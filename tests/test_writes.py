@@ -132,11 +132,12 @@ def make_sendable_draft():
 
 
 def test_pack_surface_classes_and_confirm_declarations():
-    assert len(writes.TOOLS) == 14
+    assert len(writes.TOOLS) == 15
     classes = {s.name: s.side_effect_class for s in writes.TOOLS}
     assert classes == {
         "create_draft": "write", "update_draft": "write", "delete_draft": "write",
         "add_attachment": "write", "delete_attachment": "write",
+        "create_upload_link": "write",
         "update_messages": "write", "move_messages": "write",
         "create_event": "write", "update_event": "write",
         "send_draft": "send", "respond_to_event": "send", "set_oof": "send",

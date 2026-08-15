@@ -9,6 +9,7 @@ import jsonschema
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__
+from . import uploads
 from .errors import HTTP_BY_CODE
 from .server import build_context, build_mcp_server, start_connection_manager
 from .tools.base import dispatch
@@ -175,6 +176,30 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
                 "status": "ok" if warm else "unavailable",
                 "connection": conn, "tools": len(ctx.registry),
             })
+
+        # Capability-URL upload: PUT /upload/<token>. Deliberately ahead of the
+        # bearer gate — the unguessable single-use token IS the credential (see
+        # ewsmcp/uploads.py). Every failure renders as an identical opaque 404 so
+        # probing cannot distinguish expired / used / never-existed.
+        if path.startswith("/upload/") and method in ("PUT", "POST"):
+            token = path[len("/upload/"):]
+            body = b""
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    break
+                body += message.get("body", b"")
+                if len(body) > uploads.MAX_UPLOAD_BYTES:
+                    return await _send_json(send, 404, {"ok": False, "error": {
+                        "code": "not_found", "message": "not found"}})
+                if not message.get("more_body"):
+                    break
+            try:
+                out = uploads.redeem(settings.data_dir, token, body)
+            except uploads.UploadRejected:
+                return await _send_json(send, 404, {"ok": False, "error": {
+                    "code": "not_found", "message": "not found"}})
+            return await _send_json(send, 200, {"ok": True, **out})
 
         if api_key and not _authorized(scope.get("headers"), api_key):
             return await _send_json(send, 401, {"ok": False, "error": {

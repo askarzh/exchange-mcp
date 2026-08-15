@@ -46,6 +46,7 @@ from exchangelib.items import (
     SEND_TO_NONE,
 )
 
+from .. import uploads
 from ..dates import parse_when
 from ..errors import ToolError
 from .base import Context, ToolSpec
@@ -222,6 +223,26 @@ def _draft_preview(to: List[str], cc: List[str], subject: str,
                    body_format: str = "text") -> Dict[str, Any]:
     return {"to": to, "cc": cc, "subject": subject,
             "body_snippet": _snippet(body, body_format)}
+
+
+async def _create_upload_link(ctx: Context, *, name: str,
+                             ttl_minutes: int = 15) -> Dict[str, Any]:
+    """Mint a single-use URL the human can PUT a local file to."""
+    ttl = max(1, min(int(ttl_minutes), 1440))
+    rec = uploads.mint(ctx.settings.data_dir, name, ttl_seconds=ttl * 60)
+    uploads.sweep(ctx.settings.data_dir)
+    base = (getattr(ctx.settings, "external_url", "") or "").rstrip("/")
+    url = f"{base}/upload/{rec['token']}" if base else f"/upload/{rec['token']}"
+    return {
+        "ok": True,
+        "upload_url": url,
+        "path": rec["path"],
+        "name": rec["name"],
+        "expires_in_minutes": ttl,
+        "curl": f'curl -T <local-file> "{url}"',
+        "note": ("single use, expires — upload the file, then call add_attachment "
+                 f"with path={rec['path']!r}"),
+    }
 
 
 # --- attachment helpers ------------------------------------------------------
@@ -863,6 +884,24 @@ TOOLS: List[ToolSpec] = [
             "body_format": {"type": "string", "enum": ["text", "html"], "default": "text"},
         }, required=["draft_id"]),
         handler=_update_draft,
+        confirm=False,
+    ),
+    ToolSpec(
+        name="create_upload_link",
+        description=(
+            "Mint a SINGLE-USE, short-lived URL that a human can PUT a local file "
+            "to (plain `curl -T file <url>` — no headers). Use this instead of "
+            "content_base64 for anything non-tiny: base64 travels through the "
+            "model's context and costs ~350k tokens per MB. After the upload, "
+            "pass the returned `path` to add_attachment."
+        ),
+        side_effect_class="write",
+        input_schema=_obj({
+            "name": _STR,
+            "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440,
+                            "default": 15},
+        }, required=["name"]),
+        handler=_create_upload_link,
         confirm=False,
     ),
     ToolSpec(

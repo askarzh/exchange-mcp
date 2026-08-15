@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     mcp_port: int = 8000
     mcp_api_key: Optional[str] = None
     log_level: str = "INFO"
+    # Public base URL of this server (e.g. https://ews.example.com), used to build
+    # the absolute capability URL returned by create_upload_link. Empty → the tool
+    # returns a relative /upload/<token> and the caller supplies its own origin.
+    external_url: str = ""
 
     # --- Storage (NEVER a synced folder) -------------------------------------
     data_dir: str = ""  # empty → ~/.ewsmcp; always resolved to an absolute path
