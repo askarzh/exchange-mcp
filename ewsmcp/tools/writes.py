@@ -33,11 +33,13 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
 import html as _html
 import logging
 import threading
+import base64 as _b64
 import re as _re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from exchangelib import CalendarItem, HTMLBody, Message, OofSettings
+from exchangelib import CalendarItem, FileAttachment, HTMLBody, Message, OofSettings
 from exchangelib.items import (
     SEND_TO_ALL_AND_SAVE_COPY,
     SEND_TO_CHANGED_AND_SAVE_COPY,
@@ -220,6 +222,98 @@ def _draft_preview(to: List[str], cc: List[str], subject: str,
                    body_format: str = "text") -> Dict[str, Any]:
     return {"to": to, "cc": cc, "subject": subject,
             "body_snippet": _snippet(body, body_format)}
+
+
+# --- attachment helpers ------------------------------------------------------
+
+# Inline base64 is charged to the model's context (~1.37x expansion, then
+# tokenised), so it is only sane for small payloads. Larger content should come
+# from DATA_DIR via `path` — which is exactly what get_attachment(mode="save")
+# produces, making save→attach a zero-token hand-off.
+MAX_INLINE_ATTACHMENT_BYTES = 5 * 1024 * 1024
+
+
+def _attachment_bytes(ctx: Context, path: Optional[str],
+                      content_base64: Optional[str],
+                      name: Optional[str]) -> tuple:
+    """Resolve (name, bytes) from exactly one source, with a containment guard."""
+    if bool(path) == bool(content_base64):
+        raise ToolError("validation",
+                        "Provide exactly one of path or content_base64.",
+                        hint="path must live under DATA_DIR; content_base64 also needs name.")
+    if path:
+        # Containment: the server must not be turned into a file-exfiltration
+        # primitive by a crafted path. Only DATA_DIR is readable here.
+        root = Path(ctx.settings.data_dir).resolve()
+        target = Path(path).resolve()
+        if root not in target.parents and target != root:
+            raise ToolError("validation",
+                            f"path must be inside DATA_DIR ({root}).",
+                            hint="Use get_attachment(mode='save') to place a file there first.")
+        if not target.is_file():
+            raise ToolError("validation", f"No such file: {target}")
+        data = target.read_bytes()
+        return (name or target.name), data
+    if not name:
+        raise ToolError("validation", "name is required when using content_base64.")
+    try:
+        data = _b64.b64decode(content_base64, validate=True)
+    except Exception as exc:
+        raise ToolError("validation", f"content_base64 is not valid base64: {exc}") from exc
+    if len(data) > MAX_INLINE_ATTACHMENT_BYTES:
+        raise ToolError("validation",
+                        f"inline attachment is {len(data)} bytes; cap is "
+                        f"{MAX_INLINE_ATTACHMENT_BYTES}.",
+                        hint="Write it under DATA_DIR and pass path instead.")
+    return name, data
+
+
+async def _add_attachment(ctx: Context, *, draft_id: str,
+                          path: Optional[str] = None,
+                          content_base64: Optional[str] = None,
+                          name: Optional[str] = None) -> Dict[str, Any]:
+    att_name, data = _attachment_bytes(ctx, path, content_base64, name)
+
+    def work(account: Any) -> Dict[str, Any]:
+        draft = _fetch_one(account, draft_id)
+        _require_in_drafts(draft, account, "add_attachment")
+        attachment = FileAttachment(name=att_name, content=data)
+        draft.attach(attachment)
+        # Re-alias: the dispatcher hands handlers the RAW id, and raw EWS ids are
+        # ~150 chars of case-sensitive base64. The surface is alias-only by design.
+        return {"ok": True, "draft_id": ctx.aliaser.alias_for(draft_id, "d"),
+                "name": att_name, "size": len(data),
+                "note": "attached to the draft — still NOT sent"}
+
+    return await ctx.gateway.call(work)
+
+
+async def _delete_attachment(ctx: Context, *, draft_id: str,
+                             attachment: str) -> Dict[str, Any]:
+    def work(account: Any) -> Dict[str, Any]:
+        draft = _fetch_one(account, draft_id)
+        _require_in_drafts(draft, account, "delete_attachment")
+        atts = list(getattr(draft, "attachments", None) or [])
+        if not atts:
+            raise ToolError("validation", "This draft has no attachments.")
+        names = [getattr(a, "name", "") or f"attachment-{i}" for i, a in enumerate(atts)]
+        chosen = None
+        if attachment.isdigit() and int(attachment) < len(atts):
+            chosen = atts[int(attachment)]
+        else:
+            for a, n in zip(atts, names):
+                if n == attachment:
+                    chosen = a
+                    break
+        if chosen is None:
+            raise ToolError("validation",
+                            f"No attachment matches {attachment!r}. Available: {', '.join(names)}.",
+                            hint="Pass the exact name or a zero-based index as a string.")
+        draft.detach(chosen)
+        return {"ok": True, "draft_id": ctx.aliaser.alias_for(draft_id, "d"),
+                "removed": getattr(chosen, "name", attachment)}
+
+    return await ctx.gateway.call(work)
 
 
 # --- WRITE class (reversible; tier ≥ draft) ----------------------------------
@@ -769,6 +863,32 @@ TOOLS: List[ToolSpec] = [
             "body_format": {"type": "string", "enum": ["text", "html"], "default": "text"},
         }, required=["draft_id"]),
         handler=_update_draft,
+        confirm=False,
+    ),
+    ToolSpec(
+        name="add_attachment",
+        description=(
+            "Attach a file to a DRAFT. Exactly one source: `path` (a file inside "
+            "DATA_DIR — pair with get_attachment(mode='save') to forward an "
+            "attachment between messages at zero token cost), or `content_base64` "
+            "+ `name` for small inline content. Paths outside DATA_DIR are "
+            "refused. The draft is still not sent — use send_draft."
+        ),
+        side_effect_class="write",
+        input_schema=_obj({
+            "draft_id": _STR, "path": _STR, "content_base64": _STR, "name": _STR,
+        }, required=["draft_id"]),
+        handler=_add_attachment,
+        confirm=False,
+    ),
+    ToolSpec(
+        name="delete_attachment",
+        description=("Remove one attachment from a DRAFT, by exact name or "
+                     "zero-based index as a string."),
+        side_effect_class="write",
+        input_schema=_obj({"draft_id": _STR, "attachment": _STR},
+                          required=["draft_id", "attachment"]),
+        handler=_delete_attachment,
         confirm=False,
     ),
     ToolSpec(

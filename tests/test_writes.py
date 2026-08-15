@@ -10,6 +10,7 @@ drift would fail here first.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import asyncio
 from datetime import datetime
 from types import SimpleNamespace
@@ -131,10 +132,11 @@ def make_sendable_draft():
 
 
 def test_pack_surface_classes_and_confirm_declarations():
-    assert len(writes.TOOLS) == 12
+    assert len(writes.TOOLS) == 14
     classes = {s.name: s.side_effect_class for s in writes.TOOLS}
     assert classes == {
         "create_draft": "write", "update_draft": "write", "delete_draft": "write",
+        "add_attachment": "write", "delete_attachment": "write",
         "update_messages": "write", "move_messages": "write",
         "create_event": "write", "update_event": "write",
         "send_draft": "send", "respond_to_event": "send", "set_oof": "send",
@@ -701,3 +703,125 @@ def test_update_draft_supports_html(tmp_path):
     call(ctx, "update_draft",
          {"draft_id": alias, "body": "<i>x</i>", "body_format": "html"})
     assert "<i>x</i>" in str(draft.body)
+
+
+# --- attachments on drafts ----------------------------------------------------
+# v5 shipped read-only attachments (get_attachment). These restore the v4 write
+# path: attach a file already inside DATA_DIR (pairs with get_attachment
+# mode="save") or small inline base64, and detach by name/index.
+
+def _draft_with_attachments(account, ctx, atts=None):
+    draft = MagicMock()
+    # _item_folder_id reads parent_folder_id FIRST; a bare MagicMock would
+    # auto-create a truthy one and fail the in-drafts guard.
+    draft.parent_folder_id = SimpleNamespace(id=account.drafts.id)
+    draft.folder = account.drafts
+    draft.attachments = atts if atts is not None else []
+    account._by_id["RAW-D"] = draft
+    return draft, ctx.aliaser.alias_for("RAW-D", "d")
+
+
+def test_add_attachment_from_data_dir_path(tmp_path, monkeypatch):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    draft, alias = _draft_with_attachments(account, ctx)
+    src = Path(ctx.settings.data_dir) / "attachments"
+    src.mkdir(parents=True, exist_ok=True)
+    f = src / "report.txt"
+    f.write_bytes(b"hello bytes")
+
+    res = call(ctx, "add_attachment", {"draft_id": alias, "path": str(f)})
+    assert res["ok"] is True
+    assert res["name"] == "report.txt"
+    assert res["size"] == 11
+    draft.attach.assert_called_once()
+    att = draft.attach.call_args[0][0]
+    assert att.name == "report.txt"
+    assert att.content == b"hello bytes"
+
+
+def test_add_attachment_rejects_path_outside_data_dir(tmp_path):
+    """Path traversal guard: only files under DATA_DIR may be attached."""
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    _draft, alias = _draft_with_attachments(account, ctx)
+    outside = tmp_path / "secret.txt"
+    outside.write_bytes(b"nope")
+    res = call(ctx, "add_attachment", {"draft_id": alias, "path": str(outside)})
+    assert res["ok"] is False
+    assert res["error"]["code"] == "validation"
+
+
+def test_add_attachment_from_base64(tmp_path):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    draft, alias = _draft_with_attachments(account, ctx)
+    import base64
+    res = call(ctx, "add_attachment", {
+        "draft_id": alias, "name": "note.txt",
+        "content_base64": base64.b64encode(b"inline!").decode()})
+    assert res["ok"] is True
+    att = draft.attach.call_args[0][0]
+    assert att.content == b"inline!"
+    assert att.name == "note.txt"
+
+
+def test_add_attachment_base64_requires_name(tmp_path):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    _d, alias = _draft_with_attachments(account, ctx)
+    import base64
+    res = call(ctx, "add_attachment", {
+        "draft_id": alias, "content_base64": base64.b64encode(b"x").decode()})
+    assert res["ok"] is False
+    assert res["error"]["code"] == "validation"
+
+
+def test_add_attachment_refuses_non_draft(tmp_path):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    msg = MagicMock()
+    msg.parent_folder_id = SimpleNamespace(id="FOLDER-INBOX")
+    msg.folder = SimpleNamespace(id="OTHER", name="Inbox")
+    account._by_id["RAW-M"] = msg
+    alias = ctx.aliaser.alias_for("RAW-M", "m")
+    src = Path(ctx.settings.data_dir) / "attachments"; src.mkdir(parents=True, exist_ok=True)
+    f = src / "a.txt"; f.write_bytes(b"x")
+    res = call(ctx, "add_attachment", {"draft_id": alias, "path": str(f)})
+    assert res["ok"] is False
+
+
+def test_delete_attachment_by_name(tmp_path):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    a1 = SimpleNamespace(name="keep.txt")
+    a2 = SimpleNamespace(name="drop.txt")
+    draft, alias = _draft_with_attachments(account, ctx, [a1, a2])
+    res = call(ctx, "delete_attachment", {"draft_id": alias, "attachment": "drop.txt"})
+    assert res["ok"] is True
+    assert res["removed"] == "drop.txt"
+    draft.detach.assert_called_once_with(a2)
+
+
+def test_delete_attachment_unknown_name_errors(tmp_path):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    draft, alias = _draft_with_attachments(account, ctx, [SimpleNamespace(name="a.txt")])
+    res = call(ctx, "delete_attachment", {"draft_id": alias, "attachment": "nope.txt"})
+    assert res["ok"] is False
+    draft.detach.assert_not_called()
+
+
+def test_attachment_tools_return_aliases_not_raw_ids(tmp_path):
+    """Raw EWS ids are ~150 chars and the surface is alias-only by design."""
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    draft, alias = _draft_with_attachments(account, ctx, [SimpleNamespace(name="a.txt")])
+    src = Path(ctx.settings.data_dir) / "attachments"; src.mkdir(parents=True, exist_ok=True)
+    f = src / "b.txt"; f.write_bytes(b"x")
+    add = call(ctx, "add_attachment", {"draft_id": alias, "path": str(f)})
+    rm = call(ctx, "delete_attachment", {"draft_id": alias, "attachment": "a.txt"})
+    for res in (add, rm):
+        assert res["ok"] is True
+        assert res["draft_id"] == alias
+        assert "RAW" not in res["draft_id"]
