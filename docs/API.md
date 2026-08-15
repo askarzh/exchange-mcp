@@ -221,7 +221,7 @@ Deterministic mirror query: messages YOU sent whose thread has received no inbou
 
 #### `create_draft` — write (min tier: draft)
 
-Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/forward need reply_to (the original message id) and quote the original server-side; forward also needs to. body is plain text (the server wraps it in minimal HTML). importance applies to mode=new only. Use send_draft to send.
+Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/forward need reply_to (the original message id) and quote the original server-side; forward also needs to. body is plain text by default (escaped, wrapped in minimal HTML); set body_format='html' to supply real markup verbatim for rich formatting (bold, lists, links, tables). importance applies to mode=new only. Use send_draft to send.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -232,11 +232,12 @@ Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/fo
 | `bcc` | array | no |  |
 | `subject` | string | no |  |
 | `body` | string | yes |  |
+| `body_format` | string | no | (one of: `text`, `html`; default `text`) |
 | `importance` | string | no | (one of: `normal`, `high`) |
 
 #### `update_draft` — write (min tier: draft)
 
-Update fields of an existing draft (to/cc/bcc/subject/body). Only the supplied fields change.
+Update fields of an existing draft (to/cc/bcc/subject/body). Only the supplied fields change. body_format='html' sends the new body as verbatim markup instead of escaped text.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -246,6 +247,7 @@ Update fields of an existing draft (to/cc/bcc/subject/body). Only the supplied f
 | `bcc` | array | no |  |
 | `subject` | string | no |  |
 | `body` | string | no |  |
+| `body_format` | string | no | (one of: `text`, `html`; default `text`) |
 
 #### `delete_draft` — write (min tier: draft)
 

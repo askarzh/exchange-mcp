@@ -636,3 +636,68 @@ def test_set_oof_phase_one_preview_then_plain_string_replies(tmp_path):
     assert oof.state == OofSettings.ENABLED
     assert oof.internal_reply == "I am away"  # plain str — no OofReply wrapper
     assert oof.external_reply == "I am away"  # defaulted; clean() needs both
+
+
+# --- body_format: rich HTML bodies -------------------------------------------
+# Default stays plain-text-escaped (v4 parity was plain only); body_format="html"
+# passes author-supplied markup through so drafts can carry real formatting.
+
+def test_create_draft_defaults_to_escaped_plain_text(tmp_path, monkeypatch):
+    """Regression guard: without body_format, markup must still be ESCAPED."""
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    call(ctx, "create_draft",
+         {"to": ["a@x.com"], "subject": "S", "body": "<b>hi</b>"})
+    body = str(FakeDraftMessage.last.kwargs["body"])
+    assert "&lt;b&gt;hi&lt;/b&gt;" in body
+    assert "<b>hi</b>" not in body
+
+
+def test_create_draft_html_passes_markup_through(tmp_path, monkeypatch):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    res = call(ctx, "create_draft",
+               {"to": ["a@x.com"], "subject": "S",
+                "body": "<p>Hello <b>bold</b></p>", "body_format": "html"})
+    assert res["ok"] is True
+    body = str(FakeDraftMessage.last.kwargs["body"])
+    assert "<b>bold</b>" in body           # preserved, not escaped
+    assert "&lt;b&gt;" not in body
+    assert body.startswith("<html>")       # wrapped into a document
+
+
+def test_create_draft_html_does_not_double_wrap_full_document(tmp_path, monkeypatch):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    call(ctx, "create_draft",
+         {"to": ["a@x.com"], "body": "<html><body><p>x</p></body></html>",
+          "body_format": "html"})
+    body = str(FakeDraftMessage.last.kwargs["body"])
+    assert body.count("<html>") == 1
+
+
+def test_create_draft_html_preview_snippet_is_plain_text(tmp_path, monkeypatch):
+    """The confirm preview must show readable text, not raw tags."""
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    res = call(ctx, "create_draft",
+               {"to": ["a@x.com"], "body": "<p>Hello <b>there</b></p>",
+                "body_format": "html"})
+    assert "<" not in res["preview"]["body_snippet"]
+    assert "Hello there" in res["preview"]["body_snippet"]
+
+
+def test_update_draft_supports_html(tmp_path):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    draft = MagicMock()
+    draft.folder = account.drafts
+    account._by_id["RAW-D"] = draft
+    alias = ctx.aliaser.alias_for("RAW-D", "d")
+    call(ctx, "update_draft",
+         {"draft_id": alias, "body": "<i>x</i>", "body_format": "html"})
+    assert "<i>x</i>" in str(draft.body)

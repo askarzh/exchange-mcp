@@ -33,6 +33,7 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
 import html as _html
 import logging
 import threading
+import re as _re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -108,13 +109,42 @@ def _idempotency_put(key: str, record: Dict[str, Any]) -> None:
 # --- shared helpers ----------------------------------------------------------
 
 
-def _wrap_html(text: str) -> HTMLBody:
-    """Plain text → minimal HTML (<p> per blank-line paragraph, <br/> inside)."""
+def _wrap_html(text: str, body_format: str = "text") -> HTMLBody:
+    """Author text → HTMLBody.
+
+    body_format="text" (default): plain text, ESCAPED, one <p> per blank-line
+    paragraph with <br/> inside — the historical behaviour, safe for any input.
+
+    body_format="html": the caller supplies real markup and it is passed through
+    verbatim so drafts can carry formatting (bold, lists, links, tables). Only a
+    document wrapper is added when absent. Nothing is sanitised: mail clients do
+    not execute scripts, and send_draft's two-phase confirm shows the author the
+    rendered text before anything leaves the mailbox.
+    """
+    if body_format == "html":
+        markup = (text or "").strip() or "<p></p>"
+        if "<html" not in markup.lower():
+            markup = f"<html><body>{markup}</body></html>"
+        return HTMLBody(markup)
     paragraphs = (text or "").split("\n\n")
     rendered = "".join(
         "<p>" + _html.escape(p).replace("\n", "<br/>") + "</p>" for p in paragraphs
     ) or "<p></p>"
     return HTMLBody(f"<html><body>{rendered}</body></html>")
+
+
+def _snippet(text: str, body_format: str = "text") -> str:
+    """Preview text for the confirm flow — never raw tags.
+
+    The two-phase send preview is what the author actually reads before
+    approving, so HTML bodies are reduced to their visible text.
+    """
+    raw = text or ""
+    if body_format == "html":
+        raw = _re.sub(r"<[^>]+>", " ", raw)
+        raw = _html.unescape(raw)
+        raw = _re.sub(r"\s+", " ", raw).strip()
+    return raw[:200]
 
 
 def _email_list(recipients: Any) -> List[str]:
@@ -186,9 +216,10 @@ def _failed_entry(ctx: Context, raw_id: str, exc: Exception) -> Dict[str, str]:
 
 
 def _draft_preview(to: List[str], cc: List[str], subject: str,
-                   body: Optional[str]) -> Dict[str, Any]:
+                   body: Optional[str],
+                   body_format: str = "text") -> Dict[str, Any]:
     return {"to": to, "cc": cc, "subject": subject,
-            "body_snippet": (body or "")[:200]}
+            "body_snippet": _snippet(body, body_format)}
 
 
 # --- WRITE class (reversible; tier ≥ draft) ----------------------------------
@@ -200,7 +231,8 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                         cc: Optional[List[str]] = None,
                         bcc: Optional[List[str]] = None,
                         subject: Optional[str] = None,
-                        importance: Optional[str] = None) -> Dict[str, Any]:
+                        importance: Optional[str] = None,
+                        body_format: str = "text") -> Dict[str, Any]:
     if mode not in _DRAFT_MODES:
         raise ToolError("validation", f"mode must be one of {_DRAFT_MODES}, got {mode!r}")
     if mode != "new" and not reply_to:
@@ -209,7 +241,9 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
         raise ToolError("validation", f"to is required for mode={mode!r}")
     if importance not in (None, "normal", "high"):
         raise ToolError("validation", "importance must be 'normal' or 'high'")
-    html_body = _wrap_html(body)
+    if body_format not in ("text", "html"):
+        raise ToolError("validation", "body_format must be 'text' or 'html'")
+    html_body = _wrap_html(body, body_format)
 
     def work(account: Any) -> Any:
         if mode == "new":
@@ -257,7 +291,7 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
         "ok": True,
         "draft_id": alias,
         "folder": "f:drafts",
-        "preview": _draft_preview(prev_to, prev_cc, prev_subject, body),
+        "preview": _draft_preview(prev_to, prev_cc, prev_subject, body, body_format),
         "note": "saved as draft — NOT sent",
     }
 
@@ -267,7 +301,8 @@ async def _update_draft(ctx: Context, *, draft_id: str,
                         cc: Optional[List[str]] = None,
                         bcc: Optional[List[str]] = None,
                         subject: Optional[str] = None,
-                        body: Optional[str] = None) -> Dict[str, Any]:
+                        body: Optional[str] = None,
+                        body_format: str = "text") -> Dict[str, Any]:
     if to is None and cc is None and bcc is None and subject is None and body is None:
         raise ToolError("validation", "nothing to update: pass to/cc/bcc/subject/body")
 
@@ -283,7 +318,7 @@ async def _update_draft(ctx: Context, *, draft_id: str,
             msg.subject = subject
             changed.append("subject")
         if body is not None:
-            msg.body = _wrap_html(body)
+            msg.body = _wrap_html(body, body_format)
             changed.append("body")
         msg.save(update_fields=changed)
         prev_subject = msg.subject if isinstance(msg.subject, str) else None
@@ -291,7 +326,7 @@ async def _update_draft(ctx: Context, *, draft_id: str,
             "to": _email_list(getattr(msg, "to_recipients", None)),
             "cc": _email_list(getattr(msg, "cc_recipients", None)),
             "subject": prev_subject,
-            "body_snippet": (body or "")[:200] if body is not None else None,
+            "body_snippet": _snippet(body, body_format) if body is not None else None,
         }
 
     preview = await ctx.gateway.call(work)
@@ -706,7 +741,9 @@ TOOLS: List[ToolSpec] = [
             "Author mail as a DRAFT (never sends). mode=new needs to+body; "
             "reply/reply_all/forward need reply_to (the original message id) "
             "and quote the original server-side; forward also needs to. "
-            "body is plain text (the server wraps it in minimal HTML). "
+            "body is plain text by default (escaped, wrapped in minimal HTML); "
+            "set body_format='html' to supply real markup verbatim for rich "
+            "formatting (bold, lists, links, tables). "
             "importance applies to mode=new only. Use send_draft to send."
         ),
         side_effect_class="write",
@@ -714,6 +751,7 @@ TOOLS: List[ToolSpec] = [
             "mode": {"type": "string", "enum": list(_DRAFT_MODES), "default": "new"},
             "reply_to": _STR, "to": _EMAILS, "cc": _EMAILS, "bcc": _EMAILS,
             "subject": _STR, "body": _STR,
+            "body_format": {"type": "string", "enum": ["text", "html"], "default": "text"},
             "importance": {"type": "string", "enum": ["normal", "high"]},
         }, required=["body"]),
         handler=_create_draft,
@@ -722,11 +760,13 @@ TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="update_draft",
         description=("Update fields of an existing draft (to/cc/bcc/subject/body). "
-                     "Only the supplied fields change."),
+                     "Only the supplied fields change. body_format='html' sends "
+                     "the new body as verbatim markup instead of escaped text."),
         side_effect_class="write",
         input_schema=_obj({
             "draft_id": _STR, "to": _EMAILS, "cc": _EMAILS, "bcc": _EMAILS,
             "subject": _STR, "body": _STR,
+            "body_format": {"type": "string", "enum": ["text", "html"], "default": "text"},
         }, required=["draft_id"]),
         handler=_update_draft,
         confirm=False,
