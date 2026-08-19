@@ -108,7 +108,7 @@ Rebuild the conversation containing the given message id: Inbox and Sent are mer
 
 #### `get_attachment` — read (min tier: read)
 
-Read one attachment of a message. mode='info' → metadata only; 'text' → decoded UTF-8 text (capped at 20000 chars, `truncated` flagged) for text-like attachments (text/* content type or .txt/.csv/.md/.log/.json name); 'save' → write the bytes under the server data dir and return saved_path; 'auto' (default) → text when text-like, otherwise info plus a hint. When the message has several attachments you MUST pick one via `attachment` (a name, or a zero-based index as a string).
+Read one attachment of a message. mode='info' → metadata only; 'text' → decoded UTF-8 text (capped at 20000 chars, `truncated` flagged) for text-like attachments (text/* content type or .txt/.csv/.md/.log/.json name); 'save' → write the bytes under the server data dir and return saved_path, plus shared_name when a shared space is configured (that copy is the one other services — file servers, model uploads — can read); 'auto' (default) → text when text-like, otherwise info plus a hint. When the message has several attachments you MUST pick one via `attachment` (a name, or a zero-based index as a string).
 
 | parameter | type | required | description |
 |---|---|---|---|

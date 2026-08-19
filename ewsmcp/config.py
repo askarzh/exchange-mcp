@@ -60,6 +60,10 @@ class Settings(BaseSettings):
 
     # --- Storage (NEVER a synced folder) -------------------------------------
     data_dir: str = ""  # empty → ~/.ewsmcp; always resolved to an absolute path
+    # Shared space other services can read (files-mcp lists its root, gemini-mcp
+    # reads from it). Saved attachments are copied there; nothing else in
+    # DATA_DIR — cache, audit chain, alias map — ever leaves. Empty disables it.
+    shared_dir: str = ""
     data_dir_allow_synced: bool = False  # explicit opt-out of the synced-path guard
 
     # --- Cache mirror (cache-first reads; false = pure EWS, fully functional)

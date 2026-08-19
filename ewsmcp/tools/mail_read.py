@@ -27,6 +27,7 @@ from ..bodyclean import clean_body
 from ..dates import parse_when
 from ..dto import envelope, event_card, fmt_dt, msg_card, msg_full
 from ..errors import ToolError
+from .. import shared
 from ..gateway.client import WELL_KNOWN, paginate
 from .base import Context, ToolSpec
 
@@ -704,13 +705,24 @@ async def _get_attachment(ctx: Context, message_id: str,
             if len(text) > _TEXT_CAP:
                 out["truncated"] = True
             return out
-        safe = re.sub(r"[^\w.\-]+", "_", name).strip("._") or "attachment.bin"
+        safe = shared.safe_name(name)
         dest = Path(ctx.settings.data_dir) / "attachments"
         dest.mkdir(parents=True, exist_ok=True)
         path = dest / safe
         path.write_bytes(data)
         out["mode"] = "save"
         out["saved_path"] = str(path)
+        # DATA_DIR is private to this container, so also drop a copy where the
+        # rest of the stack can reach it (files-mcp /dl links, gemini uploads).
+        # Best effort: the attachment is already safely saved either way.
+        try:
+            published = shared.publish(ctx.settings.shared_dir, path)
+        except OSError as exc:
+            logger.warning("could not publish %s to the shared space: %s", safe, exc)
+            published = None
+        if published:
+            out["shared_name"] = published
+            out["shared_path"] = str(Path(ctx.settings.shared_dir) / published)
         return out
 
     return await ctx.gateway.call(work)
@@ -985,7 +997,9 @@ TOOLS: List[ToolSpec] = [
             "'text' → decoded UTF-8 text (capped at 20000 chars, `truncated` "
             "flagged) for text-like attachments (text/* content type or "
             ".txt/.csv/.md/.log/.json name); 'save' → write the bytes under "
-            "the server data dir and return saved_path; 'auto' (default) → "
+            "the server data dir and return saved_path, plus shared_name when a "
+            "shared space is configured (that copy is the one other services — "
+            "file servers, model uploads — can read); 'auto' (default) → "
             "text when text-like, otherwise info plus a hint. When the message "
             "has several attachments you MUST pick one via `attachment` (a "
             "name, or a zero-based index as a string)."
