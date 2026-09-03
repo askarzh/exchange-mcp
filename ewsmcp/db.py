@@ -32,10 +32,11 @@ class SchemaOutdated(RuntimeError):
 
 
 class Database:
-    def __init__(self, dsn: str, min_size: int = 1, max_size: int = 4):
+    def __init__(self, dsn: str, min_size: int = 1, max_size: int = 4,
+                 open_timeout: float = 5.0):
         self.dsn = dsn
         self.pool = ConnectionPool(
-            dsn, min_size=min_size, max_size=max_size, open=True,
+            dsn, min_size=min_size, max_size=max_size, open=True, timeout=open_timeout,
             kwargs={"row_factory": dict_row, "autocommit": False},
         )
 

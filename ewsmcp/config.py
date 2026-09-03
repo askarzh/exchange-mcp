@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # --- Exchange upstream (the daemon needs these; the MCP does not) --------
     ews_server_url: str | None = None
-    ews_email: str  # both processes: own-domain checks, confirm tokens, audit
+    ews_email: str = ""  # ewsd requires this (see require_exchange); ewsmcp does not
     ews_username: str | None = None
     ews_password: str | None = None
     # NEVER pin auth_type against this Exchange: the front door only works

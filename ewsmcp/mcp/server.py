@@ -3,12 +3,14 @@
 import logging
 from typing import Any
 
+import psycopg
+import psycopg_pool
 from mcp.server import Server
 from mcp.types import Tool
 
 from ..cache.store import CacheStore
 from ..config import Settings
-from ..db import SCHEMA_VERSION, Database
+from ..db import SCHEMA_VERSION, Database, SchemaOutdated
 from ..ids import IdAliaser
 from ..server import ANNOTATIONS, _NullAudit
 from ..tools.base import Context
@@ -21,7 +23,18 @@ logger = logging.getLogger(__name__)
 
 def build_mcp_context(settings: Settings) -> Context:
     db = Database(settings.database_url)
-    db.require_version(SCHEMA_VERSION)
+    try:
+        db.require_version(SCHEMA_VERSION)
+    except SchemaOutdated:
+        # A too-old schema is a hard misconfiguration: fail loudly rather
+        # than serve tools against a database this build can't read.
+        raise
+    except (psycopg.OperationalError, psycopg_pool.PoolTimeout) as exc:
+        # Postgres is unreachable at boot. Don't kill the process: the
+        # runtime read paths already degrade to backend_unavailable, and
+        # psycopg_pool reconnects on its own once Postgres comes back.
+        logger.error("could not reach Postgres at boot (%s); continuing "
+                      "degraded, will retry in the background", exc)
     ctx = Context(settings=settings, gateway=None, manager=None, aliaser=IdAliaser(db),
                   audit=_NullAudit(), cache=CacheStore(db), db=db,
                   daemon=DaemonClient(settings.ewsd_url, settings.ewsd_api_key))
@@ -42,9 +55,10 @@ def build_mcp_server(ctx: Context) -> Server:
     async def call_tool(name: str, arguments: dict[str, Any]):
         spec = ctx.registry.get(name)
         if spec is None:
-            return {"ok": False, "error": {"code": "validation",
-                                            "message": f"Unknown tool: {name}",
-                                            "hint": f"Available: {', '.join(sorted(ctx.registry))}"}}
+            return {"ok": False, "error": {
+                "code": "validation",
+                "message": f"Unknown tool: {name}",
+                "hint": f"Available: {', '.join(sorted(ctx.registry))}"}}
         return await dispatch_mcp(ctx, spec, dict(arguments or {}))
 
     return server
