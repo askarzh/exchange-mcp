@@ -156,7 +156,7 @@ def main() -> int:
                 if send.get("error", {}).get("code") != "kill_switch":
                     failures.append(f"send_draft expected kill_switch, got {send}")
                 _, openapi = _req(EWSD_BASE, EWSD_KEY, "GET", "/openapi.json")
-                schema = json.dumps(openapi.get("paths", {}).get("/api/tools/send_draft", {}))
+                schema = json.dumps(openapi.get("paths", {}).get("/v1/tools/send_draft", {}))
                 if "confirm_token" not in schema:
                     failures.append("confirm_token absent from send_draft OpenAPI")
 
