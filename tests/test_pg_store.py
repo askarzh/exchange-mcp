@@ -5,34 +5,9 @@ import json
 import time
 
 import pytest
+from conftest import make_row
 
 from ewsmcp.cache.store import CacheStore
-
-
-def make_row(ews_id, *, folder="inbox", subject="Budget review",
-             sender_email="a@corp.example", sender_name="Ahmed",
-             body="please review the numbers", date_ts=None, is_read=1,
-             has_attachments=0, conv="CONV-1", imid=None, to=None):
-    return {
-        "ews_id": ews_id,
-        "changekey": "CK",
-        "folder": folder,
-        "conversation_id": conv,
-        "sender_name": sender_name,
-        "sender_email": sender_email,
-        "to_json": json.dumps(to or []),
-        "subject": subject,
-        "date_ts": int(date_ts if date_ts is not None else time.time()),
-        "date_iso": "2026-07-01T09:00+03:00",
-        "is_read": is_read,
-        "has_attachments": has_attachments,
-        "importance": None,
-        "categories_json": "[]",
-        "body_clean": body,
-        "internet_message_id": imid or f"<{ews_id}@corp.example>",
-        "norm_text": CacheStore.norm_for_row(subject, sender_name,
-                                             sender_email, body),
-    }
 
 
 @pytest.fixture

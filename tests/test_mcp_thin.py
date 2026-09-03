@@ -5,8 +5,7 @@ import asyncio
 import time
 
 import httpx
-from conftest import make_context, make_settings
-from test_pg_store import make_row
+from conftest import make_context, make_row, make_settings
 
 from ewsmcp.daemon import build_daemon_app
 from ewsmcp.mcp.client import DaemonClient

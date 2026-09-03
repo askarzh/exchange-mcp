@@ -16,28 +16,12 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from conftest import make_settings
-from test_pg_store import make_row
+from conftest import FakeGateway, make_context, make_row
 
-from ewsmcp.audit import AuditLog
 from ewsmcp.cache.store import CacheStore
-from ewsmcp.ids import IdAliaser
-from ewsmcp.tools import build_registry
-from ewsmcp.tools.base import Context, dispatch
+from ewsmcp.tools.base import dispatch
 
 RAW_EWS_ID = "AAMkAGI2TG93AAA" + "x" * 120 + "="  # realistically long
-
-
-class CountingGateway:
-    """Counts EWS round trips; only create_draft may use one."""
-
-    def __init__(self, account):
-        self.account = account
-        self.calls = 0
-
-    async def call(self, fn):
-        self.calls += 1
-        return fn(self.account)
 
 
 def _seed(db):
@@ -69,17 +53,10 @@ def test_north_star_two_calls_under_two_k_tokens(tmp_path, db):
     account = MagicMock(name="account")
     account.drafts = SimpleNamespace(id="F-DRAFTS", name="Drafts")
     account.fetch = MagicMock(return_value=[original])
-    gateway = CountingGateway(account)
+    gateway = FakeGateway(account)
 
-    ctx = Context(
-        settings=make_settings(),
-        gateway=gateway,
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-        cache=_seed(db),
-    )
-    build_registry(ctx)
+    ctx = make_context(db, gateway=gateway, audit_dir=str(tmp_path / "audit"))
+    ctx.cache = _seed(db)
     outputs = []
 
     # Call 1: find the last email from the sender — pure mirror.
@@ -118,15 +95,9 @@ def test_north_star_two_calls_under_two_k_tokens(tmp_path, db):
 def test_north_star_search_is_fast_warm(tmp_path, db):
     """<100ms warm is a production claim; in CI we only pin the shape of
     the guarantee — a pure-mirror (Postgres) read with no EWS round trip."""
-    ctx = Context(
-        settings=make_settings(),
-        gateway=CountingGateway(MagicMock()),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-        cache=_seed(db),
-    )
-    build_registry(ctx)
+    ctx = make_context(db, gateway=FakeGateway(MagicMock()),
+                       audit_dir=str(tmp_path / "audit"))
+    ctx.cache = _seed(db)
     start = time.perf_counter()
     res = asyncio.run(dispatch(ctx, ctx.registry["search_messages"],
                                {"sender": "director@example.com", "limit": 1}))

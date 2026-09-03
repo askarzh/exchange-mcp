@@ -3,8 +3,7 @@
 import asyncio
 import time
 
-from conftest import make_context
-from test_pg_store import make_row
+from conftest import make_context, make_row
 
 from ewsmcp.tools import cache_reads
 

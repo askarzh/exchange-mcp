@@ -8,11 +8,9 @@ http.disconnect handling that used to hang the receive loop forever.
 import asyncio
 import json
 
-from conftest import make_settings
+from conftest import make_context, make_settings
 
-from ewsmcp.audit import AuditLog
 from ewsmcp.http import MAX_BODY_BYTES, build_app
-from ewsmcp.ids import IdAliaser
 from ewsmcp.tools.base import Context, ToolSpec
 
 
@@ -30,12 +28,7 @@ def _ctx(tmp_path, db) -> Context:
         },
         handler=_echo, requires_ews=False,
     )
-    ctx = Context(
-        settings=make_settings(),
-        gateway=None, manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-    )
+    ctx = make_context(db, audit_dir=str(tmp_path / "audit"))
     ctx.registry = {"echo": spec}
     return ctx
 

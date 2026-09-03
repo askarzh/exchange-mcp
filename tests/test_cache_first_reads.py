@@ -8,34 +8,10 @@ read never touches Exchange.
 import asyncio
 import time
 
-from conftest import make_settings
-from test_pg_store import make_row
+from conftest import FakeGateway, make_context, make_row
 
-from ewsmcp.audit import AuditLog
 from ewsmcp.cache.store import CacheStore
-from ewsmcp.ids import IdAliaser
-from ewsmcp.tools import build_registry
 from ewsmcp.tools.base import Context, dispatch
-
-
-class NoTouchGateway:
-    """Raises if any tool actually reaches for Exchange."""
-
-    async def call(self, fn):
-        raise AssertionError("EWS was contacted — cache path failed")
-
-    def resolve_folder(self, account, ref, aliaser):
-        raise AssertionError("EWS folder resolution — cache path failed")
-
-
-class RecordingGateway:
-    def __init__(self, account=None):
-        self.account = account
-        self.calls = 0
-
-    async def call(self, fn):
-        self.calls += 1
-        return fn(self.account)
 
 
 def seeded_store(db):
@@ -69,15 +45,9 @@ def seeded_store(db):
 
 
 def _ctx(tmp_path, db, gateway, **overrides) -> Context:
-    ctx = Context(
-        settings=make_settings(**overrides),
-        gateway=gateway,
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-        cache=seeded_store(db),
-    )
-    build_registry(ctx)
+    ctx = make_context(db, gateway=gateway, audit_dir=str(tmp_path / "audit"),
+                       **overrides)
+    ctx.cache = seeded_store(db)
     return ctx
 
 
@@ -86,7 +56,7 @@ def _run(ctx, name, **kwargs):
 
 
 def test_search_served_from_mirror_with_provenance(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "search_messages", query="budget")
     assert res["source"] == "cache" and res["as_of"]
     assert res["count"] == 1
@@ -96,7 +66,7 @@ def test_search_served_from_mirror_with_provenance(tmp_path, db):
 
 
 def test_search_sender_filter_from_mirror(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "search_messages", sender="a@corp", limit=1)
     assert res["source"] == "cache"
     assert res["count"] == 1
@@ -104,7 +74,7 @@ def test_search_sender_filter_from_mirror(tmp_path, db):
 
 
 def test_get_message_from_mirror(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "get_message", id="RAW-1")
     assert res["source"] == "cache"
     assert res["message"]["body"].startswith("please review")
@@ -112,7 +82,7 @@ def test_get_message_from_mirror(tmp_path, db):
 
 
 def test_get_thread_local_conversation_join(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "get_thread", id="RAW-1")
     assert res["source"] == "cache"
     assert res["count"] == 2  # inbox + sent halves of C1
@@ -121,7 +91,7 @@ def test_get_thread_local_conversation_join(tmp_path, db):
 
 
 def test_overview_pure_mirror(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "get_mailbox_overview")
     assert res["source"] == "cache" and res["as_of"]
     assert res["unread_total"] == 1
@@ -130,7 +100,7 @@ def test_overview_pure_mirror(tmp_path, db):
 
 
 def test_list_folders_from_mirror(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "list_folders")
     assert res["source"] == "cache"
     assert res["items"][0]["wk"] == "f:inbox"
@@ -138,22 +108,22 @@ def test_list_folders_from_mirror(tmp_path, db):
 
 
 def test_fresh_true_forces_live(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "get_message", id="RAW-1", fresh=True)
-    # NoTouchGateway raises AssertionError → mapped upstream error — which
-    # is exactly the proof that fresh=true went to Exchange.
+    # FakeGateway(raise_on_call=True) raises AssertionError → mapped upstream
+    # error — which is exactly the proof that fresh=true went to Exchange.
     assert res["ok"] is False
 
 
 def test_uncached_folder_goes_live(tmp_path, db):
-    ctx = _ctx(tmp_path, db, NoTouchGateway())
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "search_messages", folder="f:junk")
     assert res["ok"] is False  # gateway raised → live path was chosen
 
 
 def test_cache_error_falls_back_to_live(tmp_path, db):
     account = None
-    gateway = RecordingGateway()
+    gateway = FakeGateway()
 
     class _Query(list):
         total_count = 0
@@ -174,7 +144,7 @@ def test_cache_error_falls_back_to_live(tmp_path, db):
     account = MagicMock()
     account.inbox = _Query()
     gateway.account = account
-    gateway.resolve_folder = lambda acc, ref, aliaser: account.inbox
+    gateway.folders = {"f:inbox": account.inbox, None: account.inbox}
     ctx = _ctx(tmp_path, db, gateway)
 
     def boom(**kwargs):
@@ -205,7 +175,7 @@ def test_write_through_update_and_delete(tmp_path, db):
     items = {"RAW-1": Item("RAW-1")}
     account = SimpleNamespace()
     account.fetch = lambda pairs, only_fields=None: [items[i] for i, _ in pairs]
-    gateway = RecordingGateway(account)
+    gateway = FakeGateway(account)
     ctx = _ctx(tmp_path, db, gateway, ews_capability_tier="full")
 
     res = _run(ctx, "update_messages", ids=["RAW-1"], set_read=True)

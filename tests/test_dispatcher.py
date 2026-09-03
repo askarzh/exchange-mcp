@@ -7,28 +7,16 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict
 
-from conftest import make_settings
+from conftest import FakeGateway, make_context
 
-from ewsmcp.audit import AuditLog
-from ewsmcp.ids import IdAliaser
 from ewsmcp.tools.base import Context, ToolSpec, dispatch
 
 RAW_ID = "AAMkAGI4" + "a" * 100
 
 
-class _Gateway:
-    async def call(self, fn):
-        raise AssertionError("gateway should not be hit in these tests")
-
-
 def _ctx(tmp_path, db, **settings_overrides) -> Context:
-    return Context(
-        settings=make_settings(**settings_overrides),
-        gateway=_Gateway(),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "data")),
-    )
+    return make_context(db, gateway=FakeGateway(raise_on_call=True), cache=False,
+                        audit_dir=str(tmp_path / "data"), **settings_overrides)
 
 
 def _spec(handler, *, cls="read", confirm=False, requires_ews=True, name="t") -> ToolSpec:

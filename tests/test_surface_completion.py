@@ -6,36 +6,16 @@ import time
 from datetime import date
 from types import SimpleNamespace
 
-from conftest import make_settings
-from test_pg_store import make_row
+from conftest import FakeGateway, make_context, make_row, make_settings
 
-from ewsmcp.audit import AuditLog
 from ewsmcp.cache.store import SIG_MIN_HITS, CacheStore
-from ewsmcp.ids import IdAliaser
-from ewsmcp.tools import build_registry
-from ewsmcp.tools.base import Context, dispatch
-
-
-class Gateway:
-    def __init__(self, account=None):
-        self.account = account
-        self.calls = 0
-
-    async def call(self, fn):
-        self.calls += 1
-        return fn(self.account)
+from ewsmcp.tools.base import dispatch
 
 
 def _ctx(tmp_path, db, gateway=None, cache=None, **overrides):
-    ctx = Context(
-        settings=make_settings(**overrides),
-        gateway=gateway or Gateway(),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-        cache=cache,
-    )
-    build_registry(ctx)
+    ctx = make_context(db, gateway=gateway or FakeGateway(), cache=False,
+                       audit_dir=str(tmp_path / "audit"), **overrides)
+    ctx.cache = cache
     return ctx
 
 
@@ -93,7 +73,7 @@ def test_list_tasks_live_fallback_without_mirror(tmp_path, db):
             return [Item()]
 
     account = SimpleNamespace(tasks=Tasks())
-    ctx = _ctx(tmp_path, db, Gateway(account))
+    ctx = _ctx(tmp_path, db, FakeGateway(account))
     res = _run(ctx, "list_tasks")
     assert res["source"] == "live"
     assert res["items"][0]["subject"] == "Live task"
@@ -117,7 +97,7 @@ def test_update_task_complete_and_due(tmp_path, db):
 
     item = Item()
     account = SimpleNamespace(fetch=lambda ids, only_fields=None: [item])
-    ctx = _ctx(tmp_path, db, Gateway(account))
+    ctx = _ctx(tmp_path, db, FakeGateway(account))
     res = _run(ctx, "update_task", id="T-RAW", complete=True, due="2026-08-01")
     assert res["ok"] is True
     assert item.completed == 1
@@ -165,7 +145,7 @@ def test_get_contact_by_email_with_history(tmp_path, db):
                               company_name="Acme", phone_numbers=[])
     account = SimpleNamespace(protocol=SimpleNamespace(
         resolve_names=lambda names, return_full_contact_data: [(mailbox, contact)]))
-    ctx = _ctx(tmp_path, db, Gateway(account), cache=store)
+    ctx = _ctx(tmp_path, db, FakeGateway(account), cache=store)
     res = _run(ctx, "get_contact", id="boss@corp.example")
     assert res["ok"] is True
     person = res["person"]
@@ -179,11 +159,7 @@ def test_get_contact_mirror_fallback_when_gal_down(tmp_path, db):
     store.upsert_messages([
         make_row("M1", sender_email="boss@corp.example", sender_name="Boss")])
 
-    class DeadGateway:
-        async def call(self, fn):
-            raise ConnectionError("GAL down")
-
-    ctx = _ctx(tmp_path, db, DeadGateway(), cache=store)
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True), cache=store)
     res = _run(ctx, "get_contact", id="boss@corp.example")
     assert res["ok"] is True
     assert res["person"]["source"] == "mirror"

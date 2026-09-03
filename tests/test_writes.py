@@ -19,12 +19,10 @@ from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
-from conftest import make_settings
+from conftest import FakeGateway, make_context
 from exchangelib import OofSettings
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 
-from ewsmcp.audit import AuditLog
-from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import writes
 from ewsmcp.tools.base import Context, dispatch
 
@@ -38,20 +36,6 @@ def _fresh_idempotency():
     writes.reset_idempotency_store()
     yield
     writes.reset_idempotency_store()
-
-
-class FakeGateway:
-    """async call → fn(account), executed inline."""
-
-    def __init__(self, account):
-        self.account = account
-        self.folders: Dict[str, Any] = {}
-
-    async def call(self, fn):
-        return fn(self.account)
-
-    def resolve_folder(self, account, ref, aliaser):
-        return self.folders[ref]
 
 
 def make_account():
@@ -68,13 +52,8 @@ def make_account():
 
 
 def make_ctx(tmp_path, db, account, **overrides) -> Context:
-    return Context(
-        settings=make_settings(**overrides),
-        gateway=FakeGateway(account),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-    )
+    return make_context(db, gateway=FakeGateway(account), cache=False,
+                        audit_dir=str(tmp_path / "audit"), **overrides)
 
 
 def call(ctx: Context, name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:

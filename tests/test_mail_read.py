@@ -11,12 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
-from conftest import make_settings
+from conftest import FakeGateway, make_context
 
-from ewsmcp.audit import AuditLog
-from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import mail_read
-from ewsmcp.tools.base import Context, dispatch
+from ewsmcp.tools.base import dispatch
 
 TZ = ZoneInfo("Asia/Riyadh")
 SPECS = {spec.name: spec for spec in mail_read.TOOLS}
@@ -63,17 +61,6 @@ class _Query(list):
         self.refresh_calls += 1
 
 
-class _FakeGateway:
-    def __init__(self, account):
-        self.account = account
-
-    async def call(self, fn):
-        return fn(self.account)
-
-    def resolve_folder(self, account, ref, aliaser):
-        return self.account.inbox
-
-
 def _msg(raw_id, subject="Subj", sender="ahmed@corp.example", *, sender_name=None,
          dt=None, is_read=True, has_attachments=False, text_body="",
          conv="CONV-RAW-1=", message_id=None, attachments=None, to=None):
@@ -104,13 +91,8 @@ def _account(inbox=None, sent=None):
 
 def _ctx(tmp_path, db, account, **overrides):
     overrides.setdefault("data_dir", str(tmp_path / "data"))
-    return Context(
-        settings=make_settings(**overrides),
-        gateway=_FakeGateway(account),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-    )
+    return make_context(db, gateway=FakeGateway(account), cache=False,
+                        audit_dir=str(tmp_path / "audit"), **overrides)
 
 
 def _run(ctx, name, **kwargs):

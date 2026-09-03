@@ -5,21 +5,13 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from conftest import make_settings
+from conftest import FakeGateway, make_settings
 
 from ewsmcp.cache.store import CacheStore
 from ewsmcp.cache.sync import SyncEngine, row_from_message
 
 TZ = ZoneInfo("Asia/Riyadh")
 NOW = datetime(2026, 7, 10, 9, 0, tzinfo=TZ)
-
-
-class FakeGateway:
-    async def call(self, fn):
-        return fn(self.account)
-
-    def __init__(self, account):
-        self.account = account
 
 
 class FakeFolder:
@@ -112,13 +104,9 @@ def test_window_floor_skips_ancient_backfill(db):
 
 
 def test_cycle_failure_degrades_not_dies(db):
-    class BoomGateway:
-        async def call(self, fn):
-            raise ConnectionError("exchange gone")
-
     settings = make_settings()
     store = CacheStore(db)
-    engine = SyncEngine(settings, BoomGateway(), store)
+    engine = SyncEngine(settings, FakeGateway(raise_on_call=True), store)
 
     async def one_iteration():
         try:
@@ -127,7 +115,7 @@ def test_cycle_failure_degrades_not_dies(db):
             engine.last_error = f"{type(exc).__name__}: {exc}"
 
     asyncio.run(one_iteration())
-    assert "exchange gone" in engine.last_error
+    assert "the mirror path failed" in engine.last_error
     assert engine.status()["last_error"]
 
 
