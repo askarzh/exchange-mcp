@@ -5,16 +5,11 @@ volume nothing else can read — files-mcp cannot list it, no /dl/ link can be
 minted for it, and gemini-mcp cannot open it. When SHARED_DIR is configured we
 also publish a copy into its flat root, which is the level files-mcp lists.
 """
-import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock
-
-import pytest
 
 from ewsmcp import shared as shared_mod
 from tests.test_mail_read import _account, _att, _ctx, _msg, _run
-
 
 # --- the publish helper in isolation ----------------------------------------
 

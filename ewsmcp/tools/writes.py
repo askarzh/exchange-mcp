@@ -30,11 +30,11 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
   flag field; pretending would be mock-drift bait (categories instead).
 """
 
+import base64 as _b64
 import html as _html
 import logging
-import threading
-import base64 as _b64
 import re as _re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional

@@ -24,6 +24,7 @@ async def serve(settings: Settings) -> None:
         raise SystemExit("refusing to bind ewsd on a non-loopback address without EWSD_API_KEY")
     ctx = build_context(settings)
     app = build_daemon_app(ctx, settings)
+    logger.info("ewsd starting on %s:%s", settings.ewsd_host, settings.ewsd_port)
     config = uvicorn.Config(app, host=settings.ewsd_host, port=settings.ewsd_port,
                             log_level=settings.log_level.lower(), http="h11")
     await uvicorn.Server(config).serve()

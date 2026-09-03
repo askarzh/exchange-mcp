@@ -10,19 +10,19 @@ drift would fail here first.
 """
 from __future__ import annotations
 
-from pathlib import Path
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import make_settings
 from exchangelib import OofSettings
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 
-from conftest import make_settings
 from ewsmcp.audit import AuditLog
 from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import writes
@@ -786,8 +786,10 @@ def test_add_attachment_refuses_non_draft(tmp_path, db):
     msg.folder = SimpleNamespace(id="OTHER", name="Inbox")
     account._by_id["RAW-M"] = msg
     alias = ctx.aliaser.alias_for("RAW-M", "m")
-    src = Path(ctx.settings.data_dir) / "attachments"; src.mkdir(parents=True, exist_ok=True)
-    f = src / "a.txt"; f.write_bytes(b"x")
+    src = Path(ctx.settings.data_dir) / "attachments"
+    src.mkdir(parents=True, exist_ok=True)
+    f = src / "a.txt"
+    f.write_bytes(b"x")
     res = call(ctx, "add_attachment", {"draft_id": alias, "path": str(f)})
     assert res["ok"] is False
 
@@ -818,8 +820,10 @@ def test_attachment_tools_return_aliases_not_raw_ids(tmp_path, db):
     account = make_account()
     ctx = make_ctx(tmp_path, db, account)
     draft, alias = _draft_with_attachments(account, ctx, [SimpleNamespace(name="a.txt")])
-    src = Path(ctx.settings.data_dir) / "attachments"; src.mkdir(parents=True, exist_ok=True)
-    f = src / "b.txt"; f.write_bytes(b"x")
+    src = Path(ctx.settings.data_dir) / "attachments"
+    src.mkdir(parents=True, exist_ok=True)
+    f = src / "b.txt"
+    f.write_bytes(b"x")
     add = call(ctx, "add_attachment", {"draft_id": alias, "path": str(f)})
     rm = call(ctx, "delete_attachment", {"draft_id": alias, "attachment": "a.txt"})
     for res in (add, rm):

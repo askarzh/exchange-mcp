@@ -16,20 +16,20 @@ it never gates them.
 
 import asyncio
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from .. import shared
 from ..bodyclean import clean_body
 from ..dates import parse_when
 from ..dto import envelope, event_card, fmt_dt, msg_card, msg_full
 from ..errors import ToolError
-from .. import shared
 from ..gateway.client import WELL_KNOWN, paginate
 from . import cache_reads
 from .base import Context, ToolSpec
+
 # Re-exported for compatibility — other tests/modules import these from here.
 from .cache_reads import _row_body, _row_card, _row_full, _stamp  # noqa: F401
 

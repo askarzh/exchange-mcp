@@ -3,8 +3,8 @@ by boot smokes and the generated docs — change it DELIBERATELY."""
 
 from typing import Dict
 
+from . import calendar_people, mail_read, tasks, writes
 from .base import CLASS_TIER, TIER_RANK, Context, ToolSpec
-from . import mail_read, calendar_people, tasks, writes
 
 
 def build_registry(ctx: Context) -> Dict[str, ToolSpec]:

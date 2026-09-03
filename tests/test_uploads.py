@@ -72,8 +72,9 @@ def test_mint_sanitises_the_filename(tmp_path):
 # --- the MCP tool + the HTTP route -------------------------------------------
 
 def test_create_upload_link_tool_returns_absolute_url(tmp_path, db, monkeypatch):
-    import sys; sys.path.insert(0, "tests")
-    from test_writes import make_account, make_ctx, call
+    import sys
+    sys.path.insert(0, "tests")
+    from test_writes import call, make_account, make_ctx
     account = make_account()
     ctx = make_ctx(tmp_path, db, account)
     ctx.settings.external_url = "https://ews.example.com"
@@ -87,6 +88,7 @@ def test_create_upload_link_tool_returns_absolute_url(tmp_path, db, monkeypatch)
 def test_upload_route_redeems_then_404s_on_reuse(tmp_path):
     """End-to-end through the ASGI app: first PUT wins, replay is an opaque 404."""
     import asyncio
+
     from ewsmcp.http import build_app
 
     class S:
@@ -99,10 +101,14 @@ def test_upload_route_redeems_then_404s_on_reuse(tmp_path):
     async def put(token, body):
         sent = {}
         msgs = [{"type": "http.request", "body": body, "more_body": False}]
-        async def receive(): return msgs.pop(0)
+        async def receive():
+            return msgs.pop(0)
+
         async def send(m):
-            if m["type"] == "http.response.start": sent["status"] = m["status"]
-            else: sent.setdefault("body", b"")
+            if m["type"] == "http.response.start":
+                sent["status"] = m["status"]
+            else:
+                sent.setdefault("body", b"")
             sent["body"] = sent.get("body", b"") + m.get("body", b"")
         await app({"type": "http", "path": f"/upload/{token}", "method": "PUT",
                    "headers": []}, receive, send)

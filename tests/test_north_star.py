@@ -17,14 +17,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from conftest import make_settings
+from test_pg_store import make_row
 
 from ewsmcp.audit import AuditLog
 from ewsmcp.cache.store import CacheStore
 from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import build_registry
 from ewsmcp.tools.base import Context, dispatch
-
-from test_pg_store import make_row
 
 RAW_EWS_ID = "AAMkAGI2TG93AAA" + "x" * 120 + "="  # realistically long
 
@@ -118,7 +117,7 @@ def test_north_star_two_calls_under_two_k_tokens(tmp_path, db):
 
 def test_north_star_search_is_fast_warm(tmp_path, db):
     """<100ms warm is a production claim; in CI we only pin the shape of
-    the guarantee — a pure-SQLite read with no EWS round trip."""
+    the guarantee — a pure-mirror (Postgres) read with no EWS round trip."""
     ctx = Context(
         settings=make_settings(),
         gateway=CountingGateway(MagicMock()),

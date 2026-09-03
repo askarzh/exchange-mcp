@@ -19,7 +19,8 @@ exchangelib 5.0.3 shapes verified against the installed library:
 """
 
 import time
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta
+from datetime import time as dtime
 from itertools import islice
 from typing import Any, Dict, List, Optional, Tuple
 

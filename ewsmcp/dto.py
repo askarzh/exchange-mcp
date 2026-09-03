@@ -64,7 +64,8 @@ def msg_card(item: Any, aliaser: IdAliaser, tz: str) -> Dict[str, Any]:
         text = strip_quoted_history(text)[0] or text
     except Exception:
         pass
-    raw_id = getattr(getattr(item, "id", None), "__str__", lambda: None)() or getattr(item, "id", None)
+    raw_id = (getattr(getattr(item, "id", None), "__str__", lambda: None)()
+              or getattr(item, "id", None))
     imid = getattr(item, "message_id", None)
     card: Dict[str, Any] = {
         "id": aliaser.alias_for(str(raw_id), "m", internet_message_id=imid) if raw_id else None,

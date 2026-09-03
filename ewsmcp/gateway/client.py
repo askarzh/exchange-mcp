@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from exchangelib import Account, Configuration, Credentials, DELEGATE, EWSTimeZone
+from exchangelib import DELEGATE, Account, Configuration, Credentials, EWSTimeZone
 from exchangelib.protocol import (
     BaseProtocol,
     CachingProtocol,
@@ -67,8 +67,8 @@ class EWSGateway:
             retry_policy=FaultTolerance(max_wait=s.ews_retry_max_wait_seconds),
         )
         if s.ews_auth_type_force:  # escape hatch for a DIFFERENT Exchange only
-            logger.warning("auth_type FORCED to %s — the primary Exchange requires auto-negotiation",
-                           s.ews_auth_type_force)
+            logger.warning("auth_type FORCED to %s — the primary Exchange requires "
+                           "auto-negotiation", s.ews_auth_type_force)
             kwargs["auth_type"] = s.ews_auth_type_force
         config = Configuration(**kwargs)
         return Account(

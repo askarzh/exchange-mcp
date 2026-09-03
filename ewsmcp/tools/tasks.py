@@ -137,8 +137,8 @@ async def _waiting_on(ctx: Context, days: int = 5,
         raise ToolError(
             "upstream_unavailable",
             "waiting_on needs the local mirror (sent folder not synced yet)",
-            hint="The cache warms up shortly after boot; check "
-                 "get_server_status.cache, or enable EWS_CACHE_ENABLED.",
+            hint="The daemon's sync warms the sent folder shortly after boot; "
+                 "check get_server_status.",
         )
     rows = await asyncio.to_thread(ctx.cache.sent_without_reply, days, limit)
 

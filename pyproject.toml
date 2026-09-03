@@ -40,8 +40,11 @@ include = ["ewsmcp*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
-cache_dir = ".pytest_cache_local"
 
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E731"]
