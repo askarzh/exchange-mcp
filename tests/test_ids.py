@@ -1,39 +1,27 @@
-"""Tests for the short-alias layer over raw EWS item ids (src/id_alias.py).
+"""Tests for the short-alias layer over raw EWS item ids (ewsmcp/ids.py).
 
-All tests are synchronous, hit a tmp_path-backed SQLite file, and use no
-network. The raw-id fixtures deliberately contain ``=`` / uppercase so they
-can never be mistaken for an alias by the ``^[a-z]{1,2}[0-9]+$`` shape check.
+All tests hit a real Postgres (via the `db` fixture: fresh `ews` schema per
+test) and no network. The raw-id fixtures deliberately contain ``=`` /
+uppercase so they can never be mistaken for an alias by the
+``^[a-z]{1,2}[0-9]+$`` shape check.
 """
 
 from __future__ import annotations
 
 import re
-import sqlite3
 import threading
 
 import pytest
 
-from ewsmcp.ids import (
-    IdAliaser,
-    get_aliaser,
-    kind_for_key,
-    reset_aliaser_cache,
-)
+from ewsmcp.ids import IdAliaser, NullAliaser, kind_for_key  # noqa: F401
 
 RAW_A = "AAMkAGI2NGVhZTVlLTI3ZjMtNDlmMS1iZjk4LWRlMDUxYmQ5NzU5AAA="
 RAW_B = "AAMkAGI2NGVhZTVlLTI3ZjMtNDlmMS1iZjk4LU1PVkVEX0FGVEVSAAB="
 
 
-@pytest.fixture(autouse=True)
-def _clean_singleton_cache():
-    reset_aliaser_cache()
-    yield
-    reset_aliaser_cache()
-
-
 @pytest.fixture
-def aliaser(tmp_path) -> IdAliaser:
-    return IdAliaser(str(tmp_path))
+def aliaser(db) -> IdAliaser:
+    return IdAliaser(db)
 
 
 # --- Minting -----------------------------------------------------------------
@@ -132,16 +120,12 @@ def test_imid_storage_and_retrieval(aliaser):
 # --- Persistence -----------------------------------------------------------------
 
 
-def test_persistence_across_instances_on_same_path(tmp_path):
-    first = IdAliaser(str(tmp_path))
-    alias = first.alias_for(RAW_A, internet_message_id="<persist@example.com>")
-    assert alias == "m1"
-
-    second = IdAliaser(str(tmp_path))
+def test_persistence_across_instances_on_same_db(db):
+    first = IdAliaser(db)
+    alias = first.alias_for(RAW_A, kind="m")
+    second = IdAliaser(db)
     assert second.resolve(alias) == RAW_A
-    assert second.imid_for(alias) == "<persist@example.com>"
-    # Counter persisted too: the next mint continues, never reuses m1.
-    assert second.alias_for("ID-NEXT=") == "m2"
+    assert second.alias_for("ID-NEW=", kind="m") == "m2"  # counter continues
 
 
 # --- Thread safety ----------------------------------------------------------------
@@ -171,40 +155,44 @@ def test_thread_safety_smoke(aliaser):
     assert aliaser.stats() == {"m": n_threads * n_per_thread}
 
 
+# --- Bulk minting ------------------------------------------------------------------
+
+
+def test_alias_many_mints_in_one_transaction(aliaser):
+    out = aliaser.alias_many([("A=", "m", None, None), ("B=", "e", "CK", "<b@x>"),
+                              ("", "m", None, None)])
+    assert out == {"A=": "m1", "B=": "e1"}
+    assert aliaser.imid_for("e1") == "<b@x>"
+
+
 # --- Defensive behaviour -----------------------------------------------------------
 
 
-def test_alias_for_and_rebind_swallow_storage_errors(aliaser, monkeypatch):
-    aliaser.alias_for("ID-GOOD=")
-
-    def boom():
-        raise sqlite3.OperationalError("disk I/O error")
-
-    monkeypatch.setattr(aliaser, "_connect", boom)
-    # alias_for degrades to the raw id; rebind to None. Neither raises.
-    assert aliaser.alias_for(RAW_A) == RAW_A
-    assert aliaser.rebind("ID-GOOD=", RAW_B) is None
+def test_alias_for_and_rebind_swallow_storage_errors(db, monkeypatch):
+    aliaser = IdAliaser(db)
+    aliaser.alias_for(RAW_A)
+    db.close()  # every later query fails
+    assert aliaser.alias_for("NEW=") == "NEW="  # fail open: raw id back
+    assert aliaser.rebind(RAW_A, RAW_B) is None
+    assert aliaser.stats() == {}
+    assert aliaser.resolve("m1") == "m1"  # lookup failed → pass through
 
 
-# --- Singleton accessor --------------------------------------------------------------
+def test_concurrent_mint_of_same_id_yields_one_alias(db):
+    import threading
+    aliaser = IdAliaser(db)
+    results = []
 
+    def mint():
+        results.append(aliaser.alias_for("SAME=", kind="m"))
 
-def test_get_aliaser_singleton_and_reset(tmp_path):
-    a = get_aliaser(str(tmp_path))
-    b = get_aliaser(str(tmp_path))
-    assert a is b
-    # Different spelling of the same directory resolves to the same instance.
-    import os
-
-    c = get_aliaser(str(tmp_path) + os.sep)
-    assert c is a
-    # Different directory -> different instance.
-    other = get_aliaser(str(tmp_path / "other"))
-    assert other is not a
-
-    reset_aliaser_cache()
-    fresh = get_aliaser(str(tmp_path))
-    assert fresh is not a
+    threads = [threading.Thread(target=mint) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert set(results) == {"m1"}
+    assert aliaser.stats() == {"m": 1}
 
 
 # --- Kind inference ------------------------------------------------------------------
