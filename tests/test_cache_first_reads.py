@@ -8,7 +8,16 @@ read never touches Exchange.
 import asyncio
 import time
 
-from conftest import INBOX_ID, SENT_ID, FakeGateway, make_context, make_row, seed_folders
+import psycopg
+from conftest import (
+    _FOLDER_ROWS,
+    INBOX_ID,
+    SENT_ID,
+    FakeGateway,
+    make_context,
+    make_row,
+    seed_folders,
+)
 
 from ewsmcp.cache.store import CacheStore
 from ewsmcp.tools.base import Context, dispatch
@@ -38,12 +47,15 @@ def seeded_store(db):
         "location": None, "organizer": None, "is_recurring": 0,
         "my_response": None,
     }])
-    # seed_folders already wrote the inbox row; layer in the counts
-    # test_list_folders_from_mirror and test_overview_pure_mirror assert on.
-    store.replace_folders([
-        {"ews_id": INBOX_ID, "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
-         "total": 3, "unread": 1, "children": 0},
-    ])
+    # seed_folders already wrote the full hierarchy (inbox/sent/junk/archive);
+    # layer in the counts test_list_folders_from_mirror and
+    # test_overview_pure_mirror assert on WITHOUT wiping junk/archive — the
+    # excluded-folder and unknown-folder tests need them still present.
+    rows = [dict(r) for r in _FOLDER_ROWS]
+    for r in rows:
+        if r["ews_id"] == INBOX_ID:
+            r["total"], r["unread"] = 3, 1
+    store.replace_folders(rows)
     return store
 
 
@@ -60,7 +72,7 @@ def _run(ctx, name, **kwargs):
 
 def test_search_served_from_mirror_with_provenance(tmp_path, db):
     ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
-    res = _run(ctx, "search_messages", query="budget")
+    res = _run(ctx, "search_messages", query="budget", folder="f:inbox")
     assert res["source"] == "cache" and res["as_of"]
     assert res["count"] == 1
     assert res["total_available"] == 1  # exact — COUNT(*) is free locally
@@ -106,7 +118,7 @@ def test_list_folders_from_mirror(tmp_path, db):
     ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "list_folders")
     assert res["source"] == "cache"
-    inbox = next(r for r in res["items"] if r["wk"] == "f:inbox")
+    inbox = next(r for r in res["items"] if r.get("wk") == "f:inbox")
     assert inbox["unread"] == 1
 
 
@@ -118,21 +130,72 @@ def test_fresh_true_forces_live(tmp_path, db):
     assert res["ok"] is False
 
 
-def test_unmirrored_folder_is_a_not_found_error(tmp_path, db):
-    """f:junk isn't in ews.folders (only f:inbox is, after the seed above),
-    so resolve_folder_id raises before the gateway is ever touched."""
+def test_excluded_folder_is_a_validation_error(tmp_path, db):
+    """f:junk IS in ews.folders (seed_folders seeds it) but is excluded from
+    the mirror by the default EWS_MIRROR_EXCLUDE — naming it is a validation
+    error, not a live fallback."""
     gateway = FakeGateway(raise_on_call=True)
     ctx = _ctx(tmp_path, db, gateway)
     res = _run(ctx, "search_messages", folder="f:junk")
+    assert res["ok"] is False
+    assert res["error"]["code"] == "validation"
+    assert "EWS_MIRROR_EXCLUDE" in res["error"]["message"]
+    assert gateway.calls == 0
+
+
+def test_unknown_folder_is_not_found(tmp_path, db):
+    gateway = FakeGateway(raise_on_call=True)
+    ctx = _ctx(tmp_path, db, gateway)
+    res = _run(ctx, "search_messages", folder="Nope/Missing")
     assert res["ok"] is False
     assert res["error"]["code"] == "not_found"
     assert gateway.calls == 0
 
 
-def test_cache_error_falls_back_to_live(tmp_path, db):
-    """search_messages now answers store-only (Task 4/6): a mirror error there
-    propagates rather than falling back. get_message still falls back — its
-    cache_reads helper keeps its own try/except — so it carries this test."""
+def test_search_has_no_fresh_parameter(tmp_path, db):
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    props = ctx.registry["search_messages"].input_schema["properties"]
+    assert "fresh" not in props
+    assert "fresh" not in ctx.registry["get_thread"].input_schema["properties"]
+    # ...and they still stamp source=cache
+    assert _run(ctx, "search_messages", query="budget")["source"] == "cache"
+
+
+def test_search_never_touches_exchange_even_with_no_folder(tmp_path, db):
+    """folder omitted = every mirrored folder, still zero EWS calls — and the
+    hits really do come from two different mirrored folders (inbox + sent)."""
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    res = _run(ctx, "search_messages", query="budget")
+    assert res["ok"] is True and res["count"] == 2  # inbox AND sent halves of C1
+    subjects = {it["subject"] for it in res["items"]}
+    assert subjects == {"Budget review", "Re: Budget review"}
+    res = _run(ctx, "search_messages")           # no filters at all
+    assert res["total_available"] == 3            # inbox + sent seeds
+
+
+def test_query_combines_with_structured_filters(tmp_path, db):
+    """The AQS-exclusivity rule is gone."""
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    res = _run(ctx, "search_messages", query="budget", is_unread=True)
+    assert res["ok"] is True and res["count"] == 1
+    assert res["items"][0]["subject"] == "Budget review"
+
+
+def test_store_failure_is_backend_unavailable_not_a_live_read(tmp_path, db):
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+
+    def boom(**kwargs):
+        raise psycopg.OperationalError("mirror unavailable")
+
+    ctx.cache.search_messages = boom
+    res = _run(ctx, "search_messages")
+    assert res["ok"] is False and res["error"]["code"] == "backend_unavailable"
+
+
+def test_get_message_cache_error_falls_back_to_live(tmp_path, db):
+    """get_message still falls back to live on a mirror error — its
+    cache_reads helper keeps its own try/except (unlike search_messages,
+    which is store-only with no live path to fall back to)."""
     from types import SimpleNamespace
 
     class Item:

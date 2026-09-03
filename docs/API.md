@@ -12,9 +12,9 @@ the registry is the single source of truth for what exists.
 | tool | class | min tier | what it does |
 |---|---|---|---|
 | `list_folders` | read | read | List mail folders as a depth-limited tree walk. |
-| `search_messages` | read | read | Search mail. |
+| `search_messages` | read | read | Search mail across the local mirror of the whole mailbox. |
 | `get_message` | read | read | Fetch one message by id (short alias from search results, e.g. |
-| `get_thread` | read | read | Rebuild the conversation containing the given message id: Inbox and Sent are merged and sorted chronologically, each entry's body cleaned to its latest-reply-only text. |
+| `get_thread` | read | read | Rebuild the conversation containing the given message id from the local mirror: every mail folder is mirrored and merged, sorted chronologically, each entry's body cleaned to its latest-reply-only text. |
 | `get_attachment` | read | read | Read one attachment of a message. |
 | `get_mailbox_overview` | read | read | The morning-brief workflow tool — start here. |
 | `list_events` | read | read | List calendar events overlapping a time window (default: today through +7d, server timezone). |
@@ -65,12 +65,12 @@ List mail folders as a depth-limited tree walk. Each row is {id, name, path, tot
 
 #### `search_messages` — read (min tier: read)
 
-Search mail. TWO ENGINES, mutually exclusive: pass `query` (an Exchange AQS string, e.g. 'from:ahmed subject:rfp hasattachment:yes') OR the structured filters (sender/subject/since/until/is_unread/has_attachments) — combining `query` with any structured filter is a validation error. `sender` is matched client-side against the fetched page's sender email/name, so total_available is unknown when it is used. Results are compact cards, newest first; their `id` values are short aliases (m12) for get_message / get_thread / get_attachment. If an id later goes stale (items move), re-run this search for fresh ids.
+Search mail across the local mirror of the whole mailbox. `query` is full-text over subject, sender and cleaned body (accent- and case-folded, every word matched as a prefix) and combines freely with the structured filters (sender/subject/since/until/is_unread/has_attachments) — they all AND together. Omit `folder` to search every mirrored folder; drafts/junk/trash/outbox are not mirrored and naming one is a validation error. Results are compact cards, most relevant then newest first, with an exact total_available; their `id` values are short aliases (m12) for get_message / get_thread / get_attachment. If an id later goes stale (items move), re-run this search for fresh ids.
 
 | parameter | type | required | description |
 |---|---|---|---|
-| `query` | string | no | AQS query string — cannot be combined with the structured filters below. |
-| `folder` | string | no | Folder alias (f:inbox, f:sent, f7), path, or raw id. (default `f:inbox`) |
+| `query` | string | no | Full-text query over subject, sender and cleaned body; combines freely with the structured filters below. |
+| `folder` | string | no | Restrict to one folder: wk alias (f:inbox, f:sent), folder alias (f7), path, or raw id. Omit to search EVERY mirrored folder. |
 | `sender` | string | no | Sender substring, matched client-side on the fetched page (email or display name). |
 | `from_` | string | no | DEPRECATED alias of `sender` — do not combine the two. |
 | `subject` | string | no | Subject substring. |
@@ -81,7 +81,6 @@ Search mail. TWO ENGINES, mutually exclusive: pass `query` (an Exchange AQS stri
 | `offset` | integer | no | (default `0`) |
 | `limit` | integer | no | (default `20`) |
 | `mode` | string | no | semantic is reserved; keyword only in this build. (one of: `keyword`, `semantic`; default `keyword`) |
-| `fresh` | boolean | no | true forces a live Exchange read instead of the local mirror (responses are stamped source=cache\|live). (default `False`) |
 
 #### `get_message` — read (min tier: read)
 
@@ -96,14 +95,13 @@ Fetch one message by id (short alias from search results, e.g. m12; raw EWS ids 
 
 #### `get_thread` — read (min tier: read)
 
-Rebuild the conversation containing the given message id: Inbox and Sent are merged and sorted chronologically, each entry's body cleaned to its latest-reply-only text. Returns thread_id (t-alias), participants with message counts, and the most recent `limit` entries. Entry ids are m-aliases usable with get_message/get_attachment. Stale id → re-run search_messages.
+Rebuild the conversation containing the given message id from the local mirror: every mail folder is mirrored and merged, sorted chronologically, each entry's body cleaned to its latest-reply-only text. Returns thread_id (t-alias), participants with message counts, and the most recent `limit` entries. Entry ids are m-aliases usable with get_message/get_attachment. A not_found means the seed id is not in the mirror (an excluded folder, or not synced yet).
 
 | parameter | type | required | description |
 |---|---|---|---|
 | `id` | string | yes | Any message id in the thread (m-alias or raw). |
 | `limit` | integer | no | (default `20`) |
 | `offset` | integer | no | History paging: 0 = the most recent entries; pass the returned next_offset for older ones. (default `0`) |
-| `fresh` | boolean | no | true forces a live Exchange read instead of the local mirror (responses are stamped source=cache\|live). (default `False`) |
 
 #### `get_attachment` — read (min tier: read)
 

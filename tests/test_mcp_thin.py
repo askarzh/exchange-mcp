@@ -78,7 +78,7 @@ def test_registry_matches_daemon_counts(db):
 def test_local_reads_work_with_daemon_down(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     _seed(ctx)
-    res = _run(ctx, "search_messages", query="budget")
+    res = _run(ctx, "search_messages", query="budget", folder="f:inbox")
     assert res["ok"] and res["source"] == "cache" and res["count"] == 1
     alias = res["items"][0]["id"]
     assert alias.startswith("m")
@@ -90,6 +90,19 @@ def test_local_reads_work_with_daemon_down(db):
     assert ov["unread_total"] == 1
     st = _run(ctx, "get_server_status")
     assert st["ok"] and st["daemon"]["reachable"] is False
+
+
+def test_search_with_no_folder_spans_every_mirrored_folder(db):
+    """folder omitted = every mirrored folder — on the MCP side too, a search
+    with no folder returns rows from two different mirrored folders (inbox
+    and sent)."""
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    res = _run(ctx, "search_messages", query="budget")
+    assert res["ok"] and res["source"] == "cache"
+    assert res["count"] == 2
+    subjects = {it["subject"] for it in res["items"]}
+    assert subjects == {"Budget review", "Re: Budget review"}
 
 
 def test_fresh_and_misses_fall_through_to_daemon(db):

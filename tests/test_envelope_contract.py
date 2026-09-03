@@ -70,7 +70,12 @@ def _account():
 
 
 def _ctx(tmp_path, db) -> Context:
-    return make_context(db, gateway=FakeGateway(_account()), cache=False,
+    # cache=True (but unseeded): search_messages is store-only now and needs
+    # a mirror to answer at all — an empty mirror still ships the canonical
+    # empty envelope. list_folders/list_events/find_people don't have rows
+    # synced either, so their cache_reads helpers report a clean miss and
+    # they fall through to the live `_account()` path exactly as before.
+    return make_context(db, gateway=FakeGateway(_account()), cache=True,
                         audit_dir=str(tmp_path / "audit"))
 
 

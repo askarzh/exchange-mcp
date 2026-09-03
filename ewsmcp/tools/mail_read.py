@@ -6,25 +6,28 @@ safety logic lives here — the dispatcher owns tier / kill-switch /
 confirm gates. No direct exchangelib import: all EWS work goes through
 ``account`` attributes inside closures run on the gateway pool.
 
-CACHE-FIRST CONTRACT: when the local mirror can answer (folder synced,
-watermark present, ``fresh`` not requested) reads come from SQLite in
-milliseconds and are stamped ``{"source": "cache", "as_of": …}``;
-otherwise the live EWS path runs and stamps ``{"source": "live"}``. Any
-cache error silently falls back to live — the mirror accelerates reads,
-it never gates them.
+PROVENANCE CONTRACT: `search_messages` answers ONLY from the Postgres
+mirror (the whole mailbox is mirrored, so there is no live search path).
+`get_message`, `list_folders` and `get_mailbox_overview` answer from the
+mirror when it can and are stamped ``{"source": "cache", "as_of": …}``;
+otherwise — or on `fresh: true`, `include_html`, or an attachment
+inventory — the live EWS path runs and stamps ``{"source": "live"}``.
+`get_thread` answers from the mirror or raises `not_found` — every mail
+folder is mirrored, so a seed the mirror does not know is in an excluded
+folder or not synced yet.
 """
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import psycopg
+
 from .. import shared
-from ..bodyclean import clean_body
-from ..dates import parse_when
-from ..dto import envelope, event_card, fmt_dt, msg_card, msg_full
+from ..dto import envelope, event_card, msg_card, msg_full
 from ..errors import ToolError
 from ..gateway.client import WELL_KNOWN, paginate
 from . import cache_reads
@@ -90,7 +93,7 @@ def _fetch_one(account: Any, raw_id: str, only: Optional[List[str]] = None) -> A
 
 
 async def _cards_off_loop(ctx: Context, items: List[Any], tz: str) -> List[Dict[str, Any]]:
-    """Build msg cards on a worker thread: alias mints are SQLite write
+    """Build msg cards on a worker thread: alias mints are Postgres write
     transactions and body cleaning is regex-heavy — neither belongs on the
     event loop. alias_many pre-mints the whole page in ONE transaction so
     the per-card alias_for calls hit the read-only fast path."""
@@ -103,13 +106,6 @@ async def _cards_off_loop(ctx: Context, items: List[Any], tz: str) -> List[Dict[
         return [msg_card(it, ctx.aliaser, tz) for it in items]
 
     return await asyncio.to_thread(build)
-
-
-def _from(item: Any) -> str:
-    sender = getattr(item, "sender", None)
-    name = getattr(sender, "name", None)
-    email = getattr(sender, "email_address", None) or ""
-    return f"{name} <{email}>" if name and name != email else email
 
 
 def _pick_attachment(atts: List[Any], selector: Optional[str]) -> Any:
@@ -206,14 +202,15 @@ async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int =
 
 
 async def _search_messages(ctx: Context, query: Optional[str] = None,
-                           folder: str = "f:inbox", sender: Optional[str] = None,
+                           folder: Optional[str] = None, sender: Optional[str] = None,
                            from_: Optional[str] = None,
                            subject: Optional[str] = None, since: Optional[str] = None,
                            until: Optional[str] = None, is_unread: Optional[bool] = None,
                            has_attachments: Optional[bool] = None,
                            offset: int = 0, limit: int = 20,
-                           mode: str = "keyword",
-                           fresh: bool = False) -> Dict[str, Any]:
+                           mode: str = "keyword") -> Dict[str, Any]:
+    """Store-only search. There is no live Exchange search path: the whole
+    mailbox is mirrored, so the mirror IS the search index."""
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 50))
     if mode == "semantic":
@@ -221,62 +218,18 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                         "semantic search is not available in this build (it returns "
                         "with the archive tier).", hint="Use mode='keyword'.")
     sender = cache_reads.validate_search_args(sender, from_)
-    tz = ctx.settings.ews_tz
-
-    # ---- cache-first: local FTS + SQL filters, exact COUNT(*) total -------
-    if not fresh:
-        hit = await cache_reads.search_messages(
+    if ctx.cache is None:
+        raise ToolError("backend_unavailable", "the mirror is not configured",
+                        hint="Check DATABASE_URL.", retry_after_s=15)
+    try:
+        return await cache_reads.search_messages(
             ctx, folder=folder, query=query, sender=sender, subject=subject,
             since=since, until=until, is_unread=is_unread,
             has_attachments=has_attachments, offset=offset, limit=limit)
-        if hit is not None:
-            return hit
-
-    # ---- live path ---------------------------------------------------------
-    filters: Dict[str, Any] = {}
-    if subject:
-        filters["subject__icontains"] = subject
-    if since:
-        filters["datetime_received__gte"] = parse_when(since, "since", tz)
-    if until:
-        filters["datetime_received__lte"] = parse_when(until, "until", tz)
-    if is_unread is not None:
-        filters["is_read"] = not is_unread
-    if has_attachments is not None:
-        filters["has_attachments"] = bool(has_attachments)
-
-    unfiltered = not query and not filters and not sender
-
-    def work(account: Any) -> Tuple[List[Any], Optional[int], Optional[int]]:
-        target = ctx.gateway.resolve_folder(account, folder, ctx.aliaser)
-        total: Optional[int] = None
-        if unfiltered:
-            # Exact totals are only cheap for a plain listing: one refreshed
-            # folder property instead of a count() full-folder scan.
-            try:
-                target.refresh()
-                total = getattr(target, "total_count", None)
-            except Exception:
-                total = None
-        qs = target.filter(query) if query else target.filter(**filters)
-        page, next_off = paginate(_project(qs), offset=offset, limit=limit)
-        return page, next_off, total
-
-    items, next_offset, total = await ctx.gateway.call(work)
-    if sender:
-        needle = sender.strip().lower()
-
-        def hit(it: Any) -> bool:
-            sd = getattr(it, "sender", None)
-            email = (getattr(sd, "email_address", "") or "").lower()
-            name = (getattr(sd, "name", "") or "").lower()
-            return needle in email or needle in name
-
-        items = [it for it in items if hit(it)]
-        total = None  # client-side post-filter: the upstream total no longer applies
-    cards = await _cards_off_loop(ctx, items, tz)
-    return _stamp(envelope(cards, total_available=total, offset=offset,
-                           next_offset=next_offset), "live")
+    except (psycopg.Error, RuntimeError) as exc:  # psycopg_pool.PoolClosed is RuntimeError
+        raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
+                        hint="Check DATABASE_URL; ewsd repairs the mirror on its own.",
+                        retry_after_s=15) from exc
 
 
 # --------------------------------------------------------------------------
@@ -314,99 +267,22 @@ async def _get_message(ctx: Context, id: str, format: str = "full",
 
 
 async def _get_thread(ctx: Context, id: str, limit: int = 20,
-                      offset: int = 0, fresh: bool = False) -> Dict[str, Any]:
+                      offset: int = 0) -> Dict[str, Any]:
+    """Store-only. Every mail folder is mirrored, so a seed the mirror
+    cannot find is in an excluded folder or has not synced yet — there is
+    no live rebuild fallback."""
     limit = max(1, min(int(limit), 50))
     offset = max(0, int(offset))
     raw_id = id
-    tz = ctx.settings.ews_tz
 
-    if not fresh:
-        hit = await cache_reads.get_thread(ctx, raw_id, limit, offset)
-        if hit is not None:
-            return hit
-
-    def work(account: Any) -> Tuple[Any, str, List[Any]]:
-        seed = _fetch_one(account, raw_id)
-        conv_obj = getattr(seed, "conversation_id", None)
-        conv_id = getattr(conv_obj, "id", None)
-        if not conv_id:
-            raise ToolError(
-                "not_found",
-                "That message carries no conversation id; cannot rebuild a thread.",
-                hint="Use get_message on it instead.",
-            )
-        # 5.0.3: filter needs the ConversationId OBJECT — a plain string
-        # raises TypeError inside Q(). The seed item's own conversation_id
-        # is exactly that object; the string form is only used for the
-        # thread alias. (Behavior pinned in test_exchangelib_signatures.)
-        conv_str = str(conv_id)
-        merged: Dict[str, Any] = {}
-        for source in (account.inbox, account.sent):
-            qs = _project(source.filter(conversation_id=conv_obj), order=None)
-            for it in qs:
-                key = str(getattr(it, "id", "") or "")
-                if key:
-                    merged.setdefault(key, it)
-        if not merged:  # seed lives elsewhere (archive…) — show at least it
-            merged[str(getattr(seed, "id", "") or raw_id)] = seed
-        return seed, conv_str, list(merged.values())
-
-    seed, conv_str, found = await ctx.gateway.call(work)
-
-    def sort_key(it: Any) -> datetime:
-        dt = getattr(it, "datetime_received", None)
-        return dt if dt is not None else datetime.min.replace(tzinfo=timezone.utc)
-
-    found.sort(key=sort_key)
-    total = len(found)
-    # Paging walks BACKWARDS through history: offset=0 is the most recent
-    # `limit` entries; pass the returned next_offset to fetch older ones.
-    hi = max(0, total - offset)
-    lo = max(0, hi - limit)
-    window = found[lo:hi]
-    next_offset = offset + len(window) if lo > 0 else None
-
-    def build() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        counts: Dict[str, int] = {}
-        for it in found:  # participants count the WHOLE thread, not the page
-            counts[_from(it) or "unknown"] = counts.get(_from(it) or "unknown", 0) + 1
-        ctx.aliaser.alias_many([
-            (str(it.id), "m", getattr(it, "changekey", None),
-             getattr(it, "message_id", None))
-            for it in window if getattr(it, "id", None)
-        ])
-        entries: List[Dict[str, Any]] = []
-        for it in window:
-            raw = str(getattr(it, "id", "") or "")
-            entry: Dict[str, Any] = {
-                "id": ctx.aliaser.alias_for(
-                    raw, "m", internet_message_id=getattr(it, "message_id", None),
-                ) if raw else None,
-                "from": _from(it) or "unknown",
-                "date": fmt_dt(getattr(it, "datetime_received", None), tz),
-                "body": clean_body(getattr(it, "text_body", None) or "",
-                                   max_chars=1500)["text"],
-            }
-            if getattr(it, "has_attachments", False):
-                entry["attach"] = True
-            entries.append(entry)
-        participants = [
-            {"name_or_email": who, "msgs": n}
-            for who, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        ]
-        return entries, participants
-
-    entries, participants = await asyncio.to_thread(build)
-    return _stamp({
-        "ok": True,
-        "thread_id": ctx.aliaser.alias_for(conv_str, "t"),
-        "subject": getattr(seed, "subject", "") or "",
-        "participants": participants,
-        "items": entries,
-        "count": len(entries),
-        "total_available": total,
-        "next_offset": next_offset,
-    }, "live")
+    hit = await cache_reads.get_thread(ctx, raw_id, limit, offset)
+    if hit is not None:
+        return hit
+    raise ToolError(
+        "not_found",
+        "That message is not in the mirror (excluded folder or not synced yet).",
+        hint="Use get_message with fresh=true, or wait for the next sync cycle.",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -572,28 +448,32 @@ TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="search_messages",
         description=(
-            "Search mail. TWO ENGINES, mutually exclusive: pass `query` (an "
-            "Exchange AQS string, e.g. 'from:ahmed subject:rfp hasattachment:yes') "
-            "OR the structured filters (sender/subject/since/until/is_unread/"
-            "has_attachments) — combining `query` with any structured filter is "
-            "a validation error. `sender` is matched client-side against the "
-            "fetched page's sender email/name, so total_available is unknown "
-            "when it is used. Results are compact cards, newest first; their "
-            "`id` values are short aliases (m12) for get_message / get_thread / "
-            "get_attachment. If an id later goes stale (items move), re-run "
-            "this search for fresh ids."
+            "Search mail across the local mirror of the whole mailbox. `query` "
+            "is full-text over subject, sender and cleaned body (accent- and "
+            "case-folded, every word matched as a prefix) and combines freely "
+            "with the structured filters (sender/subject/since/until/is_unread/"
+            "has_attachments) — they all AND together. Omit `folder` to search "
+            "every mirrored folder; drafts/junk/trash/outbox are not mirrored "
+            "and naming one is a validation error. Results are compact cards, "
+            "most relevant then newest first, with an exact total_available; "
+            "their `id` values are short aliases (m12) for get_message / "
+            "get_thread / get_attachment. If an id later goes stale (items "
+            "move), re-run this search for fresh ids."
         ),
         side_effect_class="read",
         requires_ews=True,
         input_schema=_schema({
             "query": {
                 "type": "string",
-                "description": "AQS query string — cannot be combined with the "
+                "description": "Full-text query over subject, sender and "
+                               "cleaned body; combines freely with the "
                                "structured filters below.",
             },
             "folder": {
-                "type": "string", "default": "f:inbox",
-                "description": "Folder alias (f:inbox, f:sent, f7), path, or raw id.",
+                "type": "string",
+                "description": "Restrict to one folder: wk alias (f:inbox, "
+                               "f:sent), folder alias (f7), path, or raw id. "
+                               "Omit to search EVERY mirrored folder.",
             },
             "sender": {
                 "type": "string",
@@ -625,7 +505,6 @@ TOOLS: List[ToolSpec] = [
                 "default": "keyword",
                 "description": "semantic is reserved; keyword only in this build.",
             },
-            "fresh": dict(_FRESH_PROPERTY),
         }),
         handler=_search_messages,
     ),
@@ -658,12 +537,14 @@ TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="get_thread",
         description=(
-            "Rebuild the conversation containing the given message id: Inbox "
-            "and Sent are merged and sorted chronologically, each entry's body "
-            "cleaned to its latest-reply-only text. Returns thread_id "
-            "(t-alias), participants with message counts, and the most recent "
-            "`limit` entries. Entry ids are m-aliases usable with get_message/"
-            "get_attachment. Stale id → re-run search_messages."
+            "Rebuild the conversation containing the given message id from "
+            "the local mirror: every mail folder is mirrored and merged, "
+            "sorted chronologically, each entry's body cleaned to its "
+            "latest-reply-only text. Returns thread_id (t-alias), "
+            "participants with message counts, and the most recent `limit` "
+            "entries. Entry ids are m-aliases usable with get_message/"
+            "get_attachment. A not_found means the seed id is not in the "
+            "mirror (an excluded folder, or not synced yet)."
         ),
         side_effect_class="read",
         requires_ews=True,
@@ -676,7 +557,6 @@ TOOLS: List[ToolSpec] = [
                 "description": "History paging: 0 = the most recent entries; "
                                "pass the returned next_offset for older ones.",
             },
-            "fresh": dict(_FRESH_PROPERTY),
         }, required=["id"]),
         handler=_get_thread,
     ),
