@@ -53,13 +53,22 @@ class ThrowawayPostgres:
             check=True, capture_output=True,
         )
         self._container = name
-        port_line = subprocess.run(
-            ["docker", "port", name, "5432/tcp"], check=True,
-            capture_output=True, text=True,
-        ).stdout.strip().splitlines()[0]
-        port = port_line.rsplit(":", 1)[1]
-        self.dsn = f"postgresql://postgres:test@127.0.0.1:{port}/postgres"
-        wait_ready(self.dsn)
+        # Anything from here on (port lookup, readiness wait) can raise, and
+        # a raise inside __enter__ means __exit__ never runs — so the
+        # container itself must be torn down here on any failure, not left
+        # for a caller who will never get the chance to call us again.
+        try:
+            port_line = subprocess.run(
+                ["docker", "port", name, "5432/tcp"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip().splitlines()[0]
+            port = port_line.rsplit(":", 1)[1]
+            self.dsn = f"postgresql://postgres:test@127.0.0.1:{port}/postgres"
+            wait_ready(self.dsn)
+        except BaseException:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+            self._container = None
+            raise
         return self.dsn
 
     def __exit__(self, *exc_info) -> None:
