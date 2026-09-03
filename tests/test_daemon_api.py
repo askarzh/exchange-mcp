@@ -38,6 +38,14 @@ def test_bearer_required_except_health(db):
     assert _drive(app, "/v1/tools", headers=AUTH)[0] == 200
 
 
+def test_openapi_paths_use_daemon_tools_prefix(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    app = build_daemon_app(ctx, ctx.settings)
+    _status, body = _drive(app, "/openapi.json", headers=AUTH)
+    assert body["paths"]
+    assert all(p.startswith("/v1/tools/") for p in body["paths"])
+
+
 def test_tools_listing_carries_public_schemas(db):
     ctx = make_context(db, ewsd_api_key="k", ews_capability_tier="full")
     app = build_daemon_app(ctx, ctx.settings)

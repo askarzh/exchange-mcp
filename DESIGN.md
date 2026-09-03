@@ -195,7 +195,10 @@ schema, 1 MiB body cap), `GET /v1/status`, `/metrics` (Prometheus) and
 `/openapi.json` are behind `EWSD_API_KEY`; `GET /livez`, `/readyz`,
 `/health`, `/version` are always public; `PUT|POST /upload/<token>` is
 deliberately ahead of the bearer gate — the unguessable single-use token
-IS the credential.
+IS the credential. `/upload/<token>` is served ONLY by `ewsd` (port 8790
+by default): `create_upload_link` builds the capability URL from
+`EXTERNAL_URL`, so any reverse proxy in front of the stack must route
+`/upload/*` through to `ewsd`, not to `ewsmcp`.
 **Never-exit boot** (both processes): tools/routes register and
 transports bind before any Exchange contact; in `ewsd` a background
 warmup loop owns connection recovery (exponential backoff + jitter,

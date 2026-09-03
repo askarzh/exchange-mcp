@@ -439,6 +439,8 @@ ids change when items move; re-run the search for fresh ones.
 | `rate_capped` | 429 | send rate cap reached (`retry_after_s` included) |
 | `upstream_error` | 502 | Exchange failed the call |
 | `upstream_unavailable` | 503 | connection cold/circuit open (`retry_after_s`) |
+| `daemon_unavailable` | 503 | ewsd unreachable from the MCP; check `EWSD_URL` |
+| `backend_unavailable` | 503 | Postgres unreachable and ewsd unreachable |
 
 ## Two-phase confirmation
 

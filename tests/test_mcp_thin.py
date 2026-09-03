@@ -140,3 +140,11 @@ def test_unknown_alias_is_validation_error_locally(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     res = _run(ctx, "get_message", id="m999")
     assert res["ok"] is False and res["error"]["code"] == "validation"
+
+
+def test_semantic_search_is_validation_error_on_mcp_side(db):
+    """mode='semantic' is rejected locally (mcp/local.py) before ever reaching
+    the daemon or Exchange -- it is reserved, not implemented in this build."""
+    ctx = _mcp_ctx(db, DeadDaemon())
+    res = _run(ctx, "search_messages", query="budget", mode="semantic")
+    assert res["ok"] is False and res["error"]["code"] == "validation"

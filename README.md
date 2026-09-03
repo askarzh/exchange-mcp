@@ -146,6 +146,7 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `EWSD_HOST` / `EWSD_PORT` | `127.0.0.1` / `8790` | Where `ewsd` serves its HTTP API |
 | `EWSD_API_KEY` | — | Bearer `ewsmcp` presents to `ewsd`; required off-loopback |
 | `EWSD_URL` | `http://127.0.0.1:8790` | `ewsmcp`'s base URL for the daemon |
+| `EXTERNAL_URL` | `` (empty) | Public base URL that reaches `ewsd` — used to build the absolute capability URL returned by `create_upload_link`; the proxy must route `/upload/*` to `ewsd`:8790. Empty → the tool returns a relative `/upload/<token>` |
 | `EWS_CAPABILITY_TIER` | `draft` | `read` ⊂ `draft` ⊂ `full` — above-tier tools are unregistered in `ewsmcp` AND refused by `ewsd`'s gate chain |
 | `SEND_ENABLED` | `false` | Global send kill-switch (blocks every send-class tool), enforced in `ewsd` |
 | `EWS_RECIPIENT_ALLOWLIST` / `EWS_RECIPIENT_DENYLIST` | — | Glob lists enforced on argument-borne AND draft-resolved recipients |

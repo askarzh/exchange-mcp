@@ -3,6 +3,7 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ews
       POSTGRES_PASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
@@ -18,6 +19,7 @@ services:
   ewsd:
     build: .
     image: ews-mcp:dev
+    restart: unless-stopped
     command: ["ewsd"]
     env_file: .env
     environment:
@@ -40,6 +42,7 @@ services:
 
   ewsmcp:
     image: ews-mcp:dev
+    restart: unless-stopped
     command: ["ewsmcp"]
     env_file: .env
     environment:
@@ -54,7 +57,7 @@ services:
       - "8000:8000"
     depends_on:
       ewsd:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   pgdata:

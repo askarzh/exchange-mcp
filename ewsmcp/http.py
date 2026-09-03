@@ -6,17 +6,15 @@ import logging
 from typing import Any
 
 import jsonschema
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__, uploads
 from .errors import HTTP_BY_CODE
-from .server import build_context, build_mcp_server, start_connection_manager
+from .server import start_connection_manager
 from .tools.base import dispatch
 from .tools.calendar_people import _get_server_status
 
 logger = logging.getLogger(__name__)
 
-PUBLIC_PATHS = {"/health", "/livez", "/readyz", "/version"}
 MAX_BODY_BYTES = 1_048_576  # 1 MiB — tool arguments, not attachments
 
 
@@ -95,11 +93,11 @@ def _metrics_text(ctx) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _openapi(ctx) -> dict[str, Any]:
+def _openapi(ctx, tools_prefix: str) -> dict[str, Any]:
     paths = {}
     for name, spec in ctx.registry.items():
         schema = spec.public_schema()
-        paths[f"/api/tools/{name}"] = {"post": {
+        paths[f"{tools_prefix}/{name}"] = {"post": {
             "operationId": name,
             "summary": schema["description"][:120],
             "requestBody": {"content": {"application/json": {"schema": schema["inputSchema"]}}},
@@ -145,7 +143,7 @@ async def _read_json_body(receive, send) -> Any | None:
 def build_app(ctx, settings, streamable: Any | None = None, *,
              mount_mcp: bool = True, tools_prefix: str = "/api/tools",
              api_key: str | None = None):
-    """ASGI app closure — separated from serve_http so tests can drive it.
+    """ASGI app closure, driven directly by tests (no uvicorn needed).
 
     ``mount_mcp`` and ``tools_prefix`` let the daemon (ewsd) reuse this same
     closure without the Streamable HTTP MCP transport and under a `/v1/tools`
@@ -227,7 +225,7 @@ def build_app(ctx, settings, streamable: Any | None = None, *,
             ]})
             return await send({"type": "http.response.body", "body": body})
         if path == "/openapi.json" and method == "GET":
-            return await _send_json(send, 200, _openapi(ctx))
+            return await _send_json(send, 200, _openapi(ctx, tools_prefix))
         if path == tools_prefix and method == "GET":
             return await _send_json(send, 200, {"tools": [
                 {"name": s.name, "class": s.side_effect_class,
@@ -264,17 +262,3 @@ def build_app(ctx, settings, streamable: Any | None = None, *,
             "code": "validation", "message": "not found"}})
 
     return app
-
-
-async def serve_http(settings) -> None:
-    import uvicorn
-
-    ctx = build_context(settings)
-    mcp_server = build_mcp_server(ctx)
-    streamable = StreamableHTTPSessionManager(app=mcp_server, json_response=False,
-                                              stateless=True)
-    app = build_app(ctx, settings, streamable)
-    config = uvicorn.Config(app, host=settings.mcp_host, port=settings.mcp_port,
-                            log_level=settings.log_level.lower(), http="h11")
-    async with streamable.run():
-        await uvicorn.Server(config).serve()
