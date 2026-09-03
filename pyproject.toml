@@ -9,8 +9,11 @@ description = "EWS MCP server — a lean, safety-gated, cache-first tool surface
 requires-python = ">=3.11"
 dependencies = [
     "exchangelib==5.0.3",
+    "httpx>=0.27",
     "jsonschema>=4.21",
     "mcp>=1.27,<2",
+    "psycopg[binary]>=3.2",
+    "psycopg_pool>=3.2",
     "pydantic>=2.8",
     "pydantic-settings>=2.5",
     "tzdata",  # zoneinfo source of truth: slim images/Windows ship no OS tzdb
@@ -30,9 +33,13 @@ ewsmcp = "ewsmcp.main:main"
 [tool.setuptools.packages.find]
 include = ["ewsmcp*"]
 
+[tool.setuptools.package-data]
+"ewsmcp.migrations" = ["*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
+cache_dir = ".pytest_cache_local"
 
 [tool.ruff]
 target-version = "py311"
