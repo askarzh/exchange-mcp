@@ -114,13 +114,26 @@ def test_unmirrored_folder_is_a_validation_error_without_touching_the_daemon(db)
 
 
 def test_search_of_a_mirrored_but_unsynced_folder_is_empty(db):
-    """f:junk is known (seed_folders wrote it) but never synced — an empty
-    cache-served result, not a fall-through to the daemon."""
+    """The custom Archive folder is known (seed_folders wrote it, no wk) but
+    never synced — an empty cache-served result, not a fall-through to the
+    daemon. (f:junk is EWS_MIRROR_EXCLUDE'd, not merely unsynced — see the
+    validation-error test below.)"""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    res = _run(ctx, "search_messages", folder="Archive 2024")
+    assert res["ok"] is True and res["source"] == "cache" and res["count"] == 0
+    assert daemon.calls == []
+
+
+def test_search_of_an_excluded_folder_is_a_validation_error(db):
+    """f:junk is in EWS_MIRROR_EXCLUDE — it is never item-synced at all, so
+    searching it is refused up front rather than silently returning empty."""
     daemon = RecordingDaemon()
     ctx = _mcp_ctx(db, daemon)
     _seed(ctx)
     res = _run(ctx, "search_messages", folder="f:junk")
-    assert res["ok"] is True and res["source"] == "cache" and res["count"] == 0
+    assert res["ok"] is False and res["error"]["code"] == "validation"
     assert daemon.calls == []
 
 

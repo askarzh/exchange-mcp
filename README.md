@@ -162,10 +162,9 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` / `MCP_API_KEY` | stdio | `ewsmcp` HTTP serving + bearer auth (all unused in stdio mode) |
 | `DATA_DIR` | `~/.ewsmcp` | `ewsd`'s local mail-at-rest (audit chain). Absolute; cloud-synced paths are refused (`DATA_DIR_ALLOW_SYNCED=true` to override) |
 | `SHARED_DIR` | — | Optional shared-space root for saved attachments (see `add_attachment`/`get_attachment`) |
-| `EWS_CACHE_FOLDERS` | `inbox,sent` | Delta-synced folders |
+| `EWS_MIRROR_EXCLUDE` | `drafts,junk,trash,outbox` | Well-known folders NOT mirrored; every other mail folder is mirrored in full |
 | `EWS_CACHE_SYNC_SECONDS` | `45` | Delta cadence |
 | `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence |
-| `EWS_CACHE_WINDOW_DAYS` | `365` | Mirror backfill window |
 | `EWS_TZ` | `Asia/Riyadh` | Server timezone for date grammar + display |
 
 Removed from the 4.5 line and no longer read: `EWS_CACHE_ENABLED`,

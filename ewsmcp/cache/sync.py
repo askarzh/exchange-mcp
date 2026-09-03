@@ -1,16 +1,17 @@
 """Background delta-sync: exchangelib's native SyncFolderItems primitives.
 
 Owned by the ConnectionManager's warm state: the engine starts when the
-connection first warms up and loops forever. Every cycle applies item
-deltas for the hot folders (resumable ``sync_state`` tokens persisted in
-the store — a container restart resumes instead of re-downloading), and a
-slower cadence refreshes the folder tree (which structurally fixes the
-frozen unread/total-counts finding), the expanded calendar window, and
+connection first warms up and loops forever. Every cycle refreshes the
+folder hierarchy FIRST (so a folder created a minute ago is mirrored in
+the same cycle, and one that disappeared is cleaned up), then applies
+item deltas for every mail folder except the ones EWS_MIRROR_EXCLUDE
+names. Each folder carries its own resumable `sync_state` token keyed
+`item:<folder ews id>`, so a container restart resumes instead of
+re-downloading. A slower lane refreshes the expanded calendar window and
 the tasks folder.
 
 Failure posture: ANY exception marks the engine degraded and is retried
-next cycle; tools always fall back to live EWS — the cache accelerates,
-never gates. All EWS work runs on the gateway's bounded pool.
+next cycle. All EWS work runs on the gateway's bounded pool.
 """
 
 from __future__ import annotations
@@ -41,6 +42,11 @@ TASK_FIELDS = ["id", "changekey", "subject", "due_date", "is_complete", "status"
 BODY_CLEAN_MAX = 20_000
 CALENDAR_WINDOW_DAYS = 14
 CALENDAR_MAX_ITEMS = 200
+
+# Folders that hold Calendar/Contacts/Tasks items live under msg_folder_root
+# too. They are mirrored by their own lanes (or not at all); running the
+# mail ITEM_FIELDS projection against them would fail every cycle.
+NON_MAIL_WK = frozenset({"f:calendar", "f:contacts", "f:tasks"})
 
 
 def _ts(dt: Any) -> int | None:
@@ -129,24 +135,26 @@ class SyncEngine:
         self.settings = settings
         self.gateway = gateway
         self.store = store
-        self.folder_keys = [
-            k.strip().lower()
-            for k in (settings.ews_cache_folders or "").split(",") if k.strip()
-        ]
+        self.excluded_wks = {
+            f"f:{part.strip().lower()}"
+            for part in (settings.ews_mirror_exclude or "").split(",")
+            if part.strip()
+        }
         self.last_error: str | None = None
         self.last_cycle_ts: float | None = None
         self.cycles = 0
         self._task: asyncio.Task | None = None
         self._stopped = False
         self._last_slow_ts = 0.0
+        self._folders: dict[str, Any] = {}  # {ews id: Folder} to item-sync
 
     # ------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name="cache-sync")
-            logger.info("cache sync engine started (folders=%s, every %ss)",
-                        self.folder_keys, self.settings.ews_cache_sync_seconds)
+            logger.info("cache sync engine started (excluding %s, every %ss)",
+                        sorted(self.excluded_wks), self.settings.ews_cache_sync_seconds)
 
     async def stop(self) -> None:
         self._stopped = True
@@ -184,64 +192,32 @@ class SyncEngine:
     # --------------------------------------------------------------- cycle
 
     async def _cycle(self) -> None:
+        await self.gateway.call(self._sync_hierarchy)
         await self.gateway.call(self._sync_mail_folders)
         slow_every = max(60, int(self.settings.ews_cache_hierarchy_seconds))
         if time.time() - self._last_slow_ts >= slow_every:
             await self.gateway.call(self._sync_slow_lane)
             self._last_slow_ts = time.time()
 
-    def _sync_mail_folders(self, account: Any) -> None:
-        """Apply item deltas for each hot folder (runs on the EWS pool)."""
-        tz = self.settings.ews_tz
-        window_floor = (
-            datetime.now(ZoneInfo(tz))
-            - timedelta(days=int(self.settings.ews_cache_window_days))
-        )
-        for key in self.folder_keys:
-            folder = getattr(account, key, None)
-            if folder is None:
-                continue
-            folder_id = str(getattr(folder, "id", "") or "")
-            if not folder_id:
-                continue
-            token = self.store.get_sync_state(f"item:{folder_id}")
-            upserts: list[dict[str, Any]] = []
-            deletes: list[str] = []
-            read_flags: list[tuple] = []
-            for change_type, payload in folder.sync_items(
-                sync_state=token, only_fields=ITEM_FIELDS,
-            ):
-                if change_type in ("create", "update"):
-                    received = getattr(payload, "datetime_received", None)
-                    if received is not None and received < window_floor:
-                        continue  # outside the mirror window — skip storing
-                    if getattr(payload, "id", None):
-                        upserts.append(row_from_message(payload, folder_id, tz))
-                elif change_type == "delete":
-                    deletes.append(str(payload.id))
-                elif change_type == "read_flag_change":
-                    item_id, is_read = payload
-                    read_flags.append((str(item_id.id), bool(is_read)))
-            self.store.upsert_messages(upserts)
-            self.store.delete_messages_by_id(deletes)
-            for ews_id, is_read in read_flags:
-                self.store.set_read_flag([ews_id], is_read)
-            self.store.set_sync_state(f"item:{folder_id}", folder.item_sync_state,
-                                      time.time())
+    def _sync_hierarchy(self, account: Any) -> None:
+        """Refresh ews.folders and decide what to item-sync this cycle.
 
-    def _sync_slow_lane(self, account: Any) -> None:
-        """Folder tree + expanded calendar window + tasks (every ~10 min)."""
-        tz = self.settings.ews_tz
-        # Folder tree with fresh counts — the frozen-counts fix.
-        rows: list[dict[str, Any]] = []
+        Runs BEFORE item sync so a folder created since the last cycle is
+        mirrored immediately. A folder that disappeared from the hierarchy
+        has its sync token dropped and its `live` rows deleted; archived
+        rows stay (they are Phase 2's archive, not a mirror).
+        """
         wk_by_raw: dict[str, str] = {}
         for wk_alias, attr in WELL_KNOWN.items():
             try:
                 fid = getattr(getattr(account, attr, None), "id", None)
                 if fid:
-                    wk_by_raw.setdefault(fid, wk_alias)
+                    wk_by_raw.setdefault(str(fid), wk_alias)
             except Exception:  # noqa: BLE001, S112 - best-effort well-known lookup
                 continue
+
+        rows: list[dict[str, Any]] = []
+        folders: dict[str, Any] = {}
 
         def walk(folder: Any, prefix: str) -> None:
             for child in list(getattr(folder, "children", None) or []):
@@ -249,24 +225,74 @@ class SyncEngine:
                 path = f"{prefix}/{name}" if prefix else name
                 raw_id = getattr(child, "id", None)
                 if raw_id:
+                    fid = str(raw_id)
+                    wk = wk_by_raw.get(fid)
                     rows.append({
-                        "ews_id": str(raw_id),
+                        "ews_id": fid,
                         "name": name,
                         "path": path,
-                        "wk": wk_by_raw.get(raw_id),
+                        "wk": wk,
                         "total": getattr(child, "total_count", None) or 0,
                         "unread": getattr(child, "unread_count", None) or 0,
                         "children": len(list(getattr(child, "children", None) or [])),
                     })
+                    if wk not in self.excluded_wks and wk not in NON_MAIL_WK:
+                        folders[fid] = child
                 walk(child, path)
 
-        try:
-            walk(account.msg_folder_root, "")
-            if rows:
-                self.store.replace_folders(rows)
-        except Exception as exc:  # noqa: BLE001 - folder tree sync is best-effort
-            logger.debug("folder tree sync failed: %s", exc)
+        walk(account.msg_folder_root, "")
+        if not rows:
+            return  # a failed walk must not look like "every folder vanished"
 
+        known_before = {r["ews_id"] for r in self.store.folder_rows()}
+        self.store.replace_folders(rows)
+        self._folders = folders
+
+        for gone in known_before - {r["ews_id"] for r in rows}:
+            removed = self.store.delete_live_messages_in_folder(gone)
+            self.store.drop_sync_state(f"item:{gone}")
+            logger.info("folder %s disappeared — dropped token, %s live rows",
+                        gone, removed)
+
+    def _sync_mail_folders(self, account: Any) -> None:
+        """Apply item deltas for every mirrored folder (runs on the EWS pool).
+
+        One folder failing degrades only that folder: the rest of the mailbox
+        keeps syncing and the bad one is retried next cycle.
+        """
+        tz = self.settings.ews_tz
+        for folder_id, folder in list(self._folders.items()):
+            try:
+                self._sync_one_folder(folder_id, folder, tz)
+            except Exception as exc:  # noqa: BLE001 - per-folder degrade
+                logger.warning("folder %s delta failed: %s", folder_id, exc)
+
+    def _sync_one_folder(self, folder_id: str, folder: Any, tz: str) -> None:
+        token = self.store.get_sync_state(f"item:{folder_id}")
+        upserts: list[dict[str, Any]] = []
+        deletes: list[str] = []
+        read_flags: list[tuple] = []
+        for change_type, payload in folder.sync_items(
+            sync_state=token, only_fields=ITEM_FIELDS,
+        ):
+            if change_type in ("create", "update"):
+                if getattr(payload, "id", None):
+                    upserts.append(row_from_message(payload, folder_id, tz))
+            elif change_type == "delete":
+                deletes.append(str(payload.id))
+            elif change_type == "read_flag_change":
+                item_id, is_read = payload
+                read_flags.append((str(item_id.id), bool(is_read)))
+        self.store.upsert_messages(upserts)
+        self.store.delete_messages_by_id(deletes)
+        for ews_id, is_read in read_flags:
+            self.store.set_read_flag([ews_id], is_read)
+        self.store.set_sync_state(f"item:{folder_id}", folder.item_sync_state,
+                                  time.time())
+
+    def _sync_slow_lane(self, account: Any) -> None:
+        """Expanded calendar window + tasks folder (every ~10 min)."""
+        tz = self.settings.ews_tz
         # Expanded calendar occurrences for the overview window.
         try:
             now = datetime.now(ZoneInfo(tz))

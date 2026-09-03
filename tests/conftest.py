@@ -104,6 +104,7 @@ class FakeGateway:
 INBOX_ID = "F-INBOX"
 SENT_ID = "F-SENT"
 JUNK_ID = "F-JUNK"
+ARCHIVE_ID = "F-ARCHIVE"
 
 _FOLDER_ROWS = [
     {"ews_id": INBOX_ID, "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
@@ -111,6 +112,11 @@ _FOLDER_ROWS = [
     {"ews_id": SENT_ID, "name": "Sent Items", "path": "Sent Items", "wk": "f:sent",
      "total": 0, "unread": 0, "children": 0},
     {"ews_id": JUNK_ID, "name": "Junk Email", "path": "Junk Email", "wk": "f:junk",
+     "total": 0, "unread": 0, "children": 0},
+    # a custom, non-well-known folder: mirrored (not excluded) but never
+    # synced — the "known but empty" case, distinct from f:junk which is
+    # excluded from the mirror entirely by EWS_MIRROR_EXCLUDE.
+    {"ews_id": ARCHIVE_ID, "name": "Archive 2024", "path": "Archive 2024", "wk": None,
      "total": 0, "unread": 0, "children": 0},
 ]
 

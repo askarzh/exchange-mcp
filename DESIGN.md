@@ -166,11 +166,14 @@ call shipped 115,457 chars for a ~150-char message.
   NFKD-decompose, drop combining marks (é→e, ё→е), lowercase. This is
   Python-side accent folding, not a database extension, so index and
   query always agree without an extra dependency in Postgres itself.
-- **Watermarks decide what is mirrored.** `ewsd`'s `SyncEngine` runs
-  resumable `SyncFolderItems` deltas every `EWS_CACHE_SYNC_SECONDS` (45)
-  for `EWS_CACHE_FOLDERS` (inbox,sent), and a slow lane every
-  `EWS_CACHE_HIERARCHY_SECONDS` (600) refreshes the folder tree (honest
-  unread/total counts), the calendar window, and the tasks folder.
+- **The whole mailbox is mirrored.** `ewsd`'s `SyncEngine` refreshes the
+  folder hierarchy first on every cycle, then runs resumable
+  `SyncFolderItems` deltas (`EWS_CACHE_SYNC_SECONDS`, 45) for every mail
+  folder except the well-known ones `EWS_MIRROR_EXCLUDE` names
+  (drafts, junk, trash, outbox), with one token per folder keyed
+  `item:<folder ews id>`. A slower lane (`EWS_CACHE_HIERARCHY_SECONDS`,
+  600) refreshes the calendar window and the tasks folder. A folder that
+  disappears loses its token and its `live` rows; archived rows stay.
   Failures degrade — `ewsmcp` reads fall back to `ewsd`'s live route
   (`fresh=true`), the server never gates on the mirror.
 - Provenance contract: every read is stamped `source: cache|live` (+
