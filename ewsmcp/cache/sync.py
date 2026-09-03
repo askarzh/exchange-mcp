@@ -20,7 +20,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..bodyclean import clean_body
@@ -43,14 +43,14 @@ CALENDAR_WINDOW_DAYS = 14
 CALENDAR_MAX_ITEMS = 200
 
 
-def _ts(dt: Any) -> Optional[int]:
+def _ts(dt: Any) -> int | None:
     try:
         return int(dt.timestamp())
     except (AttributeError, OSError, OverflowError, ValueError, TypeError):
         return None
 
 
-def row_from_message(item: Any, folder_key: str, tz: str) -> Dict[str, Any]:
+def row_from_message(item: Any, folder_key: str, tz: str) -> dict[str, Any]:
     """Message item → mirror row. Body cleaned HERE (the 700× paid once)."""
     sender = getattr(item, "sender", None)
     sender_email = getattr(sender, "email_address", None) or ""
@@ -61,7 +61,7 @@ def row_from_message(item: Any, folder_key: str, tz: str) -> Dict[str, Any]:
     if text:
         try:
             body_clean = clean_body(text, max_chars=BODY_CLEAN_MAX)["text"]
-        except Exception:
+        except Exception:  # noqa: BLE001 - fall back to the raw body, never fail sync
             body_clean = text[:BODY_CLEAN_MAX]
     to = [
         r.email_address
@@ -94,7 +94,7 @@ def row_from_message(item: Any, folder_key: str, tz: str) -> Dict[str, Any]:
     }
 
 
-def row_from_event(item: Any, tz: str) -> Dict[str, Any]:
+def row_from_event(item: Any, tz: str) -> dict[str, Any]:
     organizer = getattr(item, "organizer", None)
     return {
         "ews_id": str(getattr(item, "id", "") or ""),
@@ -112,7 +112,7 @@ def row_from_event(item: Any, tz: str) -> Dict[str, Any]:
     }
 
 
-def row_from_task(item: Any, tz: str) -> Dict[str, Any]:
+def row_from_task(item: Any, tz: str) -> dict[str, Any]:
     due = getattr(item, "due_date", None)
     return {
         "ews_id": str(getattr(item, "id", "") or ""),
@@ -127,20 +127,18 @@ def row_from_task(item: Any, tz: str) -> Dict[str, Any]:
 
 
 class SyncEngine:
-    def __init__(self, settings: Any, gateway: Any, store: CacheStore,
-                 semantic: Any = None):
+    def __init__(self, settings: Any, gateway: Any, store: CacheStore):
         self.settings = settings
         self.gateway = gateway
         self.store = store
-        self.semantic = semantic  # optional vector tier; failures degrade
         self.folder_keys = [
             k.strip().lower()
             for k in (settings.ews_cache_folders or "").split(",") if k.strip()
         ]
-        self.last_error: Optional[str] = None
-        self.last_cycle_ts: Optional[float] = None
+        self.last_error: str | None = None
+        self.last_cycle_ts: float | None = None
         self.cycles = 0
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._stopped = False
         self._last_slow_ts = 0.0
 
@@ -158,10 +156,10 @@ class SyncEngine:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
                 pass
 
-    def status(self) -> Dict[str, Any]:
+    def status(self) -> dict[str, Any]:
         return {
             "cycles": self.cycles,
             "last_cycle_age_s": (int(time.time() - self.last_cycle_ts)
@@ -176,7 +174,7 @@ class SyncEngine:
                 self.last_error = None
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - degrade, never die
                 # Degrade, never die: tools keep answering from live EWS
                 # (or from the last good mirror state) while we retry.
                 self.last_error = f"{type(exc).__name__}: {exc}"[:500]
@@ -206,9 +204,9 @@ class SyncEngine:
             if folder is None:
                 continue
             token = self.store.get_sync_state(f"item:{key}")
-            upserts: List[Dict[str, Any]] = []
-            deletes: List[str] = []
-            read_flags: List[tuple] = []
+            upserts: list[dict[str, Any]] = []
+            deletes: list[str] = []
+            read_flags: list[tuple] = []
             for change_type, payload in folder.sync_items(
                 sync_state=token, only_fields=ITEM_FIELDS,
             ):
@@ -229,29 +227,19 @@ class SyncEngine:
                 self.store.set_read_flag([ews_id], is_read)
             self.store.set_sync_state(f"item:{key}", folder.item_sync_state,
                                       time.time())
-            if self.semantic is not None and (upserts or deletes):
-                try:  # embeddings ride the sync, never gate it
-                    self.semantic.add([
-                        {"ews_id": r["ews_id"],
-                         "text": f"{r['subject']}\n{r['body_clean']}"}
-                        for r in upserts
-                    ])
-                    self.semantic.delete(deletes)
-                except Exception as exc:
-                    logger.warning("semantic indexing skipped this cycle: %s", exc)
 
     def _sync_slow_lane(self, account: Any) -> None:
         """Folder tree + expanded calendar window + tasks (every ~10 min)."""
         tz = self.settings.ews_tz
         # Folder tree with fresh counts — the frozen-counts fix.
-        rows: List[Dict[str, Any]] = []
-        wk_by_raw: Dict[str, str] = {}
+        rows: list[dict[str, Any]] = []
+        wk_by_raw: dict[str, str] = {}
         for wk_alias, attr in WELL_KNOWN.items():
             try:
                 fid = getattr(getattr(account, attr, None), "id", None)
                 if fid:
                     wk_by_raw.setdefault(fid, wk_alias)
-            except Exception:
+            except Exception:  # noqa: BLE001, S112 - best-effort well-known lookup
                 continue
 
         def walk(folder: Any, prefix: str) -> None:
@@ -275,7 +263,7 @@ class SyncEngine:
             walk(account.msg_folder_root, "")
             if rows:
                 self.store.replace_folders(rows)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - folder tree sync is best-effort
             logger.debug("folder tree sync failed: %s", exc)
 
         # Expanded calendar occurrences for the overview window.
@@ -291,7 +279,7 @@ class SyncEngine:
                 [row_from_event(ev, tz) for ev in events
                  if getattr(ev, "id", None)])
             self.store.set_sync_state("events", None, time.time())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - calendar sync is best-effort
             logger.debug("calendar window sync failed: %s", exc)
 
         # Tasks folder (small; delta-synced like mail).
@@ -299,8 +287,8 @@ class SyncEngine:
             tasks_folder = getattr(account, "tasks", None)
             if tasks_folder is not None:
                 token = self.store.get_sync_state("item:tasks")
-                upserts: List[Dict[str, Any]] = []
-                deletes: List[str] = []
+                upserts: list[dict[str, Any]] = []
+                deletes: list[str] = []
                 for change_type, payload in tasks_folder.sync_items(
                     sync_state=token, only_fields=TASK_FIELDS,
                 ):
@@ -314,5 +302,5 @@ class SyncEngine:
                 self.store.set_sync_state("item:tasks",
                                           tasks_folder.item_sync_state,
                                           time.time())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - tasks sync is best-effort
             logger.debug("tasks sync failed: %s", exc)

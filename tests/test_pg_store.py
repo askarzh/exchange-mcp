@@ -1,11 +1,7 @@
-"""CacheStore: schema, FTS search, filters, write-through patches, stats.
-
-Arabic-search correctness has its own mandatory gate suite
-(test_arabic_search.py); here the store mechanics are pinned.
-"""
+"""CacheStore on Postgres: schema, tsvector search, filters, write-through
+patches, stats, and the accent/prefix folded search behaviour."""
 
 import json
-import sqlite3
 import time
 
 import pytest
@@ -40,10 +36,8 @@ def make_row(ews_id, *, folder="inbox", subject="Budget review",
 
 
 @pytest.fixture
-def store(tmp_path):
-    s = CacheStore(tmp_path / "mirror.db")
-    yield s
-    s.close()
+def store(db):
+    return CacheStore(db)
 
 
 def test_upsert_and_fts_search(store):
@@ -55,7 +49,7 @@ def test_upsert_and_fts_search(store):
     assert total == 1 and rows[0]["ews_id"] == "M1"
     rows, total = store.search_messages(text="noon")
     assert total == 1 and rows[0]["ews_id"] == "M2"
-    # upsert replaces (same PK) and the FTS shadow follows via triggers
+    # upsert replaces (same PK) and the tsvector shadow follows the generated column
     updated = make_row("M2", subject="Lunch moved", body="now at one")
     store.upsert_messages([updated])
     rows, total = store.search_messages(text="noon")
@@ -112,8 +106,8 @@ def test_write_through_patches(store):
     assert json.loads(store.get_message("M1")["categories_json"]) == ["Follow up"]
     store.tombstone_messages(["M1"])
     assert store.get_message("M1") is None
-    rows, total = store.search_messages(text="budget")
-    assert total == 0  # FTS shadow deleted with the row
+    _rows, total = store.search_messages(text="budget")
+    assert total == 0  # row (and its tsvector shadow) is gone
 
 
 def test_unread_page_and_watermarks(store):
@@ -129,13 +123,6 @@ def test_unread_page_and_watermarks(store):
     assert store.get_sync_state("item:inbox") == "TOKEN-1"
     assert store.watermark("item:inbox") == 1234
     assert "item:inbox" in store.watermarks()
-
-
-def test_reads_are_read_only_connections(store, tmp_path):
-    store.upsert_messages([make_row("M1")])
-    with store._read() as conn:
-        with pytest.raises(sqlite3.OperationalError):
-            conn.execute("DELETE FROM messages")
 
 
 def test_stats_and_purge(store):
@@ -200,3 +187,46 @@ def test_task_rows(store):
     store.delete_tasks_by_id(["T1"])
     rows, total = store.task_rows(include_completed=True)
     assert total == 1
+
+
+def test_prefix_and_accent_folded_search(store):
+    store.upsert_messages([
+        make_row("M1", subject="Résumé review", body="café numbers"),
+        make_row("M2", subject="Отчёт за квартал", body="цифры во вложении"),
+    ])
+    rows, total = store.search_messages(text="resume")
+    assert total == 1 and rows[0]["ews_id"] == "M1"
+    rows, total = store.search_messages(text="отч")  # prefix, Cyrillic
+    assert total == 1 and rows[0]["ews_id"] == "M2"
+    rows, total = store.search_messages(text="cafe numb")  # AND of prefixes
+    assert total == 1
+
+
+def test_text_search_ranks_by_relevance_then_date(store):
+    store.upsert_messages([
+        make_row("M1", subject="budget", body="budget budget budget", date_ts=100),
+        make_row("M2", subject="budget", body="unrelated", date_ts=200),
+    ])
+    rows, _ = store.search_messages(text="budget")
+    assert [r["ews_id"] for r in rows] == ["M1", "M2"]
+
+
+def test_archived_filter(store):
+    store.upsert_messages([make_row("M1"), make_row("M2")])
+    with store.db.conn() as c:
+        c.execute("UPDATE ews.messages SET archive_state='verified' WHERE ews_id='M2'")
+    assert store.search_messages(archived="only")[1] == 1
+    assert store.search_messages(archived="exclude")[1] == 1
+    assert store.search_messages(archived="any")[1] == 2
+    assert store.get_message("M2")["archive_state"] == "verified"
+
+
+def test_upsert_never_touches_archive_columns(store):
+    store.upsert_messages([make_row("M1")])
+    with store.db.conn() as c:
+        c.execute("UPDATE ews.messages SET archive_state='captured', "
+                  "mime_sha256='abc' WHERE ews_id='M1'")
+    store.upsert_messages([make_row("M1", subject="edited")])
+    row = store.get_message("M1")
+    assert row["subject"] == "edited"
+    assert row["archive_state"] == "captured" and row["mime_sha256"] == "abc"

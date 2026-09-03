@@ -66,19 +66,19 @@ def _account():
     return account
 
 
-def _engine(tmp_path, account, **overrides):
+def _engine(db, account, **overrides):
     settings = make_settings(**overrides)
-    store = CacheStore(tmp_path / "mirror.db")
+    store = CacheStore(db)
     return SyncEngine(settings, FakeGateway(account), store), store
 
 
-def test_cycle_applies_creates_updates_deletes_and_read_flags(tmp_path):
+def test_cycle_applies_creates_updates_deletes_and_read_flags(db):
     account = _account()
     account.inbox.queue([
         ("create", _msg("M1", subject="First", is_read=False)),
         ("create", _msg("M2", subject="Second")),
     ], "TOK-1")
-    engine, store = _engine(tmp_path, account)
+    engine, store = _engine(db, account)
     asyncio.run(engine._cycle())
     assert store.get_message("M1")["subject"] == "First"
     assert store.get_sync_state("item:inbox") == "TOK-1"
@@ -98,32 +98,32 @@ def test_cycle_applies_creates_updates_deletes_and_read_flags(tmp_path):
     assert account.inbox.seen_tokens[-1] == "TOK-1"
 
 
-def test_window_floor_skips_ancient_backfill(tmp_path):
+def test_window_floor_skips_ancient_backfill(db):
     account = _account()
     ancient = NOW - timedelta(days=4000)
     account.inbox.queue([
         ("create", _msg("OLD", dt=ancient)),
         ("create", _msg("NEW")),
     ], "TOK-1")
-    engine, store = _engine(tmp_path, account, ews_cache_window_days=365)
+    engine, store = _engine(db, account, ews_cache_window_days=365)
     asyncio.run(engine._cycle())
     assert store.get_message("OLD") is None
     assert store.get_message("NEW") is not None
 
 
-def test_cycle_failure_degrades_not_dies(tmp_path):
+def test_cycle_failure_degrades_not_dies(db):
     class BoomGateway:
         async def call(self, fn):
             raise ConnectionError("exchange gone")
 
     settings = make_settings()
-    store = CacheStore(tmp_path / "mirror.db")
+    store = CacheStore(db)
     engine = SyncEngine(settings, BoomGateway(), store)
 
     async def one_iteration():
         try:
             await engine._cycle()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - mirrors SyncEngine._loop's catch-all
             engine.last_error = f"{type(exc).__name__}: {exc}"
 
     asyncio.run(one_iteration())
@@ -141,7 +141,7 @@ def test_row_from_message_cleans_body_once(tmp_path):
     assert row["internet_message_id"] == "<M1@corp.example>"
 
 
-def test_slow_lane_syncs_folders_calendar_tasks(tmp_path):
+def test_slow_lane_syncs_folders_calendar_tasks(db):
     account = _account()
 
     def folder_node(fid, name, children=(), total=0, unread=0):
@@ -171,11 +171,11 @@ def test_slow_lane_syncs_folders_calendar_tasks(tmp_path):
         id="T1", changekey=None, subject="File report",
         due_date=None, is_complete=False, status="NotStarted"))], "TT-1")
 
-    engine, store = _engine(tmp_path, account)
+    engine, store = _engine(db, account)
     engine._sync_slow_lane(account)
     folders = {r["path"]: r for r in store.folder_rows()}
     assert folders["Inbox"]["unread"] == 2
     assert store.events_window(0, 2**40)
-    rows, total = store.task_rows()
+    _rows, total = store.task_rows()
     assert total == 1
     assert store.get_sync_state("item:tasks") == "TT-1"

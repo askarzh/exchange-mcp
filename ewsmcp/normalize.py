@@ -1,67 +1,26 @@
-"""Arabic-correct text normalization — ONE function for index AND query.
+"""Text normalisation shared by the indexer and the query side.
 
-The FTS mirror stores a normalized shadow of every message and normalizes
-every query string with the SAME function, so orthographic variants match:
-a body containing "تمت الإحاطة" is found by searching "الاحاطه" (alef-hamza
-variant + teh-marbuta/heh) and by the undiacritized form of any diacritized
-word. Folds applied:
-
-- strip tashkeel/diacritics  U+064B–U+0652 and the dagger alef U+0670
-- strip tatweel              U+0640
-- fold alef variants         أ / إ / آ / ٱ → ا
-- fold alef maqsura          ى → ي
-- fold teh marbuta           ة → ه
-- fold hamza carriers        ؤ → و,  ئ → ي
-- strip bidi/control marks   (reuses bodyclean._BIDI_RE)
-- fold Arabic-Indic digits   ٠-٩ (U+0660–0669) and ۰-۹ (U+06F0–06F9) → 0-9
-
-ASCII passes through untouched (FTS5's unicode61 tokenizer case-folds it),
-so mixed Arabic/English queries work. The FTS5 tokenizer additionally runs
-``unicode61 remove_diacritics 2`` as a second safety layer.
+One function feeds ``messages.norm_text`` (from which Postgres generates
+``search_tsv`` with the ``simple`` config) and every search query, so the two
+sides always agree: NFKD-decompose, drop combining marks (é→e, ё→е), lowercase.
+No stemming, no stopwords, no language-specific folding.
 """
 
 import re
+import unicodedata
 
-from .bodyclean import _BIDI_RE
-
-# Tashkeel U+064B..U+0652 plus the superscript (dagger) alef U+0670.
-_DIACRITICS_RE = re.compile("[ً-ْٰ]")
-
-_FOLDS = str.maketrans({
-    "ـ": None,   # tatweel
-    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",   # alef variants
-    "ى": "ي",          # alef maqsura
-    "ة": "ه",          # teh marbuta
-    "ؤ": "و",          # hamza on waw
-    "ئ": "ي",          # hamza on yeh
-    # Arabic-Indic digits (U+0660-0669)
-    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
-    # Extended Arabic-Indic digits (U+06F0-06F9)
-    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
-    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
-})
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
-def normalize_ar(text: str) -> str:
-    """Normalize Arabic orthography for indexing/search. Idempotent."""
+def normalize_text(text: str) -> str:
     if not text:
         return ""
-    text = _BIDI_RE.sub("", text)
-    text = _DIACRITICS_RE.sub("", text)
-    return text.translate(_FOLDS)
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
 
 
-_FTS_TOKEN_RE = re.compile(r"[^\s\"'()*:^-]+")
-
-
-def fts_match_expression(query: str) -> str:
-    """Turn a user query into a safe FTS5 MATCH expression.
-
-    Each whitespace token is normalized, stripped of FTS5 operator
-    characters and double-quoted (implicit AND between tokens). A trailing
-    ``*`` per token enables prefix matching so partial words still hit.
-    Returns "" when nothing searchable remains.
-    """
-    tokens = _FTS_TOKEN_RE.findall(normalize_ar(query or ""))
-    return " ".join(f'"{t}"*' for t in tokens if t)
+def tsquery(query: str) -> str:
+    """Safe ``to_tsquery('simple', …)`` expression: every word becomes a
+    prefix term, terms are ANDed. Returns "" when nothing is searchable."""
+    tokens = _TOKEN_RE.findall(normalize_text(query or ""))
+    return " & ".join(f"{t}:*" for t in tokens if t)

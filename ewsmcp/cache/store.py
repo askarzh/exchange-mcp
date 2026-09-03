@@ -1,141 +1,39 @@
-"""Per-mailbox SQLite mirror — the "fetch email very fast" core.
+"""Per-mailbox Postgres mirror — the "fetch email very fast" core, shared by
+the daemon (writer) and every MCP process (readers).
 
-Design rules (hard requirements, lessons from a real SQLite corruption in
-a sibling project):
-
-- SINGLE WRITER. Only this store's writer connection (used by the sync
-  engine and the write-through path, serialized by one lock) ever writes.
-  Tool reads open short-lived ``mode=ro`` connections — under WAL they
-  never block the writer and can't corrupt anything.
-- Cleaned bodies are stored ONCE at sync time (``bodyclean`` output), so
-  the measured 115 kB raw-HTML email costs its ~150 chars exactly once.
-- Arabic-correct FTS: ``messages_fts`` indexes a NORMALIZED shadow text
-  (``normalize.normalize_ar`` over subject + sender + body), queries are
-  normalized with the same function, and the tokenizer adds
-  ``unicode61 remove_diacritics 2``. Original text is returned.
-- Timestamps are stored twice: epoch seconds (sortable/filterable) and
-  the display ISO string in the server timezone.
-- The mirror is mail-at-rest: it lives under the guarded ``data_dir``
-  (absolute, never cloud-synced) with owner-only permissions.
+- Cleaned bodies are stored ONCE at sync time (``bodyclean`` output).
+- Full-text search: ``messages.search_tsv`` is a generated tsvector over
+  ``norm_text`` (``normalize.normalize_text`` of subject + sender + body);
+  queries go through ``normalize.tsquery``. Ranked by ``ts_rank_cd`` then date.
+- Timestamps are stored twice: epoch seconds (filter/sort) and the display
+  ISO string in the server timezone.
+- Archive columns (``archive_state``, ``mime_*`` …) are owned by the Phase 2
+  archiver; ``upsert_messages`` never touches them.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-import os
-import sqlite3
-import threading
 import time
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
-from ..normalize import fts_match_expression, normalize_ar
+import psycopg
+
+from ..db import Database
+from ..normalize import normalize_text, tsquery
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 1
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-CREATE TABLE IF NOT EXISTS messages (
-    ews_id              TEXT PRIMARY KEY,
-    changekey           TEXT,
-    folder              TEXT NOT NULL,
-    conversation_id     TEXT,
-    sender_name         TEXT,
-    sender_email        TEXT,
-    to_json             TEXT,
-    subject             TEXT,
-    date_ts             INTEGER,
-    date_iso            TEXT,
-    is_read             INTEGER NOT NULL DEFAULT 1,
-    has_attachments     INTEGER NOT NULL DEFAULT 0,
-    importance          TEXT,
-    categories_json     TEXT,
-    body_clean          TEXT,
-    internet_message_id TEXT,
-    norm_text           TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_msg_folder_date ON messages(folder, date_ts DESC);
-CREATE INDEX IF NOT EXISTS ix_msg_conversation ON messages(conversation_id);
-CREATE INDEX IF NOT EXISTS ix_msg_sender ON messages(sender_email);
-CREATE INDEX IF NOT EXISTS ix_msg_imid ON messages(internet_message_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    norm_text,
-    content='messages',
-    content_rowid='rowid',
-    tokenize='unicode61 remove_diacritics 2'
-);
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, norm_text) VALUES (new.rowid, new.norm_text);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, norm_text)
-    VALUES ('delete', old.rowid, old.norm_text);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, norm_text)
-    VALUES ('delete', old.rowid, old.norm_text);
-    INSERT INTO messages_fts(rowid, norm_text) VALUES (new.rowid, new.norm_text);
-END;
-CREATE TABLE IF NOT EXISTS events (
-    ews_id       TEXT PRIMARY KEY,
-    changekey    TEXT,
-    subject      TEXT,
-    start_ts     INTEGER,
-    start_iso    TEXT,
-    end_ts       INTEGER,
-    end_iso      TEXT,
-    location     TEXT,
-    organizer    TEXT,
-    is_recurring INTEGER NOT NULL DEFAULT 0,
-    my_response  TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_events_start ON events(start_ts);
-CREATE TABLE IF NOT EXISTS tasks (
-    ews_id      TEXT PRIMARY KEY,
-    changekey   TEXT,
-    subject     TEXT,
-    due_ts      INTEGER,
-    due_iso     TEXT,
-    is_complete INTEGER NOT NULL DEFAULT 0,
-    status      TEXT
-);
-CREATE TABLE IF NOT EXISTS folders (
-    ews_id   TEXT PRIMARY KEY,
-    name     TEXT,
-    path     TEXT,
-    wk       TEXT,
-    total    INTEGER,
-    unread   INTEGER,
-    children INTEGER
-);
-CREATE TABLE IF NOT EXISTS sync_state (
-    key   TEXT PRIMARY KEY,
-    token TEXT,
-    as_of INTEGER
-);
-CREATE TABLE IF NOT EXISTS sender_sigs (
-    sender_email TEXT NOT NULL,
-    sig_hash     TEXT NOT NULL,
-    hits         INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (sender_email, sig_hash)
-);
-"""
-
-# A trailing block must recur this often before reads strip it — one
-# coincidental match must never delete real content.
 SIG_MIN_HITS = 3
 _SIG_MAX_LINES = 6
 _SIG_MAX_CHARS = 400
+_ARCHIVED = {"any": "TRUE", "only": "m.archive_state <> 'live'",
+             "exclude": "m.archive_state = 'live'"}
 
 
-def trailing_block(body: str) -> Optional[str]:
+def trailing_block(body: str) -> str | None:
     """The candidate signature block: the last blank-line-separated block,
     when it is short enough to be a signature and is not the whole body."""
     body = (body or "").rstrip()
@@ -153,477 +51,338 @@ def trailing_block(body: str) -> Optional[str]:
 
 
 def _sig_hash(sender_email: str, block: str) -> str:
-    import hashlib
     return hashlib.sha256(
-        f"{sender_email.lower()}|{normalize_ar(block)}".encode()
-    ).hexdigest()
+        f"{sender_email.lower()}|{normalize_text(block)}".encode()).hexdigest()
+
+
+_UPSERT_MESSAGE = """
+INSERT INTO ews.messages (ews_id, changekey, folder, conversation_id, sender_name,
+    sender_email, to_json, subject, date_ts, date_iso, is_read, has_attachments,
+    importance, categories_json, body_clean, internet_message_id, norm_text)
+VALUES (%(ews_id)s, %(changekey)s, %(folder)s, %(conversation_id)s, %(sender_name)s,
+    %(sender_email)s, %(to_json)s, %(subject)s, %(date_ts)s, %(date_iso)s, %(is_read)s,
+    %(has_attachments)s, %(importance)s, %(categories_json)s, %(body_clean)s,
+    %(internet_message_id)s, %(norm_text)s)
+ON CONFLICT (ews_id) DO UPDATE SET
+    changekey = EXCLUDED.changekey, folder = EXCLUDED.folder,
+    conversation_id = EXCLUDED.conversation_id, sender_name = EXCLUDED.sender_name,
+    sender_email = EXCLUDED.sender_email, to_json = EXCLUDED.to_json,
+    subject = EXCLUDED.subject, date_ts = EXCLUDED.date_ts, date_iso = EXCLUDED.date_iso,
+    is_read = EXCLUDED.is_read, has_attachments = EXCLUDED.has_attachments,
+    importance = EXCLUDED.importance, categories_json = EXCLUDED.categories_json,
+    body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id,
+    norm_text = EXCLUDED.norm_text
+"""
 
 
 class CacheStore:
-    """Owner of the mirror database. One instance per process."""
+    """Owner of the mirror queries. One instance per process; the pool is the db's."""
 
-    def __init__(self, db_path: "str | os.PathLike[str]"):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        try:  # owner-only, best effort (no-op on Windows ACLs)
-            os.chmod(self.db_path.parent, 0o700)
-        except OSError:
-            pass
-        self._lock = threading.RLock()
-        self._writer: Optional[sqlite3.Connection] = None
-        self._ensure_schema()
+    def __init__(self, db: Database):
+        self.db = db
 
-    # ------------------------------------------------------------ plumbing
-
-    def _writer_conn(self) -> sqlite3.Connection:
-        if self._writer is None:
-            conn = sqlite3.connect(str(self.db_path), timeout=10.0,
-                                   check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("PRAGMA foreign_keys=ON;")
-            conn.row_factory = sqlite3.Row
-            self._writer = conn
-        return self._writer
-
-    @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
-            conn = self._writer_conn()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                yield conn
-                conn.execute("COMMIT")
-            except Exception:
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-                raise
-
-    @contextmanager
-    def _read(self) -> Iterator[sqlite3.Connection]:
-        """Short-lived read-only connection: tools NEVER touch the writer."""
-        uri = f"file:{self.db_path.as_posix()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
-
-    def _ensure_schema(self) -> None:
-        with self._lock:
-            conn = self._writer_conn()
-            conn.executescript(_SCHEMA)
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
-                (str(_SCHEMA_VERSION),),
-            )
-            conn.commit()
-
-    def close(self) -> None:
-        with self._lock:
-            if self._writer is not None:
-                self._writer.close()
-                self._writer = None
+    def close(self) -> None:  # kept for call-site compatibility
+        return None
 
     # ------------------------------------------------------------- writers
 
     @staticmethod
     def norm_for_row(subject: str, sender_name: str, sender_email: str,
                      body_clean: str) -> str:
-        return normalize_ar(
-            " ".join(p for p in (subject, sender_name, sender_email, body_clean) if p)
-        )
+        return normalize_text(
+            " ".join(p for p in (subject, sender_name, sender_email, body_clean) if p))
 
-    def upsert_messages(self, rows: List[Dict[str, Any]]) -> int:
-        """Insert/update message rows in ONE transaction (sync + write-through).
-
-        Also LEARNS per-sender signatures: the trailing block of each body
-        is hashed per sender; once the same block recurs SIG_MIN_HITS times
-        the read paths strip it (closes the measured gap where a corporate
-        signature survived clean_body)."""
+    def upsert_messages(self, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
-        with self._write() as conn:
+        with self.db.conn() as c:
             for r in rows:
                 block = trailing_block(r.get("body_clean") or "")
                 sender = (r.get("sender_email") or "").lower()
                 if block and sender:
-                    conn.execute(
-                        "INSERT INTO sender_sigs (sender_email, sig_hash, hits) "
-                        "VALUES (?, ?, 1) "
-                        "ON CONFLICT(sender_email, sig_hash) "
-                        "DO UPDATE SET hits = hits + 1",
-                        (sender, _sig_hash(sender, block)),
-                    )
-            for r in rows:
-                conn.execute(
-                    """
-                    INSERT INTO messages (ews_id, changekey, folder,
-                        conversation_id, sender_name, sender_email, to_json,
-                        subject, date_ts, date_iso, is_read, has_attachments,
-                        importance, categories_json, body_clean,
-                        internet_message_id, norm_text)
-                    VALUES (:ews_id, :changekey, :folder, :conversation_id,
-                        :sender_name, :sender_email, :to_json, :subject,
-                        :date_ts, :date_iso, :is_read, :has_attachments,
-                        :importance, :categories_json, :body_clean,
-                        :internet_message_id, :norm_text)
-                    ON CONFLICT(ews_id) DO UPDATE SET
-                        changekey=excluded.changekey,
-                        folder=excluded.folder,
-                        conversation_id=excluded.conversation_id,
-                        sender_name=excluded.sender_name,
-                        sender_email=excluded.sender_email,
-                        to_json=excluded.to_json,
-                        subject=excluded.subject,
-                        date_ts=excluded.date_ts,
-                        date_iso=excluded.date_iso,
-                        is_read=excluded.is_read,
-                        has_attachments=excluded.has_attachments,
-                        importance=excluded.importance,
-                        categories_json=excluded.categories_json,
-                        body_clean=excluded.body_clean,
-                        internet_message_id=excluded.internet_message_id,
-                        norm_text=excluded.norm_text
-                    """,
-                    r,
-                )
+                    c.execute(
+                        "INSERT INTO ews.sender_sigs (sender_email, sig_hash, hits) "
+                        "VALUES (%s, %s, 1) ON CONFLICT (sender_email, sig_hash) "
+                        "DO UPDATE SET hits = ews.sender_sigs.hits + 1",
+                        (sender, _sig_hash(sender, block)))
+            c.cursor().executemany(_UPSERT_MESSAGE, rows)
         return len(rows)
 
-    def delete_messages_by_id(self, ews_ids: List[str]) -> int:
+    def delete_messages_by_id(self, ews_ids: list[str]) -> int:
         if not ews_ids:
             return 0
-        with self._write() as conn:
-            for ews_id in ews_ids:
-                conn.execute("DELETE FROM messages WHERE ews_id=?", (ews_id,))
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.messages WHERE ews_id = ANY(%s)", (list(ews_ids),))
         return len(ews_ids)
 
-    # Write-through spellings used by the tool handlers:
     tombstone_messages = delete_messages_by_id
 
-    def set_read_flag(self, ews_ids: List[str], is_read: bool) -> None:
+    def set_read_flag(self, ews_ids: list[str], is_read: bool) -> None:
         if not ews_ids:
             return
-        with self._write() as conn:
-            for ews_id in ews_ids:
-                conn.execute("UPDATE messages SET is_read=? WHERE ews_id=?",
-                             (1 if is_read else 0, ews_id))
+        with self.db.conn() as c:
+            c.execute("UPDATE ews.messages SET is_read = %s WHERE ews_id = ANY(%s)",
+                      (1 if is_read else 0, list(ews_ids)))
 
-    def apply_categories(self, ews_id: str, categories: Optional[List[str]]) -> None:
-        with self._write() as conn:
-            conn.execute("UPDATE messages SET categories_json=? WHERE ews_id=?",
-                         (json.dumps(categories or []), ews_id))
+    def apply_categories(self, ews_id: str, categories: list[str] | None) -> None:
+        with self.db.conn() as c:
+            c.execute("UPDATE ews.messages SET categories_json = %s WHERE ews_id = %s",
+                      (json.dumps(categories or []), ews_id))
 
-    def replace_events(self, rows: List[Dict[str, Any]]) -> None:
-        """Replace the expanded-occurrences window (refresh strategy)."""
-        with self._write() as conn:
-            conn.execute("DELETE FROM events")
-            for r in rows:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO events (ews_id, changekey, subject,
-                        start_ts, start_iso, end_ts, end_iso, location,
-                        organizer, is_recurring, my_response)
-                    VALUES (:ews_id, :changekey, :subject, :start_ts,
-                        :start_iso, :end_ts, :end_iso, :location, :organizer,
-                        :is_recurring, :my_response)
-                    """,
-                    r,
-                )
+    def replace_events(self, rows: list[dict[str, Any]]) -> None:
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.events")
+            c.cursor().executemany(
+                "INSERT INTO ews.events (ews_id, changekey, subject, start_ts, start_iso, "
+                "end_ts, end_iso, location, organizer, is_recurring, my_response) VALUES "
+                "(%(ews_id)s, %(changekey)s, %(subject)s, %(start_ts)s, %(start_iso)s, "
+                "%(end_ts)s, %(end_iso)s, %(location)s, %(organizer)s, %(is_recurring)s, "
+                "%(my_response)s) ON CONFLICT (ews_id) DO UPDATE SET "
+                "changekey = EXCLUDED.changekey, subject = EXCLUDED.subject, "
+                "start_ts = EXCLUDED.start_ts, start_iso = EXCLUDED.start_iso, "
+                "end_ts = EXCLUDED.end_ts, end_iso = EXCLUDED.end_iso, "
+                "location = EXCLUDED.location, organizer = EXCLUDED.organizer, "
+                "is_recurring = EXCLUDED.is_recurring, my_response = EXCLUDED.my_response",
+                rows)
 
-    def upsert_tasks(self, rows: List[Dict[str, Any]]) -> None:
+    def upsert_tasks(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
-        with self._write() as conn:
-            for r in rows:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO tasks (ews_id, changekey, subject,
-                        due_ts, due_iso, is_complete, status)
-                    VALUES (:ews_id, :changekey, :subject, :due_ts, :due_iso,
-                        :is_complete, :status)
-                    """,
-                    r,
-                )
+        with self.db.conn() as c:
+            c.cursor().executemany(
+                "INSERT INTO ews.tasks (ews_id, changekey, subject, due_ts, due_iso, "
+                "is_complete, status) VALUES (%(ews_id)s, %(changekey)s, %(subject)s, "
+                "%(due_ts)s, %(due_iso)s, %(is_complete)s, %(status)s) "
+                "ON CONFLICT (ews_id) DO UPDATE SET changekey = EXCLUDED.changekey, "
+                "subject = EXCLUDED.subject, due_ts = EXCLUDED.due_ts, "
+                "due_iso = EXCLUDED.due_iso, is_complete = EXCLUDED.is_complete, "
+                "status = EXCLUDED.status", rows)
 
-    def delete_tasks_by_id(self, ews_ids: List[str]) -> None:
+    def delete_tasks_by_id(self, ews_ids: list[str]) -> None:
         if not ews_ids:
             return
-        with self._write() as conn:
-            for ews_id in ews_ids:
-                conn.execute("DELETE FROM tasks WHERE ews_id=?", (ews_id,))
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.tasks WHERE ews_id = ANY(%s)", (list(ews_ids),))
 
-    def replace_folders(self, rows: List[Dict[str, Any]]) -> None:
-        with self._write() as conn:
-            conn.execute("DELETE FROM folders")
-            for r in rows:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO folders (ews_id, name, path, wk,
-                        total, unread, children)
-                    VALUES (:ews_id, :name, :path, :wk, :total, :unread,
-                        :children)
-                    """,
-                    r,
-                )
+    def replace_folders(self, rows: list[dict[str, Any]]) -> None:
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.folders")
+            c.cursor().executemany(
+                "INSERT INTO ews.folders (ews_id, name, path, wk, total, unread, children) "
+                "VALUES (%(ews_id)s, %(name)s, %(path)s, %(wk)s, %(total)s, %(unread)s, "
+                "%(children)s) ON CONFLICT (ews_id) DO UPDATE SET name = EXCLUDED.name, "
+                "path = EXCLUDED.path, wk = EXCLUDED.wk, total = EXCLUDED.total, "
+                "unread = EXCLUDED.unread, children = EXCLUDED.children", rows)
 
-    def get_sync_state(self, key: str) -> Optional[str]:
-        with self._read() as conn:
-            row = conn.execute("SELECT token FROM sync_state WHERE key=?",
-                               (key,)).fetchone()
+    def get_sync_state(self, key: str) -> str | None:
+        with self.db.conn() as c:
+            row = c.execute("SELECT token FROM ews.sync_state WHERE key = %s",
+                            (key,)).fetchone()
         return row["token"] if row else None
 
-    def set_sync_state(self, key: str, token: Optional[str],
-                       as_of_ts: Optional[float] = None) -> None:
-        with self._write() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state(key, token, as_of) "
-                "VALUES (?, ?, ?)",
-                (key, token, int(as_of_ts if as_of_ts is not None else time.time())),
-            )
+    def set_sync_state(self, key: str, token: str | None,
+                       as_of_ts: float | None = None) -> None:
+        with self.db.conn() as c:
+            c.execute(
+                "INSERT INTO ews.sync_state (key, token, as_of) VALUES (%s, %s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET token = EXCLUDED.token, "
+                "as_of = EXCLUDED.as_of",
+                (key, token, int(as_of_ts if as_of_ts is not None else time.time())))
 
     def purge(self) -> None:
-        """Drop every mirrored row and sync token (admin path; the next
-        sync cycle rebuilds from scratch)."""
-        with self._write() as conn:
-            for table in ("messages", "events", "tasks", "folders",
-                          "sync_state", "sender_sigs"):
-                conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed names
-        logger.warning("cache purged: %s", self.db_path)
+        with self.db.conn() as c:
+            c.execute("TRUNCATE ews.messages, ews.events, ews.tasks, ews.folders, "
+                      "ews.sync_state, ews.sender_sigs")
+        logger.warning("mirror purged")
 
     # -------------------------------------------------------------- reads
 
-    def watermark(self, key: str) -> Optional[int]:
+    def watermark(self, key: str) -> int | None:
         try:
-            with self._read() as conn:
-                row = conn.execute("SELECT as_of FROM sync_state WHERE key=?",
-                                   (key,)).fetchone()
-            return int(row["as_of"]) if row else None
-        except sqlite3.Error:
+            with self.db.conn() as c:
+                row = c.execute("SELECT as_of FROM ews.sync_state WHERE key = %s",
+                                (key,)).fetchone()
+            return int(row["as_of"]) if row and row["as_of"] is not None else None
+        except psycopg.Error:
             return None
 
-    def watermarks(self) -> Dict[str, int]:
+    def watermarks(self) -> dict[str, int]:
         try:
-            with self._read() as conn:
-                rows = conn.execute("SELECT key, as_of FROM sync_state").fetchall()
-            return {r["key"]: int(r["as_of"]) for r in rows}
-        except sqlite3.Error:
+            with self.db.conn() as c:
+                rows = c.execute("SELECT key, as_of FROM ews.sync_state").fetchall()
+            return {r["key"]: int(r["as_of"]) for r in rows if r["as_of"] is not None}
+        except psycopg.Error:
             return {}
 
-    def stats(self) -> Dict[str, Any]:
-        counts: Dict[str, int] = {}
-        try:
-            with self._read() as conn:
-                for table in ("messages", "events", "tasks", "folders"):
-                    counts[table] = conn.execute(
-                        f"SELECT COUNT(*) AS c FROM {table}"  # noqa: S608
-                    ).fetchone()["c"]
-        except sqlite3.Error:
-            pass
+    def stats(self) -> dict[str, Any]:
+        counts: dict[str, int] = {}
         db_mb = 0.0
         try:
-            db_mb = round(self.db_path.stat().st_size / 1_048_576, 2)
-        except OSError:
+            with self.db.conn() as c:
+                for table in ("messages", "events", "tasks", "folders"):
+                    counts[table] = c.execute(
+                        f"SELECT COUNT(*) AS n FROM ews.{table}").fetchone()["n"]
+                size = c.execute(
+                    "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0) AS b "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'ews' AND c.relkind = 'r'").fetchone()["b"]
+                db_mb = round(int(size) / 1_048_576, 2)
+        except psycopg.Error:
             pass
         return {"rows": counts, "db_mb": db_mb, "watermarks": self.watermarks()}
 
     def search_messages(
-        self,
-        *,
-        folders: Optional[List[str]] = None,
-        text: Optional[str] = None,
-        sender: Optional[str] = None,
-        subject: Optional[str] = None,
-        since_ts: Optional[int] = None,
-        until_ts: Optional[int] = None,
-        is_unread: Optional[bool] = None,
-        has_attachments: Optional[bool] = None,
-        offset: int = 0,
-        limit: int = 20,
-    ) -> Tuple[List[sqlite3.Row], int]:
-        """Local search: FTS over the normalized shadow + SQL filters.
-        Returns (rows, exact_total) — COUNT(*) is free here, which restores
-        the exact total_available the live path can no longer afford."""
-        where: List[str] = []
-        params: List[Any] = []
-        joins = ""
-        if text:
-            match = fts_match_expression(text)
-            if match:
-                joins = ("JOIN messages_fts f ON f.rowid = m.rowid "
-                         "AND messages_fts MATCH ?")
-                params.append(match)
+        self, *, folders: list[str] | None = None, text: str | None = None,
+        sender: str | None = None, subject: str | None = None,
+        since_ts: int | None = None, until_ts: int | None = None,
+        is_unread: bool | None = None, has_attachments: bool | None = None,
+        archived: str = "any", offset: int = 0, limit: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        where: list[str] = [_ARCHIVED.get(archived, "TRUE")]
+        params: list[Any] = []
+        q = tsquery(text) if text else ""
+        if q:
+            where.append("m.search_tsv @@ to_tsquery('simple', %s)")
+            params.append(q)
         if folders:
-            where.append(f"m.folder IN ({','.join('?' * len(folders))})")
-            params.extend(folders)
+            where.append("m.folder = ANY(%s)")
+            params.append(list(folders))
         if sender:
-            where.append("(m.sender_email LIKE ? OR m.sender_name LIKE ?)")
-            needle = f"%{sender.strip()}%"
+            needle = f"%{sender.strip().lower()}%"
+            where.append("(lower(m.sender_email) LIKE %s OR lower(m.sender_name) LIKE %s)")
             params.extend([needle, needle])
         if subject:
-            where.append("m.subject LIKE ?")
-            params.append(f"%{subject.strip()}%")
+            where.append("lower(m.subject) LIKE %s")
+            params.append(f"%{subject.strip().lower()}%")
         if since_ts is not None:
-            where.append("m.date_ts >= ?")
+            where.append("m.date_ts >= %s")
             params.append(int(since_ts))
         if until_ts is not None:
-            where.append("m.date_ts <= ?")
+            where.append("m.date_ts <= %s")
             params.append(int(until_ts))
         if is_unread is not None:
-            where.append("m.is_read = ?")
+            where.append("m.is_read = %s")
             params.append(0 if is_unread else 1)
         if has_attachments is not None:
-            where.append("m.has_attachments = ?")
+            where.append("m.has_attachments = %s")
             params.append(1 if has_attachments else 0)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
-        base = f"FROM messages m {joins}{clause}"
-        with self._read() as conn:
-            total = conn.execute(f"SELECT COUNT(*) AS c {base}",  # noqa: S608
-                                 params).fetchone()["c"]
-            rows = conn.execute(
-                f"SELECT m.* {base} ORDER BY m.date_ts DESC "  # noqa: S608
-                "LIMIT ? OFFSET ?",
-                [*params, int(limit), int(offset)],
-            ).fetchall()
+        base = "FROM ews.messages m WHERE " + " AND ".join(where)
+        order, order_params = "m.date_ts DESC", []
+        if q:
+            order = "ts_rank_cd(m.search_tsv, to_tsquery('simple', %s)) DESC, m.date_ts DESC"
+            order_params = [q]
+        with self.db.conn() as c:
+            total = c.execute(f"SELECT COUNT(*) AS n {base}", params).fetchone()["n"]
+            rows = c.execute(
+                f"SELECT m.* {base} ORDER BY {order} LIMIT %s OFFSET %s",
+                [*params, *order_params, int(limit), int(offset)]).fetchall()
         return rows, int(total)
 
     def strip_learned_signature(self, sender_email: str, body: str) -> str:
-        """Drop the trailing block when it is a LEARNED signature for this
-        sender (recurred >= SIG_MIN_HITS times). Deterministic, read-only."""
         block = trailing_block(body)
         sender = (sender_email or "").lower()
         if not block or not sender:
             return body
         try:
-            with self._read() as conn:
-                row = conn.execute(
-                    "SELECT hits FROM sender_sigs WHERE sender_email=? "
-                    "AND sig_hash=?",
-                    (sender, _sig_hash(sender, block)),
-                ).fetchone()
-        except sqlite3.Error:
+            with self.db.conn() as c:
+                row = c.execute(
+                    "SELECT hits FROM ews.sender_sigs WHERE sender_email = %s "
+                    "AND sig_hash = %s", (sender, _sig_hash(sender, block))).fetchone()
+        except psycopg.Error:
             return body
         if row is not None and row["hits"] >= SIG_MIN_HITS:
             return body.rstrip().rpartition("\n\n")[0].rstrip()
         return body
 
-    def get_message(self, ews_id: str) -> Optional[sqlite3.Row]:
-        with self._read() as conn:
-            return conn.execute(
-                "SELECT * FROM messages WHERE ews_id=? OR internet_message_id=?",
-                (ews_id, ews_id),
-            ).fetchone()
+    def get_message(self, ews_id: str) -> dict[str, Any] | None:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT * FROM ews.messages WHERE ews_id = %s OR internet_message_id = %s "
+                "LIMIT 1", (ews_id, ews_id)).fetchone()
 
-    def thread(self, conversation_id: str) -> List[sqlite3.Row]:
-        with self._read() as conn:
-            return conn.execute(
-                "SELECT * FROM messages WHERE conversation_id=? "
-                "ORDER BY date_ts ASC",
-                (conversation_id,),
-            ).fetchall()
+    def thread(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT * FROM ews.messages WHERE conversation_id = %s ORDER BY date_ts ASC",
+                (conversation_id,)).fetchall()
 
-    def unread_page(self, limit: int = 10) -> Tuple[int, List[sqlite3.Row]]:
-        with self._read() as conn:
-            total = conn.execute(
-                "SELECT COUNT(*) AS c FROM messages "
-                "WHERE folder='inbox' AND is_read=0"
-            ).fetchone()["c"]
-            rows = conn.execute(
-                "SELECT * FROM messages WHERE folder='inbox' AND is_read=0 "
-                "ORDER BY date_ts DESC LIMIT ?",
-                (int(limit),),
-            ).fetchall()
+    def unread_page(self, limit: int = 10) -> tuple[int, list[dict[str, Any]]]:
+        with self.db.conn() as c:
+            total = c.execute(
+                "SELECT COUNT(*) AS n FROM ews.messages WHERE folder = 'inbox' "
+                "AND is_read = 0 AND archive_state = 'live'").fetchone()["n"]
+            rows = c.execute(
+                "SELECT * FROM ews.messages WHERE folder = 'inbox' AND is_read = 0 "
+                "AND archive_state = 'live' ORDER BY date_ts DESC LIMIT %s",
+                (int(limit),)).fetchall()
         return int(total), rows
 
     def events_window(self, start_ts: int, end_ts: int,
-                      limit: int = 25) -> List[sqlite3.Row]:
-        with self._read() as conn:
-            return conn.execute(
-                "SELECT * FROM events WHERE start_ts < ? AND end_ts > ? "
-                "ORDER BY start_ts ASC LIMIT ?",
-                (int(end_ts), int(start_ts), int(limit)),
-            ).fetchall()
+                      limit: int = 25) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT * FROM ews.events WHERE start_ts < %s AND end_ts > %s "
+                "ORDER BY start_ts ASC LIMIT %s",
+                (int(end_ts), int(start_ts), int(limit))).fetchall()
 
-    def folder_rows(self) -> List[sqlite3.Row]:
-        with self._read() as conn:
-            return conn.execute(
-                "SELECT * FROM folders ORDER BY path ASC").fetchall()
+    def folder_rows(self) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute("SELECT * FROM ews.folders ORDER BY path ASC").fetchall()
 
-    def task_rows(self, include_completed: bool = False,
-                  offset: int = 0, limit: int = 50) -> Tuple[List[sqlite3.Row], int]:
-        clause = "" if include_completed else " WHERE is_complete=0"
-        with self._read() as conn:
-            total = conn.execute(
-                f"SELECT COUNT(*) AS c FROM tasks{clause}"  # noqa: S608
-            ).fetchone()["c"]
-            rows = conn.execute(
-                f"SELECT * FROM tasks{clause} "  # noqa: S608
-                "ORDER BY COALESCE(due_ts, 1e15) ASC LIMIT ? OFFSET ?",
-                (int(limit), int(offset)),
-            ).fetchall()
+    def task_rows(self, include_completed: bool = False, offset: int = 0,
+                  limit: int = 50) -> tuple[list[dict[str, Any]], int]:
+        clause = "" if include_completed else " WHERE is_complete = 0"
+        with self.db.conn() as c:
+            total = c.execute(f"SELECT COUNT(*) AS n FROM ews.tasks{clause}").fetchone()["n"]
+            rows = c.execute(
+                f"SELECT * FROM ews.tasks{clause} ORDER BY COALESCE(due_ts, 1e15) ASC "
+                "LIMIT %s OFFSET %s", (int(limit), int(offset))).fetchall()
         return rows, int(total)
 
-    def contact_stats(self, email: str) -> Dict[str, Any]:
-        """Mirror-derived relationship stats for one address."""
+    def contact_stats(self, email: str) -> dict[str, Any]:
         needle = (email or "").strip().lower()
         if not needle:
             return {}
-        with self._read() as conn:
-            received = conn.execute(
-                "SELECT COUNT(*) AS c, MIN(date_iso) AS first, MAX(date_iso) AS last "
-                "FROM messages WHERE lower(sender_email)=? AND folder != 'sent'",
-                (needle,),
-            ).fetchone()
-            sent = conn.execute(
-                "SELECT COUNT(*) AS c, MAX(date_iso) AS last FROM messages "
-                "WHERE folder='sent' AND lower(to_json) LIKE ?",
-                (f'%{needle}%',),
-            ).fetchone()
-        out: Dict[str, Any] = {}
-        if received and received["c"]:
-            out.update({"received_count": received["c"],
-                        "first_seen": received["first"],
+        with self.db.conn() as c:
+            received = c.execute(
+                "SELECT COUNT(*) AS n, MIN(date_iso) AS first, MAX(date_iso) AS last "
+                "FROM ews.messages WHERE lower(sender_email) = %s AND folder <> 'sent'",
+                (needle,)).fetchone()
+            sent = c.execute(
+                "SELECT COUNT(*) AS n, MAX(date_iso) AS last FROM ews.messages "
+                "WHERE folder = 'sent' AND lower(to_json) LIKE %s",
+                (f"%{needle}%",)).fetchone()
+        out: dict[str, Any] = {}
+        if received and received["n"]:
+            out.update({"received_count": received["n"], "first_seen": received["first"],
                         "last_received": received["last"]})
-        if sent and sent["c"]:
-            out.update({"sent_count": sent["c"], "last_sent": sent["last"]})
+        if sent and sent["n"]:
+            out.update({"sent_count": sent["n"], "last_sent": sent["last"]})
         return out
 
-    def senders_matching(self, query: str, limit: int = 10) -> List[sqlite3.Row]:
-        """People discovery from mail history (fallback when GAL is cold)."""
-        needle = f"%{(query or '').strip()}%"
-        with self._read() as conn:
-            return conn.execute(
-                "SELECT sender_email, sender_name, COUNT(*) AS msgs, "
-                "MAX(date_iso) AS last_seen FROM messages "
-                "WHERE folder != 'sent' AND (sender_email LIKE ? OR sender_name LIKE ?) "
-                "GROUP BY lower(sender_email) ORDER BY msgs DESC LIMIT ?",
-                (needle, needle, int(limit)),
-            ).fetchall()
+    def senders_matching(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        needle = f"%{(query or '').strip().lower()}%"
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT lower(sender_email) AS sender_email, MAX(sender_name) AS sender_name, "
+                "COUNT(*) AS msgs, MAX(date_iso) AS last_seen FROM ews.messages "
+                "WHERE folder <> 'sent' AND (lower(sender_email) LIKE %s OR "
+                "lower(sender_name) LIKE %s) GROUP BY lower(sender_email) "
+                "ORDER BY msgs DESC LIMIT %s", (needle, needle, int(limit))).fetchall()
 
-    def sent_without_reply(self, days: int = 5,
-                           limit: int = 25) -> List[sqlite3.Row]:
-        """waiting_on: sent-folder threads with no later inbound message."""
+    def sent_without_reply(self, days: int = 5, limit: int = 25) -> list[dict[str, Any]]:
         cutoff = int(time.time() - days * 86400)
-        with self._read() as conn:
-            return conn.execute(
+        with self.db.conn() as c:
+            return c.execute(
                 """
-                SELECT s.* FROM messages s
-                WHERE s.folder = 'sent'
-                  AND s.date_ts <= ?
+                SELECT s.* FROM ews.messages s
+                WHERE s.folder = 'sent' AND s.date_ts <= %s
                   AND s.conversation_id IS NOT NULL
-                  AND s.date_ts = (
-                        SELECT MAX(x.date_ts) FROM messages x
-                        WHERE x.conversation_id = s.conversation_id
-                          AND x.folder = 'sent')
-                  AND NOT EXISTS (
-                        SELECT 1 FROM messages i
-                        WHERE i.conversation_id = s.conversation_id
-                          AND i.folder != 'sent'
-                          AND i.date_ts > s.date_ts)
-                ORDER BY s.date_ts DESC LIMIT ?
-                """,
-                (cutoff, int(limit)),
-            ).fetchall()
+                  AND s.date_ts = (SELECT MAX(x.date_ts) FROM ews.messages x
+                                   WHERE x.conversation_id = s.conversation_id
+                                     AND x.folder = 'sent')
+                  AND NOT EXISTS (SELECT 1 FROM ews.messages i
+                                  WHERE i.conversation_id = s.conversation_id
+                                    AND i.folder <> 'sent' AND i.date_ts > s.date_ts)
+                ORDER BY s.date_ts DESC LIMIT %s
+                """, (cutoff, int(limit))).fetchall()
