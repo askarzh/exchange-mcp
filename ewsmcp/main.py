@@ -16,10 +16,10 @@ def main() -> None:
     )
     try:
         if settings.mcp_transport == "http":
-            from .http import serve_http
+            from .mcp.http import serve_http
             asyncio.run(serve_http(settings))
         else:
-            from .server import run_stdio
+            from .mcp.server import run_stdio
             asyncio.run(run_stdio(settings))
     except KeyboardInterrupt:
         print("shutting down", file=sys.stderr)
