@@ -20,15 +20,20 @@ ENV PATH="/opt/venv/bin:$PATH" \
     DATA_DIR=/data \
     MCP_TRANSPORT=http \
     MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000
+    MCP_PORT=8000 \
+    EWSD_HOST=0.0.0.0 \
+    EWSD_PORT=8790
 # Build gate: the application must IMPORT — never grep for version strings
-# (the v3 Dockerfile's stale version-grep was a build landmine).
-RUN python -c "import ewsmcp.main"
+# (the v3 Dockerfile's stale version-grep was a build landmine). Both
+# entrypoints (ewsmcp, ewsd) and the MCP server module are gated here.
+RUN python -c "import ewsmcp.main, ewsmcp.daemon, ewsmcp.mcp.server"
 USER mcp
 VOLUME /data
-EXPOSE 8000
+EXPOSE 8000 8790
 # /livez answers the moment the process is up (never-exit boot): a cold
 # Exchange must NOT make the container unhealthy — that is /readyz's job.
+# This healthcheck targets ewsmcp's port 8000; the compose ewsd service
+# overrides it to port 8790.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=3).status==200 else 1)"
 CMD ["ewsmcp"]

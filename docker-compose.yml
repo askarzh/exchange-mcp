@@ -1,0 +1,61 @@
+# ews-mcp 5.0 dev stack: Postgres (pgvector-ready for Phase 2) + ewsd + ewsmcp.
+# Copy .env.example to .env first. Production lives in the operator's own stack.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ews
+      POSTGRES_PASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      POSTGRES_DB: ews
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ews -d ews"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ewsd:
+    build: .
+    image: ews-mcp:dev
+    command: ["ewsd"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://ews:${PGPASSWORD}@postgres:5432/ews
+      EWSD_HOST: 0.0.0.0
+      EWSD_PORT: "8790"
+      EWSD_API_KEY: ${EWSD_API_KEY:?set EWSD_API_KEY in .env}
+      DATA_DIR: /data
+    volumes:
+      - ewsdata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8790/livez', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  ewsmcp:
+    image: ews-mcp:dev
+    command: ["ewsmcp"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://ews:${PGPASSWORD}@postgres:5432/ews
+      EWSD_URL: http://ewsd:8790
+      EWSD_API_KEY: ${EWSD_API_KEY}
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      MCP_API_KEY: ${MCP_API_KEY:?set MCP_API_KEY in .env}
+    ports:
+      - "8000:8000"
+    depends_on:
+      ewsd:
+        condition: service_started
+
+volumes:
+  pgdata:
+  ewsdata:
