@@ -22,10 +22,21 @@ ALTER TABLE ews.messages RENAME COLUMN folder TO folder_id;
 -- dictionary at run time), so it cannot appear in a generated column. Naming
 -- the dictionary explicitly makes the call deterministic, and this wrapper
 -- declares that fact to the planner.
-CREATE EXTENSION IF NOT EXISTS unaccent;
+-- WITH SCHEMA public is load-bearing. Without it the extension is created in
+-- the first schema of the CALLER's search_path, and production connects as
+-- role `ews` against a database that also has an `ews` schema — so the default
+-- search_path's `"$user"` element resolves, unaccent lands in `ews`, and every
+-- `public.unaccent(...)` reference below fails with "function does not exist".
+CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;
 
+-- The body is fully qualified, but `unaccent('public.unaccent', $1)` still
+-- casts its first argument to `regdictionary`, and regdictionary input is
+-- resolved against the search_path of whatever session evaluates it (any
+-- session that INSERTs, since search_tsv is a generated column). Pinning
+-- search_path on the function makes that resolution independent of the caller.
 CREATE FUNCTION ews.immutable_unaccent(text) RETURNS text
-    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    SET search_path = pg_catalog, public AS
 $$SELECT public.unaccent('public.unaccent', $1)$$;
 
 ALTER TABLE ews.messages ADD COLUMN search_tsv tsvector
