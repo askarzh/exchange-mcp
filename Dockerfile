@@ -24,8 +24,8 @@ ENV PATH="/opt/venv/bin:$PATH" \
     EWSD_HOST=0.0.0.0 \
     EWSD_PORT=8790
 # Build gate: the application must IMPORT — never grep for version strings
-# (the v3 Dockerfile's stale version-grep was a build landmine). Both
-# entrypoints (ewsmcp, ewsd) and the MCP server module are gated here.
+# (a stale version-grep was a build landmine before). Both entrypoints
+# (ewsmcp, ewsd) and the MCP server module are gated here.
 RUN python -c "import ewsmcp.main, ewsmcp.daemon, ewsmcp.mcp.server"
 USER mcp
 VOLUME /data

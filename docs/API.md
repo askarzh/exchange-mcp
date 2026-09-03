@@ -456,72 +456,17 @@ when they would notify attendees) run in two phases:
    `send_draft` retries with the same `idempotency_key` replay the cached
    receipt instead of sending twice.
 
-## Cache freshness contract
+## Freshness contract
 
-Reads answered by `ewsmcp` from the Postgres mirror carry
-`source: "cache"` and `as_of` (the folder's last sync watermark; delta
-cadence `EWS_CACHE_SYNC_SECONDS`, default 45 s). `fresh: true` is
-forwarded to `ewsd`'s live route and forces a fresh Exchange read.
+`search_messages` answers only from the Postgres mirror of the whole
+mailbox — there is no live search — and is stamped `source: "cache"` with
+`as_of` (the oldest watermark among the folders it searched; delta
+cadence `EWS_CACHE_SYNC_SECONDS`, default 45 s). `get_thread` reads the
+mirror and falls back to a live Exchange rebuild when the seed lives
+outside it (`source: "live"`). `fresh: true` is available on `get_message`
+(attachment inventory, raw HTML), `list_folders` and
+`get_mailbox_overview` (live counts) and forwards to `ewsd`'s live route.
 `get_server_status.cache` exposes per-folder watermarks, row counts and
-sync health. `mode: "semantic"` on `search_messages`, and the
-`find_similar` tool, are Phase 2 work — not registered in this build;
-`mode: "semantic"` returns a `validation` error until embeddings land
-(see `docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`
-at the repo root).
-
-## v3 → 5.0 tool rename map
-
-Unchanged from the 4.5 line — the 5.0 rewrite changed storage and
-process model, not tool names.
-
-| v3 (67-tool surface) | 5.0 |
-|---|---|
-| `read_emails` / `search_emails` / `advanced_search` | `search_messages` |
-| `get_email_details` | `get_message` |
-| `get_thread` / `search_by_conversation` | `get_thread` |
-| `list_folders` / `get_folder_tree` | `list_folders` |
-| `read_attachment` / `download_attachment` | `get_attachment` |
-| `get_calendar` / `list_appointments` | `list_events` |
-| `get_appointment_details` | `get_event` |
-| `check_availability` / `find_meeting_slots` | `check_availability` |
-| `find_person` / `search_gal` / `list_contacts` | `find_people` |
-| `get_person_details` | `get_contact` |
-| `get_oof_settings` / `oof_settings(action=get)` | `get_oof_settings` |
-| `oof_settings(action=set)` | `set_oof` |
-| `whoami` / `get_server_info` | `get_server_status` |
-| `create_draft` / `create_reply_draft` / `create_forward_draft` | `create_draft` (modes) |
-| `update_draft` | `update_draft` |
-| `send_draft` | `send_draft` (content-bound two-phase) |
-| `send_email` / `reply_email` / `forward_email` | **removed** — draft-first only |
-| `update_email` / `mark_read` / `update_messages` | `update_messages` (bulk) |
-| `move_email` / `move_messages` | `move_messages` (bulk) |
-| `delete_email` / `delete_messages` | `delete_messages` (bulk) |
-| `create_appointment` | `create_event` |
-| `update_appointment` | `update_event` |
-| `respond_to_meeting` | `respond_to_event` |
-| `delete_appointment` | `cancel_event` |
-| `get_tasks` | `list_tasks` |
-| `update_task` / `complete_task` | `update_task` |
-| — (new) | `get_mailbox_overview`, `waiting_on` |
-| — (Phase 2, not yet built) | `find_similar` |
-
-## Intentionally dropped vs v3
-
-Removed deliberately — most belong to the calling assistant (skills), not
-a data-plane server:
-
-- **One-shot send tools** (`send_email`, `reply_email`, `forward_email`):
-  the ONLY way mail leaves the mailbox is `create_draft` → `send_draft`.
-- **Impersonation / delegated mailboxes** (`target_mailbox` everywhere):
-  one server = one mailbox.
-- **OAuth2/MSAL flows**: the target deployment is on-prem Exchange with
-  auto-negotiated auth; a Graph/OAuth backend would be a different
-  gateway, not a flag.
-- **Contacts folder management** (create/update/delete contacts).
-- **Folder management** (create/rename/delete folders).
-- **MIME export** and raw-content endpoints.
-- **The agent-secretary stack** (server-side classify/summarize/brief/
-  voice/commitments/approval queue): the caller already IS an LLM;
-  `examples/skills/exchange-assistant/` shows the skill-side pattern.
-- **Inbox rules tools**: prefer real server-side Exchange rules
-  (revisit after an exchangelib ≥5.2 bump).
+sync health. `mode: "semantic"` on `search_messages` is Phase 2 work and
+returns a `validation` error until embeddings land — see
+`docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`.

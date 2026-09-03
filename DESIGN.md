@@ -12,12 +12,12 @@ below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Stor
    makes an LLM call and never ships a "judgment tool". Tool count stays
    lean and is generated into the docs, never hand-counted.
 2. **Storage = Postgres in core.** One `ews` schema holds the mirror,
-   aliases and (Phase 2) the archive. Full-text search is a generated
-   `tsvector` column over `norm_text`, indexed GIN, queried with Postgres'
-   `simple` text-search config (no stemming, no stopwords); accent/diacritic
-   folding happens in Python (`ewsmcp/normalize.py`, NFKD-decompose + drop
-   combining marks) before the text ever reaches Postgres, so index and
-   query side always agree. No `unaccent` extension, no SQLite, no FTS5.
+   aliases and (Phase 2) the archive. Full-text search is a generated,
+   stored `tsvector` over subject + sender + cleaned body, indexed GIN and
+   queried with Postgres' `simple` text-search config (no stemming, no
+   stopwords). Accent folding happens in the database, on both the index
+   and the query side, through `ews.immutable_unaccent()` — an IMMUTABLE
+   wrapper over the `unaccent` extension's dictionary.
 3. **Reads are cache-first with provenance** (`source`, `as_of`,
    `fresh:true` escape hatch); **writes go straight to EWS** and then
    write-through to the mirror.
@@ -86,9 +86,9 @@ Four packs:
   `move_messages`, `delete_messages`), calendar writes (`create_event`,
   `update_event`, `respond_to_event`, `cancel_event`), `set_oof`.
 
-`find_similar` and `search_messages`' `mode="semantic"` are Phase 2 work
-(see the design spec) — the tool is unregistered and the mode is a
-validation error until embeddings land.
+`search_messages`' `mode="semantic"` is Phase 2 work (see the design
+spec): the mode is a reserved enum value that returns a validation error
+until embeddings land.
 
 Every list-shaped result ships exactly the canonical envelope
 `{items, count, total_available, next_offset}` (contract-tested).
@@ -136,18 +136,15 @@ The model never sees a raw EWS id: outputs carry short aliases (`m12`,
 The Postgres-backed aliaser (`ews.aliases`) survives restarts, rebinds on
 moves, and keeps `internet_message_id` as a secondary key. Stale alias →
 clean re-search hint, never an upstream error. Page-sized mints batch
-into one transaction. Because there is no data migration from the 4.5
-SQLite line, every 5.0 deployment starts with an empty alias table and
-re-mints ids from scratch — old `m12`-style ids from a 4.5 mailbox do not
-resolve; a client hitting one gets the stale-alias hint once, then a
-fresh id from its next search.
+into one transaction. See `CHANGELOG.md` for the alias re-mint note on
+upgrade from a prior release line.
 
 ## §DTOs — token economy
 
 `MsgCard` (~60 tokens): id, from, subject, date, 200-char snippet, flags.
-`MsgFull`: card + recipients + CLEANED body (bilingual quoted-history +
+`MsgFull`: card + recipients + CLEANED body (quoted-history +
 signature stripping) + attachment inventory. Raw HTML only on explicit
-`include_html=true`. The measured pathology this kills: one v3 detail
+`include_html=true`. The measured pathology this kills: one legacy detail
 call shipped 115,457 chars for a ~150-char message.
 
 ## §Store — the mirror (Postgres, schema `ews`)
@@ -155,23 +152,21 @@ call shipped 115,457 chars for a ~150-char message.
 - `db.py` / `migrations/`: one Postgres database, schema `ews`, numbered
   SQL migrations applied by `ewsd` at startup and version-checked by
   `ewsmcp` (refuses to start against an older schema than it expects).
-  `messages`, `events`, `tasks`, `folders`, `sync_state`, `aliases`,
-  `sender_sigs` — the durable mirror both processes read.
-- Full-text search: each message row carries `norm_text` (see
-  `normalize.py` below) and a generated, stored `search_tsv` column
-  (`to_tsvector('simple', norm_text)`) with a GIN index
-  (`ix_msg_tsv`). `search_messages` queries it with Postgres' `simple`
-  config — no stemming, no `unaccent` extension.
-- `normalize.py`: ONE `normalize_text()` for both index and query side —
-  NFKD-decompose, drop combining marks (é→e, ё→е), lowercase. This is
-  Python-side accent folding, not a database extension, so index and
-  query always agree without an extra dependency in Postgres itself.
+  `messages`, `events`, `tasks`, `folders`, `sync_state`, `aliases` —
+  the durable mirror both processes read.
+- Full-text search: `search_tsv` is generated as
+  `to_tsvector('simple', ews.immutable_unaccent(lower(subject || sender ||
+  body_clean)))` with a GIN index (`ix_msg_tsv`). `search_messages` builds
+  the prefix expression (`tok:* & tok2:*`) in Python and unaccents it in
+  SQL, so index and query always agree.
 - **The whole mailbox is mirrored.** `ewsd`'s `SyncEngine` refreshes the
   folder hierarchy first on every cycle, then runs resumable
   `SyncFolderItems` deltas (`EWS_CACHE_SYNC_SECONDS`, 45) for every mail
   folder except the well-known ones `EWS_MIRROR_EXCLUDE` names
-  (drafts, junk, trash, outbox), with one token per folder keyed
-  `item:<folder ews id>`. A slower lane (`EWS_CACHE_HIERARCHY_SECONDS`,
+  (drafts, junk, trash, outbox) — exclusion is by well-known key only, so
+  sub-folders of an excluded folder are still mirrored — with one token
+  per folder keyed `item:<folder ews id>`. A slower lane
+  (`EWS_CACHE_HIERARCHY_SECONDS`,
   600) refreshes the calendar window and the tasks folder. A folder that
   disappears loses its token and its `live` rows; archived rows stay.
   Failures degrade — `ewsmcp` reads fall back to `ewsd`'s live route
@@ -231,8 +226,8 @@ link and catches edits, deletions and truncation.
 
 A durable, attachment-inclusive mail archive with a safe path to
 deletion (capture → verify → delete workers in `ewsd`), plus
-Gemini-embedding-backed semantic search (`find_similar`,
-`search_messages(mode="semantic")`). Authoritative design:
+Gemini-embedding-backed semantic search (`search_messages(mode="semantic")`
+and a new similarity tool). Authoritative design:
 `docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`.
 Everything in this document describes what is built now (Phase 1): the
 Postgres store and the two-process split, with the archive tables and
