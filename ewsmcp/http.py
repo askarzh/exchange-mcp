@@ -12,23 +12,12 @@ import jsonschema
 from . import __version__, uploads
 from .errors import HTTP_BY_CODE
 from .server import start_connection_manager
-from .tools.base import dispatch
+from .tools.base import dispatch, validator_for
 from .tools.calendar_people import _get_server_status
 
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1_048_576  # 1 MiB — tool arguments, not attachments
-
-
-def _validator_for(spec) -> Any:
-    """Compiled validator for the tool's PUBLIC schema (which includes
-    confirm_token for two-phase tools), cached on the spec itself so it can
-    never go stale against a different spec of the same name."""
-    v = getattr(spec, "_rest_validator", None)
-    if v is None:
-        v = jsonschema.Draft202012Validator(spec.public_schema()["inputSchema"])
-        spec._rest_validator = v
-    return v
 
 
 def _authorized(headers, api_key: str) -> bool:
@@ -243,7 +232,7 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
                     "code": "validation",
                     "message": "request body must be a JSON object of tool arguments"}})
             error = jsonschema.exceptions.best_match(
-                _validator_for(spec).iter_errors(arguments))
+                validator_for(spec).iter_errors(arguments))
             if error is not None:
                 return await _send_json(send, 400, {"ok": False, "error": {
                     "code": "validation", "message": error.message,

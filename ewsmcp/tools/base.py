@@ -16,6 +16,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
+import jsonschema
+
 from ..confirm import consume_token, content_hash, make_token, verify_token
 from ..errors import ToolError, map_exception
 
@@ -78,6 +80,31 @@ class ToolSpec:
             props = schema["inputSchema"].setdefault("properties", {})
             props.setdefault("confirm_token", dict(CONFIRM_TOKEN_PROPERTY))
         return schema
+
+
+def validator_for(spec: "ToolSpec") -> Any:
+    """Compiled validator for the tool's PUBLIC schema (which includes
+    confirm_token for two-phase tools), cached on the spec itself so it can
+    never go stale against a different spec of the same name. Shared by the
+    REST shim and the MCP dispatcher so both surfaces enforce the same
+    declared bounds (limit maxima, offset minima, enums, required keys)."""
+    v = getattr(spec, "_schema_validator", None)
+    if v is None:
+        v = jsonschema.Draft202012Validator(spec.public_schema()["inputSchema"])
+        spec._schema_validator = v
+    return v
+
+
+def validate_arguments(spec: "ToolSpec", arguments: Dict[str, Any]) -> None:
+    """Raise ToolError("validation") for arguments the tool's schema rejects."""
+    error = jsonschema.exceptions.best_match(validator_for(spec).iter_errors(arguments))
+    if error is not None:
+        path = "/".join(str(p) for p in error.absolute_path)
+        raise ToolError(
+            "validation",
+            f"{path}: {error.message}" if path else error.message,
+            hint=f"Check the argument against the {spec.name} input schema.",
+        )
 
 
 @dataclass

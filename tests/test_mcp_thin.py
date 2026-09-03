@@ -195,3 +195,45 @@ def test_semantic_search_is_validation_error_on_mcp_side(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     res = _run(ctx, "search_messages", query="budget", mode="semantic")
     assert res["ok"] is False and res["error"]["code"] == "validation"
+
+
+def test_get_thread_with_a_dead_mirror_is_backend_unavailable(db):
+    """The MCP surface makes the same distinction as the daemon: a closed
+    pool is backend_unavailable, never a not_found."""
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    alias = _run(ctx, "search_messages", query="budget")["items"][0]["id"]
+    assert _run(ctx, "get_thread", id=alias)["ok"] is True
+    db.close()
+    res = asyncio.run(dispatch_mcp(ctx, ctx.registry["get_thread"],
+                                   {"id": alias}))
+    assert res["ok"] is False and res["error"]["code"] == "backend_unavailable"
+
+
+def test_arguments_are_validated_against_the_tool_schema(db):
+    """The MCP dispatcher validates against spec.input_schema before any
+    handler runs — mcp/local.py does not re-clamp limit/offset by hand, and
+    an out-of-range argument must not reach the store or ewsd."""
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    over = _run(ctx, "search_messages", query="budget", limit=5000)
+    assert over["ok"] is False and over["error"]["code"] == "validation"
+    assert "50" in over["error"]["message"]
+
+    negative = _run(ctx, "search_messages", query="budget", offset=-1)
+    assert negative["ok"] is False and negative["error"]["code"] == "validation"
+
+    thread_over = _run(ctx, "get_thread", id="m1", limit=5000)
+    assert thread_over["ok"] is False and thread_over["error"]["code"] == "validation"
+
+    # in-range arguments still work
+    assert _run(ctx, "search_messages", query="budget", limit=50, offset=0)["ok"]
+
+
+def test_validation_rejects_unknown_arguments_before_forwarding(db):
+    """A proxied tool is validated too, so ewsd never sees junk arguments."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon, ews_capability_tier="full")
+    res = _run(ctx, "create_draft", subject="hi", nonsense=1)
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert daemon.calls == []
