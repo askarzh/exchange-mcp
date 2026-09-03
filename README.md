@@ -163,7 +163,7 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `SHARED_DIR` | — | Optional shared-space root for saved attachments (see `add_attachment`/`get_attachment`) |
 | `EWS_MIRROR_EXCLUDE` | `drafts,junk,trash,outbox` | Well-known folders NOT mirrored; every other mail folder is mirrored in full. Exclusion is by well-known key only — sub-folders of an excluded folder are still mirrored. |
 | `EWS_CACHE_SYNC_SECONDS` | `45` | Delta cadence |
-| `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence |
+| `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence. The folder walk clears exchangelib's cached tree and re-fetches it this often (not every cycle), so a new or deleted folder and fresh unread counts show up within this window while mail keeps syncing every `EWS_CACHE_SYNC_SECONDS`. |
 | `EWS_TZ` | `Asia/Riyadh` | Server timezone for date grammar + display |
 
 ## The send flow (two-phase, content-bound)

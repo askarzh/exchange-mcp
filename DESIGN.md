@@ -159,17 +159,26 @@ call shipped 115,457 chars for a ~150-char message.
   body_clean)))` with a GIN index (`ix_msg_tsv`). `search_messages` builds
   the prefix expression (`tok:* & tok2:*`) in Python and unaccents it in
   SQL, so index and query always agree.
-- **The whole mailbox is mirrored.** `ewsd`'s `SyncEngine` refreshes the
-  folder hierarchy first on every cycle, then runs resumable
+- **The whole mailbox is mirrored.** `ewsd`'s `SyncEngine` runs resumable
   `SyncFolderItems` deltas (`EWS_CACHE_SYNC_SECONDS`, 45) for every mail
   folder except the well-known ones `EWS_MIRROR_EXCLUDE` names
   (drafts, junk, trash, outbox) — exclusion is by well-known key only, so
   sub-folders of an excluded folder are still mirrored — with one token
-  per folder keyed `item:<folder ews id>`. A slower lane
-  (`EWS_CACHE_HIERARCHY_SECONDS`,
-  600) refreshes the calendar window and the tasks folder. A folder that
-  disappears loses its token and its `live` rows; archived rows stay.
-  Failures degrade — `ewsmcp` reads fall back to `ewsd`'s live route
+  per folder keyed `item:<folder ews id>`. A folder is "mail" when its EWS
+  `folder_class` is `IPF.Note`; Contacts/Calendar/Tasks folders and their
+  children (Recipient Cache, GAL Contacts, Sharing, Quick Step Settings, …)
+  are listed by `list_folders` but never item-synced.
+- **Hierarchy refresh cadence.** exchangelib caches the whole folder tree on
+  the account root for the life of the process, so the hierarchy lane clears
+  that cache and re-walks it — discovering new folders, dropping vanished
+  ones, refreshing `total`/`unread` — every `EWS_CACHE_HIERARCHY_SECONDS`
+  (600) and on the first cycle, not on every cycle; the item lane keeps
+  running at the 45s cadence in between, and the walk runs before item sync
+  so a newly discovered folder is mirrored in the same cycle. `list_folders`
+  stamps its `as_of` from that lane's `folders` watermark. A slower lane on
+  the same interval refreshes the calendar window and the tasks folder. A
+  folder that disappears loses its token and its `live` rows; archived rows
+  stay. Failures degrade — `ewsmcp` reads fall back to `ewsd`'s live route
   (`fresh=true`), the server never gates on the mirror.
 - Provenance contract: every read is stamped `source: cache|live` (+
   `as_of` for cache); `fresh=true` is forwarded by `ewsmcp` to `ewsd`

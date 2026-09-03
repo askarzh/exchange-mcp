@@ -16,14 +16,20 @@ NOW = datetime(2026, 7, 10, 9, 0, tzinfo=TZ)
 
 class FakeFolder:
     """Scripted sync_items + a hierarchy node in one object: the engine walks
-    msg_folder_root and then syncs the very folders it found."""
+    msg_folder_root and then syncs the very folders it found.
 
-    def __init__(self, name, folder_id, *, total=0, unread=0, children=()):
+    `folder_class` mirrors exchangelib's ``Folder.folder_class`` (the EWS
+    ``folder:FolderClass``): "IPF.Note" is mail, anything else is not.
+    """
+
+    def __init__(self, name, folder_id, *, total=0, unread=0, children=(),
+                 folder_class="IPF.Note"):
         self.name = name
         self.id = folder_id
         self.total_count = total
         self.unread_count = unread
         self.children = list(children)
+        self.folder_class = folder_class
         self.batches = []
         self.item_sync_state = None
         self.seen_tokens = []
@@ -64,15 +70,32 @@ def _account(extra=()):
     account.drafts = FakeFolder("Drafts", "F-DRAFT")
     account.trash = FakeFolder("Deleted Items", "F-TRASH")
     account.outbox = FakeFolder("Outbox", "F-OUT")
-    account.calendar = FakeFolder("Calendar", "F-CAL")
-    account.contacts = FakeFolder("Contacts", "F-CON")
-    account.tasks = FakeFolder("Tasks", "F-TASK")
+    account.calendar = FakeFolder("Calendar", "F-CAL",
+                                  folder_class="IPF.Appointment")
+    account.contacts = FakeFolder("Contacts", "F-CON",
+                                  folder_class="IPF.Contact")
+    account.tasks = FakeFolder("Tasks", "F-TASK", folder_class="IPF.Task")
     account.msg_folder_root = FakeFolder(
-        "root", "F-ROOT",
+        "root", "F-ROOT", folder_class=None,
         children=[inbox, sent, junk, archive, account.drafts, account.trash,
                   account.outbox, account.calendar, account.contacts,
                   account.tasks, *extra])
+    account.root = FakeRoot(account.msg_folder_root)
     return account
+
+
+class FakeRoot:
+    """exchangelib's Root: holds the cached subfolder tree and clears it."""
+
+    def __init__(self, msg_folder_root):
+        self._msg_folder_root = msg_folder_root
+        self.clear_cache_calls = 0
+        self.pending = []  # folders that only appear after a cache clear
+
+    def clear_cache(self):
+        self.clear_cache_calls += 1
+        self._msg_folder_root.children.extend(self.pending)
+        self.pending = []
 
 
 def _engine(db, account, **overrides):
@@ -135,17 +158,120 @@ def test_every_mail_folder_is_mirrored_except_the_excluded_ones(db):
 
 
 def test_hierarchy_runs_before_item_sync(db):
-    """A folder that appears for the first time is item-synced in the SAME
-    cycle — the hierarchy lane is not a slow lane any more."""
+    """When the hierarchy lane runs, a folder it discovers is item-synced in
+    the SAME cycle — the walk is never one cycle behind the item lane."""
     account = _account()
     engine, store = _engine(db, account)
     asyncio.run(engine._cycle())
     new = FakeFolder("Project X", "F-NEW")
     new.queue([("create", _msg("M9", subject="New folder message"))], "TOK-NEW")
-    account.msg_folder_root.children.append(new)
+    account.root.pending.append(new)  # only visible once the cache is cleared
+    engine._last_hierarchy_ts = 0.0   # the refresh interval has elapsed
     asyncio.run(engine._cycle())
     assert store.get_message("M9") is not None
     assert store.get_sync_state("item:F-NEW") == "TOK-NEW"
+
+
+def test_hierarchy_refresh_clears_exchangelibs_folder_cache(db):
+    """exchangelib caches the subfolder tree on Root for the life of the
+    Account, so a new folder is invisible until the cache is cleared — and
+    that clear is rate-limited to EWS_CACHE_HIERARCHY_SECONDS while the item
+    lane keeps running every cycle."""
+    account = _account()
+    engine, store = _engine(db, account, ews_cache_hierarchy_seconds=600)
+    asyncio.run(engine._cycle())
+    assert account.root.clear_cache_calls == 1  # the first cycle always walks
+
+    new = FakeFolder("Project X", "F-NEW")
+    new.queue([("create", _msg("M9", subject="New folder message"))], "TOK-NEW")
+    account.root.pending.append(new)
+    account.inbox.queue([("create", _msg("M8", subject="Meanwhile"))], "TOK-IN2")
+
+    asyncio.run(engine._cycle())  # inside the interval: no re-walk...
+    assert account.root.clear_cache_calls == 1
+    assert store.get_message("M9") is None
+    assert store.get_message("M8") is not None  # ...but the item lane still ran
+
+    engine._last_hierarchy_ts -= 601  # the interval elapses
+    asyncio.run(engine._cycle())
+    assert account.root.clear_cache_calls == 2
+    assert store.get_message("M9") is not None
+    assert {r["path"] for r in store.folder_rows()} >= {"Project X"}
+
+
+def test_hierarchy_lane_stamps_its_own_watermark(db):
+    """list_folders' provenance comes from the `folders` key, not the slow
+    lane's `events` one."""
+    account = _account()
+    engine, store = _engine(db, account)
+    assert store.watermark("folders") is None
+    asyncio.run(engine._cycle())
+    assert store.watermark("folders") is not None
+
+
+def test_non_mail_folders_are_listed_but_never_item_synced(db):
+    """A Contacts child such as `Recipient Cache` carries folder_class
+    IPF.Contact: the mail ITEM_FIELDS projection would raise against it every
+    cycle, so it is mirrored into ews.folders and nothing else."""
+    account = _account()
+    cache = FakeFolder("Recipient Cache", "F-RECIP", folder_class="IPF.Contact")
+    cache.queue([("create", _msg("MX", subject="never"))], "TOK-RECIP")
+    account.contacts.children.append(cache)
+    quick = FakeFolder("Quick Step Settings", "F-QSS",
+                       folder_class="IPF.Configuration")
+    account.msg_folder_root.children.append(quick)
+    engine, store = _engine(db, account)
+    asyncio.run(engine._cycle())
+
+    paths = {r["path"] for r in store.folder_rows()}
+    assert "Contacts/Recipient Cache" in paths
+    assert "Quick Step Settings" in paths
+    assert store.get_sync_state("item:F-RECIP") is None
+    assert store.get_sync_state("item:F-QSS") is None
+    assert cache.seen_tokens == []      # sync_items was never called on it
+    assert store.get_message("MX") is None
+    assert set(engine._folders) == {"F-IN", "F-SENT", "F-ARCH"}
+
+
+def test_a_classless_well_known_mail_folder_is_still_mirrored(db):
+    """Some servers leave folder:FolderClass unset on the distinguished
+    folders; exchangelib models those as Messages subclasses, so the
+    well-known mail aliases stay mirrored."""
+    account = _account()
+    account.inbox.folder_class = None
+    account.contacts.folder_class = None
+    account.inbox.queue([("create", _msg("M1"))], "TOK-IN")
+    engine, store = _engine(db, account)
+    asyncio.run(engine._cycle())
+    assert store.get_message("M1") is not None
+    assert "F-CON" not in engine._folders
+
+
+def test_large_first_sync_flushes_in_batches(db):
+    """450 creates must not be buffered in one list: the store sees several
+    upsert batches, and every row lands."""
+    account = _account()
+    account.inbox.queue(
+        [("create", _msg(f"M{i}", subject=f"Msg {i}")) for i in range(450)],
+        "TOK-BIG")
+    engine, store = _engine(db, account)
+    batches = []
+    real_upsert = store.upsert_messages
+
+    def spy(rows):
+        batches.append(len(rows))
+        return real_upsert(rows)
+
+    store.upsert_messages = spy
+    asyncio.run(engine._cycle())
+    assert len(batches) >= 3
+    assert max(batches) <= 200
+    assert sum(batches) == 450
+    with store.db.conn() as c:
+        n = c.execute("SELECT COUNT(*) AS n FROM ews.messages "
+                      "WHERE folder_id = 'F-IN'").fetchone()["n"]
+    assert n == 450
+    assert store.get_sync_state("item:F-IN") == "TOK-BIG"
 
 
 def test_disappearing_folder_drops_its_token_and_live_rows(db):
@@ -163,6 +289,7 @@ def test_disappearing_folder_drops_its_token_and_live_rows(db):
                   "WHERE ews_id='M-KEPT'")
 
     account.msg_folder_root.children.remove(archive)
+    engine._last_hierarchy_ts = 0.0  # the hierarchy refresh interval elapsed
     asyncio.run(engine._cycle())
     assert store.get_message("M2") is None            # live row deleted
     assert store.get_message("M-KEPT") is not None    # archived row stays
