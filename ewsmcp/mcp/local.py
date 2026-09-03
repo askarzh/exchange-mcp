@@ -15,10 +15,9 @@ raises `_MirrorDown` only when THAT fails too.
 
 `search_messages` and `get_thread` are store-only (Task 6): there is no live
 fallback for either, so neither goes through `_try`/`_cache_then_forward`.
-`search_messages` lets `cache_reads.search_messages`'s `psycopg.Error`
-propagate and maps it straight to `backend_unavailable` itself;
-`get_thread` treats a clean mirror miss as `not_found` — never a forward
-to ewsd.
+Both let `cache_reads`' `psycopg.Error`/`RuntimeError` propagate and map it
+straight to `backend_unavailable` themselves; `get_thread` treats a clean
+mirror miss (and ONLY that) as `not_found` — never a forward to ewsd.
 """
 
 from __future__ import annotations
@@ -154,8 +153,12 @@ async def get_message(ctx: Context, **kw) -> dict[str, Any]:
 async def get_thread(ctx: Context, **kw) -> dict[str, Any]:
     """Store-only: every mail folder is mirrored, so a miss never forwards
     — it means the seed is in an excluded folder or not synced yet."""
-    hit = await cache_reads.get_thread(
-        ctx, kw["id"], int(kw.get("limit", 20)), int(kw.get("offset", 0)))
+    try:
+        hit = await cache_reads.get_thread(
+            ctx, kw["id"], int(kw.get("limit", 20)), int(kw.get("offset", 0)))
+    except (psycopg.Error, RuntimeError) as exc:
+        raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
+                        hint="Check DATABASE_URL.", retry_after_s=15) from exc
     if hit is not None:
         return hit
     raise ToolError(

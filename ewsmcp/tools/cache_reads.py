@@ -2,12 +2,14 @@
 
 Extracted out of ``mail_read.py`` / ``tasks.py`` so both the daemon's
 `ToolSpec` handlers and the thin MCP (Task 8) can hit the same mirror
-logic. ``search_messages`` answers only from the store (it raises
-``ToolError`` on a bad folder rather than falling back). Every other
-function here returns ``None`` when the mirror cannot answer (folder not
-synced, row missing, cache disabled, or an unexpected error) — the caller
-then falls through to the live EWS path. Nothing here ever imports
-exchangelib or touches the gateway.
+logic. ``search_messages`` and ``get_thread`` answer only from the store:
+they raise ``ToolError`` on a bad folder rather than falling back, and let
+``psycopg.Error``/``RuntimeError`` (a closed pool) propagate so the caller
+can report `backend_unavailable` instead of passing a dead database off as
+a miss. Every other function here returns ``None`` when the mirror cannot
+answer (folder not synced, row missing, cache disabled, or an unexpected
+error) — the caller then falls through to the live EWS path. Nothing here
+ever imports exchangelib or touches the gateway.
 """
 
 import asyncio
@@ -16,6 +18,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import psycopg
 
 from ..dates import parse_when
 from ..dto import envelope
@@ -146,7 +150,7 @@ def _excluded_wks(ctx: Context) -> set[str]:
     return {f"f:{part.strip().lower()}" for part in raw.split(",") if part.strip()}
 
 
-def resolve_folder_id(ctx: Context, folder_ref: str) -> str:
+async def resolve_folder_id(ctx: Context, folder_ref: str) -> str:
     """well-known alias (f:inbox / inbox) | folder alias (f7) | path | raw
     EWS id → the folder's EWS id, resolved against ``ews.folders``.
 
@@ -157,7 +161,7 @@ def resolve_folder_id(ctx: Context, folder_ref: str) -> str:
     populated but nothing matches.
     """
     ref = (folder_ref or "").strip()
-    rows = ctx.cache.folder_rows()
+    rows = await asyncio.to_thread(ctx.cache.folder_rows)
     if not rows:
         raise ToolError(
             "upstream_unavailable", "folder hierarchy not synced yet",
@@ -185,13 +189,6 @@ def resolve_folder_id(ctx: Context, folder_ref: str) -> str:
             f"{ctx.settings.ews_mirror_exclude}).",
             hint="Search a mirrored folder, or omit `folder` to search all of them.")
     return row["ews_id"]
-
-
-def mirrored_folder_ids(ctx: Context) -> list[str]:
-    """Every folder the sync engine has actually populated (an ``item:<id>``
-    watermark exists). Empty means nothing has synced yet."""
-    marks = ctx.cache.watermarks()
-    return [k[len("item:"):] for k in marks if k.startswith("item:")]
 
 
 def folder_watermark(ctx: Context, folder_id: str) -> int | None:
@@ -242,7 +239,9 @@ async def list_folders(ctx: Context, depth: int,
         if r["wk"]:
             row["wk"] = r["wk"]
         rows.append(row)
-    as_of = ctx.cache.watermark("events")  # slow-lane watermark
+    # The hierarchy lane's own watermark — `events` belongs to the slow
+    # (calendar/tasks) lane and says nothing about when these rows were read.
+    as_of = await asyncio.to_thread(ctx.cache.watermark, "folders")
     return _stamp(envelope(rows, total_available=len(rows), offset=0),
                   "cache", as_of)
 
@@ -260,7 +259,7 @@ async def search_messages(ctx: Context, *, folder: str | None,
     backend_unavailable)."""
     if ctx.cache is None:
         return None
-    folder_ids = [resolve_folder_id(ctx, folder)] if folder else None
+    folder_ids = [await resolve_folder_id(ctx, folder)] if folder else None
     marks = ctx.cache.watermarks()
     keys = ([f"item:{fid}" for fid in folder_ids] if folder_ids
             else [k for k in marks if k.startswith("item:")])
@@ -299,13 +298,19 @@ async def get_message(ctx: Context, raw_id: str,
 
 async def get_thread(ctx: Context, raw_id: str, limit: int,
                      offset: int) -> dict[str, Any] | None:
+    """Store-only, like ``search_messages``: None means a genuine miss (the
+    seed is not mirrored), which the callers turn into `not_found`. A dead
+    Postgres must NOT look like a miss, so psycopg/pool errors propagate for
+    the callers to map to `backend_unavailable`."""
     if ctx.cache is None:
         return None
     try:
         cached = await asyncio.to_thread(
             _thread_from_cache, ctx, raw_id, limit, offset)
-    except Exception as exc:  # noqa: BLE001 - mirror error → live fallback
-        logger.warning("cache get_thread failed (%s) — live", exc)
+    except (psycopg.Error, RuntimeError):  # pool closed/unreachable — never a miss
+        raise
+    except Exception as exc:  # noqa: BLE001 - bad row/shape → clean miss
+        logger.warning("cache get_thread failed (%s)", exc)
         return None
     if cached is None:
         return None

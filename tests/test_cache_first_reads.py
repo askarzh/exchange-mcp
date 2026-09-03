@@ -7,6 +7,7 @@ read never touches Exchange.
 
 import asyncio
 import time
+from datetime import UTC, datetime
 
 import psycopg
 from conftest import (
@@ -56,6 +57,7 @@ def seeded_store(db):
         if r["ews_id"] == INBOX_ID:
             r["total"], r["unread"] = 3, 1
     store.replace_folders(rows)
+    store.set_sync_state("folders", None, now)  # what _sync_hierarchy stamps
     return store
 
 
@@ -120,6 +122,31 @@ def test_list_folders_from_mirror(tmp_path, db):
     assert res["source"] == "cache"
     inbox = next(r for r in res["items"] if r.get("wk") == "f:inbox")
     assert inbox["unread"] == 1
+
+
+def test_list_folders_provenance_is_the_hierarchy_lane_not_the_slow_lane(tmp_path, db):
+    """as_of must come from the `folders` watermark. The slow (calendar/tasks)
+    lane's `events` key says nothing about when the folder tree was read."""
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    now = int(time.time())
+    ctx.cache.set_sync_state("folders", None, now - 900)
+    ctx.cache.set_sync_state("events", None, now)
+    res = _run(ctx, "list_folders")
+    assert res["as_of"].startswith(
+        datetime.fromtimestamp(now - 900, tz=UTC).isoformat(timespec="seconds")[:16])
+
+    ctx.cache.drop_sync_state("folders")
+    assert "as_of" not in _run(ctx, "list_folders")  # events must not stand in
+
+
+def test_get_thread_with_a_dead_mirror_is_backend_unavailable(tmp_path, db):
+    """A down Postgres is not a missing thread: get_thread must not report
+    not_found when it simply could not look."""
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    assert _run(ctx, "get_thread", id="RAW-1")["ok"] is True
+    db.close()
+    res = _run(ctx, "get_thread", id="RAW-1")
+    assert res["ok"] is False and res["error"]["code"] == "backend_unavailable"
 
 
 def test_fresh_true_forces_live(tmp_path, db):

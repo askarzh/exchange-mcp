@@ -29,10 +29,11 @@ def test_search_of_an_unsynced_folder_is_empty_not_an_error(db):
 def test_resolve_folder_id_uses_the_folders_table(db):
     ctx = make_context(db)
     seed_folders(ctx.cache)
-    assert cache_reads.resolve_folder_id(ctx, "f:inbox") == INBOX_ID
-    assert cache_reads.resolve_folder_id(ctx, "inbox") == INBOX_ID
-    assert cache_reads.resolve_folder_id(ctx, INBOX_ID) == INBOX_ID
-    assert cache_reads.resolve_folder_id(ctx, "Inbox") == INBOX_ID  # path
+    resolve = cache_reads.resolve_folder_id
+    assert asyncio.run(resolve(ctx, "f:inbox")) == INBOX_ID
+    assert asyncio.run(resolve(ctx, "inbox")) == INBOX_ID
+    assert asyncio.run(resolve(ctx, INBOX_ID)) == INBOX_ID
+    assert asyncio.run(resolve(ctx, "Inbox")) == INBOX_ID  # path
 
 
 def test_resolve_folder_id_on_cold_boot_is_upstream_unavailable(db):
@@ -40,7 +41,7 @@ def test_resolve_folder_id_on_cold_boot_is_upstream_unavailable(db):
     a degrading "not synced yet", never a claim that f:inbox is unknown."""
     ctx = make_context(db)  # no seed_folders(): the table is empty
     with pytest.raises(ToolError) as exc_info:
-        cache_reads.resolve_folder_id(ctx, "f:inbox")
+        asyncio.run(cache_reads.resolve_folder_id(ctx, "f:inbox"))
     assert exc_info.value.code == "upstream_unavailable"
 
 

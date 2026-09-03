@@ -146,7 +146,8 @@ async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int =
                         fresh: bool = False) -> Dict[str, Any]:
     depth = max(1, min(int(depth), 5))
 
-    # ---- mirror (the hierarchy lane refreshes counts every ~10 min) --------
+    # ---- mirror (the hierarchy lane re-walks the tree, and so refreshes
+    # these counts, every EWS_CACHE_HIERARCHY_SECONDS — 10 min by default) ---
     if not fresh and parent is None:
         hit = await cache_reads.list_folders(ctx, depth, include_empty)
         if hit is not None:
@@ -275,7 +276,13 @@ async def _get_thread(ctx: Context, id: str, limit: int = 20,
     offset = max(0, int(offset))
     raw_id = id
 
-    hit = await cache_reads.get_thread(ctx, raw_id, limit, offset)
+    try:
+        hit = await cache_reads.get_thread(ctx, raw_id, limit, offset)
+    except (psycopg.Error, RuntimeError) as exc:
+        # A dead Postgres is not a missing thread — same mapping search_messages
+        # uses, so the model retries instead of trusting a false not_found.
+        raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
+                        hint="Check DATABASE_URL.", retry_after_s=15) from exc
     if hit is not None:
         return hit
     raise ToolError(
