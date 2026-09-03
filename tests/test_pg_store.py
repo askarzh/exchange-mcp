@@ -100,15 +100,13 @@ def test_unread_page_and_watermarks(store):
     assert "item:inbox" in store.watermarks()
 
 
-def test_stats_and_purge(store):
+def test_stats(store):
     store.upsert_messages([make_row("M1")])
     store.set_sync_state("item:inbox", "T", time.time())
     stats = store.stats()
     assert stats["rows"]["messages"] == 1
     assert stats["db_mb"] >= 0
-    store.purge()
-    assert store.stats()["rows"]["messages"] == 0
-    assert store.get_sync_state("item:inbox") is None
+    assert stats["watermarks"]["item:inbox"] > 0
 
 
 def test_contact_stats_and_senders(store):

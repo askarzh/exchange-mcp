@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from ewsmcp.ids import IdAliaser, NullAliaser, kind_for_key  # noqa: F401
+from ewsmcp.ids import IdAliaser, kind_for_key
 
 RAW_A = "AAMkAGI2NGVhZTVlLTI3ZjMtNDlmMS1iZjk4LWRlMDUxYmQ5NzU5AAA="
 RAW_B = "AAMkAGI2NGVhZTVlLTI3ZjMtNDlmMS1iZjk4LU1PVkVEX0FGVEVSAAB="

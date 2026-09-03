@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import time
 from typing import Any
 
@@ -23,8 +22,6 @@ import psycopg
 
 from ..db import Database
 from ..normalize import normalize_text, tsquery
-
-logger = logging.getLogger(__name__)
 
 SIG_MIN_HITS = 3
 _SIG_MAX_LINES = 6
@@ -80,9 +77,6 @@ class CacheStore:
 
     def __init__(self, db: Database):
         self.db = db
-
-    def close(self) -> None:  # kept for call-site compatibility
-        return None
 
     # ------------------------------------------------------------- writers
 
@@ -188,12 +182,6 @@ class CacheStore:
                 "ON CONFLICT (key) DO UPDATE SET token = EXCLUDED.token, "
                 "as_of = EXCLUDED.as_of",
                 (key, token, int(as_of_ts if as_of_ts is not None else time.time())))
-
-    def purge(self) -> None:
-        with self.db.conn() as c:
-            c.execute("TRUNCATE ews.messages, ews.events, ews.tasks, ews.folders, "
-                      "ews.sync_state, ews.sender_sigs")
-        logger.warning("mirror purged")
 
     # -------------------------------------------------------------- reads
 

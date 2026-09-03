@@ -71,3 +71,11 @@ class AuditLog:
         except Exception:
             # Auditing must never take a tool call down.
             pass
+
+
+class NullAudit:
+    """Audit disabled (storage init failed, or the MCP process, which does
+    not own the chain). Every record is dropped; nothing else changes."""
+
+    def record(self, *args, **kwargs) -> None:
+        return None

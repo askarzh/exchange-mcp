@@ -234,35 +234,6 @@ async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     return None
 
 
-async def mint_token(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any]) -> str:
-    """Server-side pre-confirmation (e.g. a human-approved queue item).
-
-    Mirrors ``_confirm_gate``'s binding exactly: preview-hook specs get a
-    token bound to the resolved content, others to the literal arguments.
-    """
-    if spec.preview is not None:
-        content = await spec.preview(ctx, dict(kwargs))
-        body_text = content.get("body_text")
-        chash = content_hash(
-            content.get("subject") or "",
-            sorted(content.get("to") or []),
-            sorted(content.get("cc") or []),
-            sorted(content.get("bcc") or []),
-            body_text if isinstance(body_text, str) else "",
-        )
-        target_id = str(kwargs.get("draft_id") or kwargs.get("event_id")
-                        or kwargs.get("id") or "-")
-    else:
-        chash = content_hash(dict(kwargs))
-        target_id = "-"
-    return make_token(
-        mailbox=ctx.settings.ews_email, action=spec.name, target_id=target_id,
-        chash=chash,
-        ttl_seconds=ctx.settings.confirm_ttl_seconds,
-        secret=ctx.settings.send_confirm_secret,
-    )["confirm_token"]
-
-
 def resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(kwargs)
     try:
@@ -275,9 +246,6 @@ def resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     except KeyError as e:
         raise ToolError("validation", str(e.args[0] if e.args else e))
     return out
-
-
-_resolve_ids = resolve_ids
 
 
 async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],

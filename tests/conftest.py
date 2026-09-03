@@ -135,13 +135,12 @@ def make_context(db, gateway=None, cache=True, audit_dir=None, **overrides):
     `cache=False` leaves ctx.cache None. `audit_dir` swaps the null audit for
     a real hash-chained AuditLog rooted there.
     """
-    from ewsmcp.audit import AuditLog
+    from ewsmcp.audit import AuditLog, NullAudit
     from ewsmcp.cache.store import CacheStore
     from ewsmcp.ids import IdAliaser
-    from ewsmcp.server import _NullAudit
     from ewsmcp.tools import build_registry
     from ewsmcp.tools.base import Context
-    audit = AuditLog(audit_dir) if audit_dir else _NullAudit()
+    audit = AuditLog(audit_dir) if audit_dir else NullAudit()
     ctx = Context(settings=make_settings(**overrides), gateway=gateway, manager=None,
                   aliaser=IdAliaser(db), audit=audit,
                   cache=CacheStore(db) if cache else None, db=db)

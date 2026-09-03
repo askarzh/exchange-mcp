@@ -29,9 +29,7 @@ from ..errors import ToolError
 from ..gateway.client import WELL_KNOWN, paginate
 from . import cache_reads
 from .base import Context, ToolSpec
-
-# Re-exported for compatibility — other tests/modules import these from here.
-from .cache_reads import _row_body, _row_card, _row_full, _stamp  # noqa: F401
+from .cache_reads import _stamp
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +38,6 @@ _FRESH_PROPERTY = {
     "description": "true forces a live Exchange read instead of the local "
                    "mirror (responses are stamped source=cache|live).",
 }
-
-
-def _cache_folder_key(ctx: Context, folder_ref: Optional[str]) -> Optional[str]:
-    """Map a folder argument onto a mirrored folder key, or None (→ live)."""
-    return cache_reads.folder_key(ctx, folder_ref)
-
-
-def _cache_watermark(ctx: Context, folder_key: str) -> Optional[int]:
-    return cache_reads.watermark(ctx, folder_key)
 
 # Fields fetched for every list/search projection (token economy: never
 # pull full MIME just to render a card).

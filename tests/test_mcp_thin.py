@@ -37,11 +37,11 @@ class RecordingDaemon:
 
 
 def _mcp_ctx(db, daemon, **overrides):
+    from ewsmcp.audit import NullAudit
     from ewsmcp.cache.store import CacheStore
     from ewsmcp.ids import IdAliaser
-    from ewsmcp.server import _NullAudit
     ctx = Context(settings=make_settings(**overrides), gateway=None, manager=None,
-                  aliaser=IdAliaser(db), audit=_NullAudit(), cache=CacheStore(db),
+                  aliaser=IdAliaser(db), audit=NullAudit(), cache=CacheStore(db),
                   db=db, daemon=daemon)
     build_mcp_registry(ctx)
     return ctx

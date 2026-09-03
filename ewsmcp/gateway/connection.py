@@ -70,10 +70,6 @@ class ConnectionManager:
         with self._lock:
             return self._state
 
-    @property
-    def is_warm(self) -> bool:
-        return self.state == STATE_WARM
-
     def status(self) -> Dict[str, Any]:
         """Snapshot for /readyz and whoami. Never raises, never blocks on EWS."""
         with self._lock:

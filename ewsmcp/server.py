@@ -1,12 +1,10 @@
 """MCP wiring: low-level Server, annotations, structured output, lifecycle."""
 
 import logging
-from typing import Any, Dict, List
 
-from mcp.server import Server
-from mcp.types import Tool, ToolAnnotations
+from mcp.types import ToolAnnotations
 
-from .audit import AuditLog
+from .audit import AuditLog, NullAudit
 from .cache import CacheStore
 from .config import Settings
 from .db import Database
@@ -14,7 +12,7 @@ from .gateway.client import EWSGateway
 from .gateway.connection import ConnectionManager
 from .ids import IdAliaser
 from .tools import build_registry
-from .tools.base import Context, dispatch
+from .tools.base import Context
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +28,6 @@ ANNOTATIONS = {
 }
 
 
-class _NullAudit:
-    def record(self, *args, **kwargs) -> None:
-        return None
-
-
 def build_context(settings: Settings) -> Context:
     gateway = EWSGateway(settings)
     db = Database(settings.database_url)
@@ -47,7 +40,7 @@ def build_context(settings: Settings) -> Context:
         audit = AuditLog(settings.data_dir)
     except Exception as exc:  # noqa: BLE001 - audit is best-effort, never blocks boot
         logger.error("audit init failed (%s) — audit disabled", exc)
-        audit = _NullAudit()
+        audit = NullAudit()
     ctx = Context(
         settings=settings,
         gateway=gateway,
@@ -84,44 +77,4 @@ async def start_connection_manager(ctx: Context) -> None:
 
     await manager.start(on_warm=on_warm)
     logger.info("Exchange warmup running in background (see /readyz)")
-
-
-def build_mcp_server(ctx: Context) -> Server:
-    server = Server("ews-mcp-v5")
-
-    @server.list_tools()
-    async def list_tools() -> List[Tool]:
-        tools = []
-        for spec in ctx.registry.values():
-            schema = spec.public_schema()
-            tools.append(Tool(
-                name=schema["name"],
-                description=schema["description"],
-                inputSchema=schema["inputSchema"],
-                annotations=ANNOTATIONS.get(spec.side_effect_class, ANNOTATIONS["write"]),
-            ))
-        return tools
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: Dict[str, Any]):
-        spec = ctx.registry.get(name)
-        if spec is None:
-            return {"ok": False, "error": {
-                "code": "validation",
-                "message": f"Unknown tool: {name}",
-                "hint": f"Available: {', '.join(sorted(ctx.registry))}",
-            }}
-        return await dispatch(ctx, spec, dict(arguments or {}), transport="mcp")
-
-    return server
-
-
-async def run_stdio(settings: Settings) -> None:
-    from mcp.server.stdio import stdio_server
-
-    ctx = build_context(settings)
-    server = build_mcp_server(ctx)
-    await start_connection_manager(ctx)
-    async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
 

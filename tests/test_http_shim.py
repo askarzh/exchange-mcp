@@ -56,7 +56,7 @@ def _status_and_body(sent):
 
 def _post(app, name, payload):
     body = json.dumps(payload).encode() if not isinstance(payload, bytes) else payload
-    return _drive(app, f"/api/tools/{name}",
+    return _drive(app, f"/v1/tools/{name}",
                   [{"type": "http.request", "body": body, "more_body": False}])
 
 
@@ -101,7 +101,7 @@ def test_oversize_body_is_capped(tmp_path, db):
 
 def test_disconnect_mid_body_does_not_hang_or_crash(tmp_path, db):
     app = build_app(_ctx(tmp_path, db), make_settings())
-    sent = _drive(app, "/api/tools/echo", [
+    sent = _drive(app, "/v1/tools/echo", [
         {"type": "http.request", "body": b'{"q":', "more_body": True},
         {"type": "http.disconnect"},
     ])

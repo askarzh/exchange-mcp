@@ -140,15 +140,15 @@ async def _read_json_body(receive, send) -> Any | None:
         return None
 
 
-def build_app(ctx, settings, streamable: Any | None = None, *,
-             mount_mcp: bool = True, tools_prefix: str = "/api/tools",
+def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
              api_key: str | None = None):
     """ASGI app closure, driven directly by tests (no uvicorn needed).
 
-    ``mount_mcp`` and ``tools_prefix`` let the daemon (ewsd) reuse this same
-    closure without the Streamable HTTP MCP transport and under a `/v1/tools`
-    prefix; ``api_key`` overrides `settings.mcp_api_key` when given (the
-    daemon uses `settings.ewsd_api_key`).
+    Serves health, /metrics, /openapi.json, the capability-URL upload route
+    and the REST tool routes under `tools_prefix`. The MCP transport is NOT
+    here — it lives in ewsmcp/mcp/http.py, the only process that speaks MCP.
+    `api_key` overrides `settings.mcp_api_key` when given (ewsd passes
+    `settings.ewsd_api_key`).
     """
     key = (settings.mcp_api_key if api_key is None else api_key) or ""
 
@@ -211,12 +211,6 @@ def build_app(ctx, settings, streamable: Any | None = None, *,
         if path == "/v1/status" and method == "GET":
             return await _send_json(send, 200, await _get_server_status(ctx))
 
-        if path == "/mcp" and mount_mcp:
-            if streamable is None:
-                return await _send_json(send, 503, {"ok": False, "error": {
-                    "code": "upstream_unavailable",
-                    "message": "MCP transport not mounted"}})
-            return await streamable.handle_request(scope, receive, send)
         if path == "/metrics" and method == "GET":
             body = _metrics_text(ctx).encode()
             await send({"type": "http.response.start", "status": 200, "headers": [
