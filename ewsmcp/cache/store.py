@@ -7,8 +7,11 @@ the daemon (writer) and every MCP process (readers).
   is resolved.
 - Full-text search: ``messages.search_tsv`` is generated from subject,
   sender and body through ``ews.immutable_unaccent(lower(...))``. Queries
-  use the same wrapper, with the prefix expression (``tok:* & tok2:*``)
-  built in Python by ``prefix_tsquery``. Ranked by ``ts_rank_cd`` then date.
+  tokenize in Python (``\\w+``) but fold AND re-sanitise in SQL, per token,
+  via ``_TSQUERY`` — ``ews.immutable_unaccent`` can turn a single input
+  character into tsquery metacharacters (e.g. a modifier apostrophe →
+  ``'``), so the prefix expression is only safe to build after folding.
+  Ranked by ``ts_rank_cd`` then date.
 - Timestamps are stored twice: epoch seconds (filter/sort) and the display
   ISO string in the server timezone.
 - Archive columns (``archive_state``, ``mime_*`` …) are owned by the Phase 2
@@ -34,16 +37,44 @@ _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 # and a missing folders row degrades to "matches nothing" rather than an error.
 _INBOX_ID = "(SELECT ews_id FROM ews.folders WHERE wk = 'f:inbox' LIMIT 1)"
 _SENT_ID = "(SELECT ews_id FROM ews.folders WHERE wk = 'f:sent' LIMIT 1)"
-_TSQUERY = "to_tsquery('simple', ews.immutable_unaccent(lower(%s)))"
+
+# %s is a text[] of raw (lowercased) \w+ tokens. Folding (immutable_unaccent)
+# can turn a single input character into tsquery metacharacters — e.g. a
+# modifier apostrophe folds to "'", a circled digit to "(1)" — so the folded
+# text is never handed to to_tsquery directly (it would raise a syntax
+# error). Instead each token is re-lexed with to_tsvector (which, unlike
+# to_tsquery, never errors on odd input) to recover its real word-lexeme(s)
+# post-folding; a token that splits into more than one lexeme (e.g. the
+# circled digit example, "(1)budget" -> '1','budget') ORs its lexemes
+# together — either could be "the word" the user meant — and distinct
+# original tokens AND together, same as plain prefix search. A token that
+# folds to nothing (pure punctuation) drops out; if every token does,
+# string_agg returns NULL and to_tsquery(NULL) is NULL (matches nothing,
+# never raises).
+_TSQUERY = """
+(SELECT to_tsquery('simple', string_agg(grp, ' & '))
+   FROM (SELECT string_agg(lex || ':*', ' | ') AS grp
+           FROM unnest(%s::text[]) WITH ORDINALITY AS tok(word, ord)
+           CROSS JOIN LATERAL unnest(tsvector_to_array(to_tsvector(
+               'simple', ews.immutable_unaccent(lower(tok.word))))) AS lex
+          GROUP BY tok.ord) s
+  WHERE grp IS NOT NULL)
+"""
+
+
+def _tokens(query: str | None) -> list[str]:
+    """Raw (lowercased) \\w+ tokens — no folding, no sanitising: that all
+    happens in SQL, in ``_TSQUERY``, after unaccent (see its docstring)."""
+    return [t for t in _TOKEN_RE.findall((query or "").lower()) if t]
 
 
 def prefix_tsquery(query: str) -> str:
-    """Safe ``to_tsquery('simple', …)`` expression: every word becomes a
-    prefix term, terms are ANDed. Accent folding happens in SQL, so the
-    tokens are passed through as written (only lowercased there).
+    """Preview of the prefix expression ``_TSQUERY`` builds server-side:
+    every word becomes a prefix term, terms are ANDed. This Python-only
+    rendering does NOT fold accents (that happens in SQL) — it exists for
+    callers that just need to know whether `query` is searchable at all.
     Returns "" when nothing is searchable."""
-    tokens = _TOKEN_RE.findall((query or "").lower())
-    return " & ".join(f"{t}:*" for t in tokens if t)
+    return " & ".join(f"{t}:*" for t in _tokens(query))
 
 
 _UPSERT_MESSAGE = """
@@ -231,10 +262,10 @@ class CacheStore:
         mirrored folder. Returns (page rows, exact total)."""
         where: list[str] = [_ARCHIVED.get(archived, "TRUE")]
         params: list[Any] = []
-        q = prefix_tsquery(text) if text else ""
-        if q:
+        tokens = _tokens(text) if text else []
+        if tokens:
             where.append(f"m.search_tsv @@ {_TSQUERY}")
-            params.append(q)
+            params.append(tokens)
         if folder_ids:
             where.append("m.folder_id = ANY(%s)")
             params.append(list(folder_ids))
@@ -259,9 +290,9 @@ class CacheStore:
             params.append(1 if has_attachments else 0)
         base = "FROM ews.messages m WHERE " + " AND ".join(where)
         order, order_params = "m.date_ts DESC", []
-        if q:
+        if tokens:
             order = f"ts_rank_cd(m.search_tsv, {_TSQUERY}) DESC, m.date_ts DESC"
-            order_params = [q]
+            order_params = [tokens]
         with self.db.conn() as c:
             total = c.execute(f"SELECT COUNT(*) AS n {base}", params).fetchone()["n"]
             rows = c.execute(

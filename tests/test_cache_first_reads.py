@@ -118,12 +118,15 @@ def test_fresh_true_forces_live(tmp_path, db):
     assert res["ok"] is False
 
 
-def test_unmirrored_folder_is_a_validation_error(tmp_path, db):
+def test_unmirrored_folder_is_a_not_found_error(tmp_path, db):
     """f:junk isn't in ews.folders (only f:inbox is, after the seed above),
     so resolve_folder_id raises before the gateway is ever touched."""
-    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    gateway = FakeGateway(raise_on_call=True)
+    ctx = _ctx(tmp_path, db, gateway)
     res = _run(ctx, "search_messages", folder="f:junk")
     assert res["ok"] is False
+    assert res["error"]["code"] == "not_found"
+    assert gateway.calls == 0
 
 
 def test_cache_error_falls_back_to_live(tmp_path, db):

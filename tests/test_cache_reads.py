@@ -3,8 +3,10 @@
 import asyncio
 import time
 
+import pytest
 from conftest import INBOX_ID, make_context, make_row, seed_folders
 
+from ewsmcp.errors import ToolError
 from ewsmcp.tools import cache_reads
 
 
@@ -31,6 +33,15 @@ def test_resolve_folder_id_uses_the_folders_table(db):
     assert cache_reads.resolve_folder_id(ctx, "inbox") == INBOX_ID
     assert cache_reads.resolve_folder_id(ctx, INBOX_ID) == INBOX_ID
     assert cache_reads.resolve_folder_id(ctx, "Inbox") == INBOX_ID  # path
+
+
+def test_resolve_folder_id_on_cold_boot_is_upstream_unavailable(db):
+    """ews.folders is empty before the hierarchy lane's first sync — that's
+    a degrading "not synced yet", never a claim that f:inbox is unknown."""
+    ctx = make_context(db)  # no seed_folders(): the table is empty
+    with pytest.raises(ToolError) as exc_info:
+        cache_reads.resolve_folder_id(ctx, "f:inbox")
+    assert exc_info.value.code == "upstream_unavailable"
 
 
 def test_search_hit_is_stamped(db):

@@ -203,6 +203,33 @@ def test_search_folds_accents_in_the_database(store):
     assert total == 1
 
 
+def test_search_does_not_raise_when_unaccent_emits_tsquery_metacharacters(store):
+    """ews.immutable_unaccent can turn a single input character into tsquery
+    metacharacters (a modifier apostrophe -> "'", a circled digit -> "(1)",
+    a modifier colon -> ":") — the query must re-sanitise AFTER folding, in
+    SQL, or to_tsquery raises a syntax error on these inputs."""
+    store.upsert_messages([make_row("M1", subject="Budget approved")])
+    for text in ("ʼhello", "aːb", "⑴budget"):
+        store.search_messages(text=text)  # must not raise
+    # the circled-digit token still folds down to a working "budget" prefix
+    rows, total = store.search_messages(text="⑴budget")
+    assert total == 1 and rows[0]["ews_id"] == "M1"
+
+
+def test_search_folds_and_prefixes_together(store):
+    store.upsert_messages([make_row("M1", subject="Café budget review")])
+    rows, total = store.search_messages(text="Café bud")
+    assert total == 1 and rows[0]["ews_id"] == "M1"
+
+
+def test_search_folds_cyrillic_yo_to_ye(store):
+    store.upsert_messages([make_row("M1", subject="Ёлка на праздник")])
+    rows, total = store.search_messages(text="ёлка")
+    assert total == 1 and rows[0]["ews_id"] == "M1"
+    rows, total = store.search_messages(text="елка")  # е/ё fold both ways
+    assert total == 1 and rows[0]["ews_id"] == "M1"
+
+
 def test_prefix_tsquery_builds_an_and_of_prefixes():
     from ewsmcp.cache.store import prefix_tsquery
     assert prefix_tsquery("Budget Review") == "budget:* & review:*"

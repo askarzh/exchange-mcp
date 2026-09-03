@@ -150,11 +150,19 @@ def resolve_folder_id(ctx: Context, folder_ref: str) -> str:
     """well-known alias (f:inbox / inbox) | folder alias (f7) | path | raw
     EWS id → the folder's EWS id, resolved against ``ews.folders``.
 
-    Raises ToolError("validation") for a folder excluded from the mirror and
-    ToolError("not_found") when nothing matches.
+    Raises ToolError("validation") for a folder excluded from the mirror,
+    ToolError("upstream_unavailable") when the hierarchy lane has not synced
+    ANY folders yet (cold boot — degrading, not a claim that the folder
+    itself is wrong), and ToolError("not_found") when the hierarchy IS
+    populated but nothing matches.
     """
     ref = (folder_ref or "").strip()
     rows = ctx.cache.folder_rows()
+    if not rows:
+        raise ToolError(
+            "upstream_unavailable", "folder hierarchy not synced yet",
+            hint="ewsd syncs the folder tree shortly after boot; check "
+                 "get_server_status", retry_after_s=30)
     wk = ref.lower() if ref.lower().startswith("f:") else f"f:{ref.lower()}"
     row = next((r for r in rows if r["wk"] == wk), None)
     if row is None:
