@@ -92,10 +92,12 @@ MCP_TRANSPORT=http MCP_PORT=8000 MCP_API_KEY=<long-random-string> ewsmcp
 - `ewsmcp` in HTTP mode still needs `DATABASE_URL` + `EWSD_URL` +
   `EWSD_API_KEY`; it never talks to Exchange itself.
 
-`ewsd`'s own HTTP surface (`/upload/<token>`, `POST /v1/tools/<name>`,
-`GET /v1/tools`, `GET /v1/status`, `/metrics`, `/openapi.json`) is
-separate — it is what `ewsmcp` calls for writes, not something a client
-talks to directly. See DESIGN.md §Processes.
+`ewsd`'s own HTTP surface (`GET /v1/tools`, `POST /v1/tools/<name>`,
+`GET /v1/status`, `/metrics`, `/openapi.json` behind `EWSD_API_KEY`;
+`/livez`, `/readyz`, `/health`, `/version` always public; `PUT|POST
+/upload/<token>` deliberately ahead of the bearer gate) is separate — it
+is what `ewsmcp` calls for writes, not something a client talks to
+directly. See DESIGN.md §Processes.
 
 Full dev stack (Postgres + `ewsd` + `ewsmcp` in HTTP mode), see
 [`docker-compose.yml`](docker-compose.yml):
@@ -183,8 +185,9 @@ send_draft(draft_id="d1", confirm_token="…")
 
 `ewsmcp`: `GET /livez` (process up), `GET /readyz` (honest 503 while
 warming), `GET /health` (tool count), `GET /version`. `ewsd`: `GET
-/livez`, `GET /readyz` (Exchange connection state), `GET /v1/status`,
-`GET /metrics` (Prometheus, bearer-authenticated). `get_server_status`
+/livez`, `GET /readyz` (Exchange connection state), `GET /health`,
+`GET /version` — all always public, no `EWSD_API_KEY` needed; `GET
+/v1/status` and `GET /metrics` (Prometheus) require it. `get_server_status`
 tool (answered by `ewsmcp` — tier, alias stats, cache stats, plus
 `ewsd`'s own status merged in, or `daemon.reachable: false` if `ewsd` is
 down — works while cold and over stdio too). Audit chain:

@@ -44,10 +44,12 @@ Two processes share one Postgres database.
 - **`ewsd`, the daemon.** One instance, always on. Owns the only Exchange
   session (gateway, connection manager), the `SyncEngine` that keeps the
   mirror warm, capability-URL uploads, the hash-chained audit log, and the
-  entire gate chain (§Safety). Exposes an authenticated HTTP API on
-  `EWSD_HOST:EWSD_PORT` (default `127.0.0.1:8790`) behind `EWSD_API_KEY`:
-  `GET /v1/tools`, `POST /v1/tools/<name>`, `GET /v1/status`,
-  `/upload/<token>`, `/livez`, `/readyz`, `/metrics`, `/openapi.json`.
+  entire gate chain (§Safety). Serves HTTP on `EWSD_HOST:EWSD_PORT`
+  (default `127.0.0.1:8790`): `GET /v1/tools`, `POST /v1/tools/<name>`,
+  `GET /v1/status`, `/metrics`, `/openapi.json` are behind `EWSD_API_KEY`;
+  `GET /livez`, `/readyz`, `/health`, `/version` are always public; `PUT|POST
+  /upload/<token>` is deliberately ahead of the bearer gate too — the
+  unguessable single-use token IS the credential.
 - **`ewsmcp`, the thin MCP.** Any number of instances. Reads Postgres
   directly for `list_folders`, `search_messages`, `get_message`,
   `get_thread`, `get_mailbox_overview`, `list_tasks`, `waiting_on`, and
@@ -189,9 +191,11 @@ LLM-directed `hint` and `retry_after_s` where meaningful. Handler
 `/livez`, `/readyz`, `/health`, `/version` (`MCP_API_KEY` guards `/mcp`
 in HTTP mode). `ewsd`: HTTP only — `GET /v1/tools`,
 `POST /v1/tools/<name>` (jsonschema-validated against the public tool
-schema, 1 MiB body cap), `GET /v1/status`, `/upload/<token>`, `/livez`,
-`/readyz`, `/metrics` (Prometheus) and `/openapi.json`, all behind
-`EWSD_API_KEY` except the public health paths.
+schema, 1 MiB body cap), `GET /v1/status`, `/metrics` (Prometheus) and
+`/openapi.json` are behind `EWSD_API_KEY`; `GET /livez`, `/readyz`,
+`/health`, `/version` are always public; `PUT|POST /upload/<token>` is
+deliberately ahead of the bearer gate — the unguessable single-use token
+IS the credential.
 **Never-exit boot** (both processes): tools/routes register and
 transports bind before any Exchange contact; in `ewsd` a background
 warmup loop owns connection recovery (exponential backoff + jitter,
