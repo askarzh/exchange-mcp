@@ -1,7 +1,7 @@
 """Environment-driven configuration (12-factor; every knob defaults safe)."""
 
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,14 +18,14 @@ class Settings(BaseSettings):
     )
 
     # --- Exchange upstream (the daemon needs these; the MCP does not) --------
-    ews_server_url: Optional[str] = None
+    ews_server_url: str | None = None
     ews_email: str  # both processes: own-domain checks, confirm tokens, audit
-    ews_username: Optional[str] = None
-    ews_password: Optional[str] = None
+    ews_username: str | None = None
+    ews_password: str | None = None
     # NEVER pin auth_type against this Exchange: the front door only works
     # via exchangelib auto-negotiation (verified live 2026-06-12; pinning
     # BASIC/NTLM both fail). Escape hatch for a *different* server only.
-    ews_auth_type_force: Optional[Literal["basic", "ntlm", "digest"]] = None
+    ews_auth_type_force: Literal["basic", "ntlm", "digest"] | None = None
     ews_insecure_skip_verify: bool = False
     ews_tz: str = "Asia/Riyadh"
     request_timeout: int = 30
@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # --- Daemon HTTP API (ewsd serves; ewsmcp calls) ---------------------------
     ewsd_host: str = "127.0.0.1"
     ewsd_port: int = 8790
-    ewsd_api_key: Optional[str] = None  # bearer the MCP presents; required off-loopback
+    ewsd_api_key: str | None = None  # bearer the MCP presents; required off-loopback
     ewsd_url: str = "http://127.0.0.1:8790"
 
     # --- Mirror sync (daemon) ---------------------------------------------------
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     # --- Safety -------------------------------------------------------------
     ews_capability_tier: Literal["read", "draft", "full"] = "draft"
     send_enabled: bool = False  # kill-switch: v5 defaults SAFE (off)
-    send_confirm_secret: Optional[str] = None
+    send_confirm_secret: str | None = None
     confirm_ttl_seconds: int = 600  # ONE default everywhere (== confirm.DEFAULT_TTL_SECONDS)
     ews_recipient_allowlist: str = ""
     ews_recipient_denylist: str = ""
@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     mcp_transport: Literal["stdio", "http"] = "stdio"
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8000
-    mcp_api_key: Optional[str] = None
+    mcp_api_key: str | None = None
     log_level: str = "INFO"
     # Public base URL of this server (e.g. https://ews.example.com), used to build
     # the absolute capability URL returned by create_upload_link. Empty → the tool
