@@ -13,25 +13,13 @@ from typing import Any, Dict, List, Optional
 from ..dates import parse_when
 from ..dto import envelope
 from ..errors import ToolError
+from . import cache_reads
 from .base import Context, ToolSpec
 
 logger = logging.getLogger(__name__)
 
 _TASK_PROJECTION = ("id", "changekey", "subject", "due_date", "is_complete",
                     "status")
-
-
-def _task_row_dto(ctx: Context, row: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "id": ctx.aliaser.alias_for(row["ews_id"], "k"),
-        "subject": row["subject"] or "",
-        "complete": bool(row["is_complete"]),
-    }
-    if row["due_iso"]:
-        out["due"] = row["due_iso"]
-    if row["status"]:
-        out["status"] = row["status"]
-    return out
 
 
 def _task_item_dto(ctx: Context, item: Any, tz: str) -> Dict[str, Any]:
@@ -56,16 +44,10 @@ async def _list_tasks(ctx: Context, include_completed: bool = False,
                       fresh: bool = False) -> Dict[str, Any]:
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 100))
-    if not fresh and ctx.cache is not None and ctx.cache.watermark("item:tasks"):
-        try:
-            rows, total = await asyncio.to_thread(
-                ctx.cache.task_rows, include_completed, offset, limit)
-            items = [_task_row_dto(ctx, r) for r in rows]
-            out = envelope(items, total, offset)
-            out["source"] = "cache"
-            return out
-        except Exception as exc:
-            logger.warning("cache list_tasks failed (%s) — live", exc)
+    if not fresh:
+        hit = await cache_reads.list_tasks(ctx, include_completed, offset, limit)
+        if hit is not None:
+            return hit
 
     tz = ctx.settings.ews_tz
 

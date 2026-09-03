@@ -15,7 +15,6 @@ it never gates them.
 """
 
 import asyncio
-import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -29,7 +28,10 @@ from ..dto import envelope, event_card, fmt_dt, msg_card, msg_full
 from ..errors import ToolError
 from .. import shared
 from ..gateway.client import WELL_KNOWN, paginate
+from . import cache_reads
 from .base import Context, ToolSpec
+# Re-exported for compatibility — other tests/modules import these from here.
+from .cache_reads import _row_body, _row_card, _row_full, _stamp  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -40,93 +42,13 @@ _FRESH_PROPERTY = {
 }
 
 
-def _stamp(result: Dict[str, Any], source: str,
-           as_of_ts: Optional[int] = None) -> Dict[str, Any]:
-    result["source"] = source
-    if source == "cache" and as_of_ts:
-        result["as_of"] = datetime.fromtimestamp(
-            as_of_ts, tz=timezone.utc).isoformat(timespec="seconds")
-    return result
-
-
 def _cache_folder_key(ctx: Context, folder_ref: Optional[str]) -> Optional[str]:
     """Map a folder argument onto a mirrored folder key, or None (→ live)."""
-    key = (folder_ref or "f:inbox").strip().lower()
-    if key.startswith("f:"):
-        key = key[2:]
-    cached = {k.strip().lower()
-              for k in (ctx.settings.ews_cache_folders or "").split(",")}
-    return key if key in cached else None
+    return cache_reads.folder_key(ctx, folder_ref)
 
 
 def _cache_watermark(ctx: Context, folder_key: str) -> Optional[int]:
-    if ctx.cache is None:
-        return None
-    return ctx.cache.watermark(f"item:{folder_key}")
-
-
-def _row_body(ctx: Context, row: Any) -> str:
-    """Cleaned body with the sender's LEARNED signature stripped (the
-    deterministic per-sender trailing-block learning from sync time)."""
-    body = row["body_clean"] or ""
-    if ctx.cache is not None and body:
-        try:
-            body = ctx.cache.strip_learned_signature(row["sender_email"], body)
-        except Exception:
-            pass
-    return body
-
-
-def _row_card(ctx: Context, row: Any) -> Dict[str, Any]:
-    """Mirror row → the same MsgCard shape the live path emits."""
-    body = _row_body(ctx, row)
-    card: Dict[str, Any] = {
-        "id": ctx.aliaser.alias_for(row["ews_id"], "m",
-                                    changekey=row["changekey"],
-                                    internet_message_id=row["internet_message_id"]),
-        "from": (f"{row['sender_name']} <{row['sender_email']}>"
-                 if row["sender_name"] and row["sender_name"] != row["sender_email"]
-                 else (row["sender_email"] or "")),
-        "subject": row["subject"] or "",
-        "date": row["date_iso"],
-        "snippet": body[:200],
-    }
-    if row["conversation_id"]:
-        card["thread"] = ctx.aliaser.alias_for(row["conversation_id"], "t")
-    if not row["is_read"]:
-        card["unread"] = True
-    if row["has_attachments"]:
-        card["attach"] = True
-    if (row["importance"] or "").lower() == "high":
-        card["importance"] = "high"
-    return card
-
-
-def _row_full(ctx: Context, row: Any) -> Dict[str, Any]:
-    full = _row_card(ctx, row)
-    full.pop("snippet", None)
-    try:
-        full["to"] = json.loads(row["to_json"] or "[]")
-    except ValueError:
-        full["to"] = []
-    body = _row_body(ctx, row)
-    limit = int(ctx.settings.body_max_chars)
-    full["body"] = body[:limit]
-    if len(body) > limit:
-        full["body_truncated"] = True
-    if row["internet_message_id"]:
-        full["internet_message_id"] = row["internet_message_id"]
-    try:
-        cats = json.loads(row["categories_json"] or "[]")
-    except ValueError:
-        cats = []
-    if cats:
-        full["categories"] = cats
-    if row["has_attachments"]:
-        full["attachments_hint"] = ("message has attachments — call again "
-                                    "with fresh=true for the inventory, or "
-                                    "get_attachment to read one")
-    return full
+    return cache_reads.watermark(ctx, folder_key)
 
 # Fields fetched for every list/search projection (token economy: never
 # pull full MIME just to render a card).
@@ -240,31 +162,10 @@ async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int =
     depth = max(1, min(int(depth), 5))
 
     # ---- mirror (the hierarchy lane refreshes counts every ~10 min) --------
-    if not fresh and parent is None and ctx.cache is not None:
-        try:
-            folder_rows = await asyncio.to_thread(ctx.cache.folder_rows)
-        except Exception as exc:
-            logger.warning("cache list_folders failed (%s) — live", exc)
-            folder_rows = []
-        if folder_rows:
-            rows = []
-            for r in folder_rows:
-                if (r["path"] or "").count("/") + 1 > depth:
-                    continue
-                if not include_empty and not r["total"]:
-                    continue
-                row: Dict[str, Any] = {
-                    "id": ctx.aliaser.alias_for(r["ews_id"], "f"),
-                    "name": r["name"], "path": r["path"],
-                    "total": r["total"], "unread": r["unread"],
-                    "children": r["children"],
-                }
-                if r["wk"]:
-                    row["wk"] = r["wk"]
-                rows.append(row)
-            as_of = ctx.cache.watermark("events")  # slow-lane watermark
-            return _stamp(envelope(rows, total_available=len(rows), offset=0),
-                          "cache", as_of)
+    if not fresh and parent is None:
+        hit = await cache_reads.list_folders(ctx, depth, include_empty)
+        if hit is not None:
+            return hit
 
     def work(account: Any) -> List[Dict[str, Any]]:
         root = (ctx.gateway.resolve_folder(account, parent, ctx.aliaser)
@@ -330,50 +231,18 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
         raise ToolError("validation",
                         "semantic search is not available in this build (it returns "
                         "with the archive tier).", hint="Use mode='keyword'.")
-    if sender and from_:
-        raise ToolError("validation",
-                        "pass `sender` only — `from_` is its deprecated alias.")
-    sender = sender or from_
-    structured_given = any(
-        v is not None for v in (sender, subject, since, until, is_unread, has_attachments)
-    )
-    if query and structured_given:
-        raise ToolError(
-            "validation",
-            "`query` (AQS) cannot be combined with the structured filters "
-            "(sender/subject/since/until/is_unread/has_attachments) — Exchange "
-            "runs them on different engines.",
-            hint="Either fold everything into the AQS string "
-                 "(e.g. 'from:ahmed subject:rfp received>=2026-06-01') or drop "
-                 "`query` and use only structured filters.",
-        )
+    sender = cache_reads.validate_search_args(
+        sender, from_, subject, since, until, is_unread, has_attachments, query)
     tz = ctx.settings.ews_tz
 
     # ---- cache-first: local FTS + SQL filters, exact COUNT(*) total -------
-    folder_key = _cache_folder_key(ctx, folder)
-    if not fresh and folder_key:
-        as_of = _cache_watermark(ctx, folder_key)
-        if as_of:
-            try:
-                since_ts = (int(parse_when(since, "since", tz).timestamp())
-                            if since else None)
-                until_ts = (int(parse_when(until, "until", tz).timestamp())
-                            if until else None)
-                rows, total = await asyncio.to_thread(
-                    ctx.cache.search_messages,
-                    folders=[folder_key], text=query, sender=sender,
-                    subject=subject, since_ts=since_ts, until_ts=until_ts,
-                    is_unread=is_unread, has_attachments=has_attachments,
-                    offset=offset, limit=limit,
-                )
-                cards = await asyncio.to_thread(
-                    lambda: [_row_card(ctx, r) for r in rows])
-                return _stamp(envelope(cards, total_available=total,
-                                       offset=offset), "cache", as_of)
-            except ToolError:
-                raise
-            except Exception as exc:
-                logger.warning("cache search failed (%s) — falling back live", exc)
+    if not fresh:
+        hit = await cache_reads.search_messages(
+            ctx, folder=folder, query=query, sender=sender, subject=subject,
+            since=since, until=until, is_unread=is_unread,
+            has_attachments=has_attachments, offset=offset, limit=limit)
+        if hit is not None:
+            return hit
 
     # ---- live path ---------------------------------------------------------
     filters: Dict[str, Any] = {}
@@ -434,17 +303,10 @@ async def _get_message(ctx: Context, id: str, format: str = "full",
     tz = ctx.settings.ews_tz
     # Mirror unless the caller needs live data: fresh=true, raw HTML, or an
     # attachment inventory (the mirror stores the flag, not the parts).
-    if not fresh and not include_html and ctx.cache is not None:
-        try:
-            row = await asyncio.to_thread(ctx.cache.get_message, raw_id)
-        except Exception as exc:
-            logger.warning("cache get_message failed (%s) — live", exc)
-            row = None
-        if row is not None:
-            as_of = _cache_watermark(ctx, row["folder"])
-            message = (_row_card(ctx, row) if format == "concise"
-                       else _row_full(ctx, row))
-            return _stamp({"ok": True, "message": message}, "cache", as_of)
+    if not fresh and not include_html:
+        hit = await cache_reads.get_message(ctx, raw_id, format)
+        if hit is not None:
+            return hit
     if format == "concise":
         # Card projection: never pull the full item (incl. MIME) for a card.
         item = await ctx.gateway.call(
@@ -463,52 +325,6 @@ async def _get_message(ctx: Context, id: str, format: str = "full",
 # --------------------------------------------------------------------------
 
 
-def _thread_from_cache(ctx: Context, raw_id: str, limit: int,
-                       offset: int) -> Optional[Dict[str, Any]]:
-    """Local conversation_id join — sync helper, runs on a worker thread."""
-    seed = ctx.cache.get_message(raw_id)
-    if seed is None or not seed["conversation_id"]:
-        return None
-    rows = ctx.cache.thread(seed["conversation_id"])
-    if not rows:
-        return None
-    total = len(rows)
-    hi = max(0, total - offset)
-    lo = max(0, hi - limit)
-    window = rows[lo:hi]
-    next_offset = offset + len(window) if lo > 0 else None
-    counts: Dict[str, int] = {}
-    for r in rows:
-        who = r["sender_email"] or "unknown"
-        counts[who] = counts.get(who, 0) + 1
-    entries: List[Dict[str, Any]] = []
-    for r in window:
-        entry: Dict[str, Any] = {
-            "id": ctx.aliaser.alias_for(r["ews_id"], "m",
-                                        internet_message_id=r["internet_message_id"]),
-            "from": r["sender_email"] or "unknown",
-            "date": r["date_iso"],
-            "body": _row_body(ctx, r)[:1500],
-        }
-        if r["has_attachments"]:
-            entry["attach"] = True
-        entries.append(entry)
-    participants = [
-        {"name_or_email": who, "msgs": n}
-        for who, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    ]
-    return {
-        "ok": True,
-        "thread_id": ctx.aliaser.alias_for(seed["conversation_id"], "t"),
-        "subject": seed["subject"] or "",
-        "participants": participants,
-        "items": entries,
-        "count": len(entries),
-        "total_available": total,
-        "next_offset": next_offset,
-    }
-
-
 async def _get_thread(ctx: Context, id: str, limit: int = 20,
                       offset: int = 0, fresh: bool = False) -> Dict[str, Any]:
     limit = max(1, min(int(limit), 50))
@@ -516,18 +332,10 @@ async def _get_thread(ctx: Context, id: str, limit: int = 20,
     raw_id = id
     tz = ctx.settings.ews_tz
 
-    if not fresh and ctx.cache is not None:
-        try:
-            cached = await asyncio.to_thread(
-                _thread_from_cache, ctx, raw_id, limit, offset)
-        except Exception as exc:
-            logger.warning("cache get_thread failed (%s) — live", exc)
-            cached = None
-        if cached is not None:
-            as_of = min(filter(None, (
-                _cache_watermark(ctx, k) for k in ("inbox", "sent"))),
-                default=None)
-            return _stamp(cached, "cache", as_of)
+    if not fresh:
+        hit = await cache_reads.get_thread(ctx, raw_id, limit, offset)
+        if hit is not None:
+            return hit
 
     def work(account: Any) -> Tuple[Any, str, List[Any]]:
         seed = _fetch_one(account, raw_id)
@@ -698,37 +506,10 @@ async def _get_mailbox_overview(ctx: Context, horizon_days: int = 1,
     day_end = day_start + timedelta(days=horizon_days)
 
     # ---- pure mirror + watermark (sub-100ms warm) --------------------------
-    as_of = _cache_watermark(ctx, "inbox") if not fresh else None
-    if as_of and ctx.cache is not None:
-        try:
-            def read_mirror():
-                unread_total, rows = ctx.cache.unread_page(limit=10)
-                events = ctx.cache.events_window(
-                    int(day_start.timestamp()), int(day_end.timestamp()),
-                    limit=10)
-                return unread_total, rows, events
-
-            unread_total, rows, event_rows = await asyncio.to_thread(read_mirror)
-            cards = await asyncio.to_thread(
-                lambda: [_row_card(ctx, r) for r in rows])
-            events = [{
-                "id": ctx.aliaser.alias_for(r["ews_id"], "e"),
-                "subject": r["subject"],
-                "start": r["start_iso"],
-                "end": r["end_iso"],
-                **({"location": r["location"]} if r["location"] else {}),
-                **({"recurring": True} if r["is_recurring"] else {}),
-            } for r in event_rows]
-            return _stamp({
-                "ok": True,
-                "generated_at": now.isoformat(timespec="seconds"),
-                "unread_total": unread_total,
-                "recent_unread": cards,
-                "today_events": events,
-                "connection": ctx.manager.state if ctx.manager else "unmanaged",
-            }, "cache", as_of)
-        except Exception as exc:
-            logger.warning("cache overview failed (%s) — live", exc)
+    if not fresh:
+        hit = await cache_reads.overview(ctx, horizon_days)
+        if hit is not None:
+            return hit
 
     def work(account: Any) -> Tuple[int, List[Any], List[Any]]:
         try:
