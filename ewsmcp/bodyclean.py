@@ -2,9 +2,8 @@
 
 Email bodies returned to an LLM are bloated by quoted reply chains,
 signatures and disclaimers. This module strips them without any third
-party dependency and without importing exchangelib. Bilingual: handles
-both English and Arabic (Outlook / Gmail) reply conventions, and is
-tolerant of RTL/LTR bidi control marks and ``>`` quote prefixes.
+party dependency and without importing exchangelib. It handles the
+English Outlook and Gmail reply conventions and ``>`` quote prefixes.
 
 Public API:
     strip_quoted_history(text) -> (latest_reply_text, markers_stripped)
@@ -24,18 +23,8 @@ from html.parser import HTMLParser
 # Line normalization helpers
 # --------------------------------------------------------------------------
 
-# Bidi / directionality control characters commonly injected by Outlook and
-# Gmail around Arabic text (LRM, RLM, embeddings, isolates, ALM, BOM).
-_BIDI_RE = re.compile(
-    "[\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\u061c\\ufeff]"
-)
-
 # One or more leading '>' quote markers ("> ", ">> ", "> > " ...).
 _QUOTE_PREFIX_RE = re.compile(r"^(?:>\s?)+")
-
-# Normalize Arabic alef hamza variants so marker matching tolerates both
-# spellings (e.g. "الإرسال" vs "الارسال", "أرسلت" vs "ارسلت").
-_AR_TRANS = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا"})
 
 
 def _normalize_newlines(text: str) -> str:
@@ -45,10 +34,10 @@ def _normalize_newlines(text: str) -> str:
 def _norm_line(line: str) -> tuple[str, bool]:
     """Return (normalized_line, was_quoted).
 
-    Normalization: drop bidi control marks, strip surrounding whitespace,
-    and remove leading '>' quote prefixes (recording that they were there).
+    Normalization: strip surrounding whitespace and remove leading '>' quote
+    prefixes (recording that they were there).
     """
-    s = _BIDI_RE.sub("", line).strip()
+    s = line.strip()
     m = _QUOTE_PREFIX_RE.match(s)
     quoted = m is not None
     if m:
@@ -62,26 +51,13 @@ def _norm_line(line: str) -> tuple[str, bool]:
 
 # "-----Original Message-----" separator (Outlook EN).
 _ORIG_EN_RE = re.compile(r"^-{2,}\s*original message\s*-{2,}$", re.IGNORECASE)
-# Arabic "رسالة أصلية" variants ("الرسالة الأصلية", dash-decorated, hamza
-# normalized to bare alef before matching).
-_ORIG_AR_RE = re.compile(r"^[-_*\s]*(?:ال)?رسالة\s+ال?اصلية[-_*\s:]*$")
 
 # Outlook EN header block: "From:" paired with a following "Sent:"/"Date:".
 _FROM_EN_RE = re.compile(r"^from\s*:", re.IGNORECASE)
 _PAIR_EN_RE = re.compile(r"^(?:sent|date)\s*:", re.IGNORECASE)
 
-# Outlook AR header block: "من:" paired with "تاريخ الإرسال:"/"التاريخ:"/
-# "أرسلت:" (hamza-normalized).
-_FROM_AR_RE = re.compile(r"^من\s*:")
-_PAIR_AR_RE = re.compile(r"^(?:تاريخ\s+الارسال|التاريخ|ارسلت)\s*:")
-
 # Gmail-style EN attribution: "On Mon, Jun 1, 2026 ... <a@b> wrote:".
 _GMAIL_EN_RE = re.compile(r"^On .{4,80} wrote:\s*$", re.IGNORECASE)
-
-# Gmail-style AR attribution heuristic ingredients (kept conservative).
-_AR_WROTE_RE = re.compile(r"\bكتبت?\b")
-_EMAIL_FRAG_RE = re.compile(r"<[^<>\s]+@[^<>\s]+>")
-_DATEISH_RE = re.compile(r"\d{4}|\d{1,2}[/:\-]\d{1,2}")
 
 # Minimum length of a run of '>'-prefixed lines treated as a quoted block.
 _MIN_QUOTE_RUN = 3
@@ -93,8 +69,7 @@ def _find_markers(
     """Return (markers, quote_runs).
 
     markers: sorted list of (line_index, kind) where kind is one of
-        "original", "outlook_en", "outlook_ar", "gmail_en", "gmail_ar",
-        "quote_run".
+        "original", "outlook_en", "gmail_en", "quote_run".
     quote_runs: list of (start_index, end_index) inclusive spans of runs of
         3+ consecutive '>'-quoted lines.
     """
@@ -121,8 +96,7 @@ def _find_markers(
         s = norm[idx][0]
         if not s:
             continue
-        ar = s.translate(_AR_TRANS)
-        if _ORIG_EN_RE.match(s) or _ORIG_AR_RE.match(ar):
+        if _ORIG_EN_RE.match(s):
             markers.append((idx, "original"))
             continue
         if _FROM_EN_RE.match(s) and any(
@@ -130,24 +104,8 @@ def _find_markers(
         ):
             markers.append((idx, "outlook_en"))
             continue
-        if _FROM_AR_RE.match(ar) and any(
-            _PAIR_AR_RE.match(norm[k][0].translate(_AR_TRANS))
-            for k in range(idx + 1, min(idx + 5, n))
-        ):
-            markers.append((idx, "outlook_ar"))
-            continue
         if _GMAIL_EN_RE.match(s):
             markers.append((idx, "gmail_en"))
-            continue
-        # Conservative Arabic "wrote:" attribution: must contain the word
-        # كتب/كتبت, end with ':' and carry a date-ish or <email> fragment.
-        if (
-            len(s) <= 200
-            and s.endswith(":")
-            and _AR_WROTE_RE.search(s)
-            and (_EMAIL_FRAG_RE.search(s) or _DATEISH_RE.search(s))
-        ):
-            markers.append((idx, "gmail_ar"))
 
     markers.sort(key=lambda m: m[0])
     return markers, runs
@@ -208,14 +166,6 @@ _CLOSERS_EN: list[tuple[str, int]] = [
     ("thanks,", 2),
     ("sent from my", 40),
 ]
-# Matched against hamza-normalized text.
-_CLOSERS_AR: list[tuple[str, int]] = [
-    ("مع خالص التحية", 30),
-    ("مع التحية", 30),
-    ("تحياتي", 30),
-    ("وتفضلوا بقبول", 60),
-    ("ارسل من", 40),
-]
 
 _MAX_SIG_LINES = 6
 _MAX_SIG_LINE_LEN = 80
@@ -223,21 +173,15 @@ _MAX_SIG_LINE_LEN = 80
 
 def _is_closer_line(s: str) -> bool:
     cf = s.casefold()
-    for prefix, max_rest in _CLOSERS_EN:
-        if cf.startswith(prefix) and len(cf) - len(prefix) <= max_rest:
-            return True
-    ar = s.translate(_AR_TRANS)
-    for prefix, max_rest in _CLOSERS_AR:
-        if ar.startswith(prefix) and len(ar) - len(prefix) <= max_rest:
-            return True
-    return False
+    return any(cf.startswith(prefix) and len(cf) - len(prefix) <= max_rest
+               for prefix, max_rest in _CLOSERS_EN)
 
 
 def strip_signature(text: str) -> str:
     """Remove a trailing signature block when one is confidently detected.
 
     Two detectors: the RFC "-- " delimiter line, and a trailing block of at
-    most 6 short lines that begins with a common EN/AR closer. Conservative:
+    most 6 short lines that begins with a common EN closer. Conservative:
     only strips when at least 2 non-empty body lines remain above.
     """
     if not text:
@@ -414,7 +358,7 @@ def html_to_text(html: str) -> str:
     Block tags (p, div, br, tr, li, h1-h6, table) emit newlines; style /
     script / head contents are dropped; entities are unescaped; links keep
     their href only when it is short and differs from the label. Whitespace
-    is collapsed per line; Arabic text passes through untouched.
+    is collapsed per line.
     """
     if not html:
         return ""

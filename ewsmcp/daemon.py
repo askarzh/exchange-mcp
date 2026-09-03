@@ -13,8 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_daemon_app(ctx, settings: Settings):
-    return build_app(ctx, settings, None, mount_mcp=False, tools_prefix="/v1/tools",
-                     api_key=settings.ewsd_api_key or "")
+    return build_app(ctx, settings, api_key=settings.ewsd_api_key or "")
 
 
 async def serve(settings: Settings) -> None:

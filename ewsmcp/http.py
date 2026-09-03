@@ -1,4 +1,6 @@
-"""HTTP serving: Streamable HTTP /mcp + REST shim + health (DESIGN.md §Transports)."""
+"""ewsd's HTTP app: REST tool shim, capability-URL uploads, health and
+status (DESIGN.md §Transports). No /mcp here — that's ewsmcp/mcp/http.py,
+the only module that speaks MCP over Streamable HTTP."""
 
 import hmac
 import json
@@ -10,23 +12,12 @@ import jsonschema
 from . import __version__, uploads
 from .errors import HTTP_BY_CODE
 from .server import start_connection_manager
-from .tools.base import dispatch
+from .tools.base import dispatch, validator_for
 from .tools.calendar_people import _get_server_status
 
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1_048_576  # 1 MiB — tool arguments, not attachments
-
-
-def _validator_for(spec) -> Any:
-    """Compiled validator for the tool's PUBLIC schema (which includes
-    confirm_token for two-phase tools), cached on the spec itself so it can
-    never go stale against a different spec of the same name."""
-    v = getattr(spec, "_rest_validator", None)
-    if v is None:
-        v = jsonschema.Draft202012Validator(spec.public_schema()["inputSchema"])
-        spec._rest_validator = v
-    return v
 
 
 def _authorized(headers, api_key: str) -> bool:
@@ -140,15 +131,15 @@ async def _read_json_body(receive, send) -> Any | None:
         return None
 
 
-def build_app(ctx, settings, streamable: Any | None = None, *,
-             mount_mcp: bool = True, tools_prefix: str = "/api/tools",
+def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
              api_key: str | None = None):
     """ASGI app closure, driven directly by tests (no uvicorn needed).
 
-    ``mount_mcp`` and ``tools_prefix`` let the daemon (ewsd) reuse this same
-    closure without the Streamable HTTP MCP transport and under a `/v1/tools`
-    prefix; ``api_key`` overrides `settings.mcp_api_key` when given (the
-    daemon uses `settings.ewsd_api_key`).
+    Serves health, /metrics, /openapi.json, the capability-URL upload route
+    and the REST tool routes under `tools_prefix`. The MCP transport is NOT
+    here — it lives in ewsmcp/mcp/http.py, the only process that speaks MCP.
+    `api_key` overrides `settings.mcp_api_key` when given (ewsd passes
+    `settings.ewsd_api_key`).
     """
     key = (settings.mcp_api_key if api_key is None else api_key) or ""
 
@@ -211,12 +202,6 @@ def build_app(ctx, settings, streamable: Any | None = None, *,
         if path == "/v1/status" and method == "GET":
             return await _send_json(send, 200, await _get_server_status(ctx))
 
-        if path == "/mcp" and mount_mcp:
-            if streamable is None:
-                return await _send_json(send, 503, {"ok": False, "error": {
-                    "code": "upstream_unavailable",
-                    "message": "MCP transport not mounted"}})
-            return await streamable.handle_request(scope, receive, send)
         if path == "/metrics" and method == "GET":
             body = _metrics_text(ctx).encode()
             await send({"type": "http.response.start", "status": 200, "headers": [
@@ -247,7 +232,7 @@ def build_app(ctx, settings, streamable: Any | None = None, *,
                     "code": "validation",
                     "message": "request body must be a JSON object of tool arguments"}})
             error = jsonschema.exceptions.best_match(
-                _validator_for(spec).iter_errors(arguments))
+                validator_for(spec).iter_errors(arguments))
             if error is not None:
                 return await _send_json(send, 400, {"ok": False, "error": {
                     "code": "validation", "message": error.message,

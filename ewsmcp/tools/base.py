@@ -16,6 +16,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
+import jsonschema
+
 from ..confirm import consume_token, content_hash, make_token, verify_token
 from ..errors import ToolError, map_exception
 
@@ -78,6 +80,31 @@ class ToolSpec:
             props = schema["inputSchema"].setdefault("properties", {})
             props.setdefault("confirm_token", dict(CONFIRM_TOKEN_PROPERTY))
         return schema
+
+
+def validator_for(spec: "ToolSpec") -> Any:
+    """Compiled validator for the tool's PUBLIC schema (which includes
+    confirm_token for two-phase tools), cached on the spec itself so it can
+    never go stale against a different spec of the same name. Shared by the
+    REST shim and the MCP dispatcher so both surfaces enforce the same
+    declared bounds (limit maxima, offset minima, enums, required keys)."""
+    v = getattr(spec, "_schema_validator", None)
+    if v is None:
+        v = jsonschema.Draft202012Validator(spec.public_schema()["inputSchema"])
+        spec._schema_validator = v
+    return v
+
+
+def validate_arguments(spec: "ToolSpec", arguments: Dict[str, Any]) -> None:
+    """Raise ToolError("validation") for arguments the tool's schema rejects."""
+    error = jsonschema.exceptions.best_match(validator_for(spec).iter_errors(arguments))
+    if error is not None:
+        path = "/".join(str(p) for p in error.absolute_path)
+        raise ToolError(
+            "validation",
+            f"{path}: {error.message}" if path else error.message,
+            hint=f"Check the argument against the {spec.name} input schema.",
+        )
 
 
 @dataclass
@@ -234,35 +261,6 @@ async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     return None
 
 
-async def mint_token(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any]) -> str:
-    """Server-side pre-confirmation (e.g. a human-approved queue item).
-
-    Mirrors ``_confirm_gate``'s binding exactly: preview-hook specs get a
-    token bound to the resolved content, others to the literal arguments.
-    """
-    if spec.preview is not None:
-        content = await spec.preview(ctx, dict(kwargs))
-        body_text = content.get("body_text")
-        chash = content_hash(
-            content.get("subject") or "",
-            sorted(content.get("to") or []),
-            sorted(content.get("cc") or []),
-            sorted(content.get("bcc") or []),
-            body_text if isinstance(body_text, str) else "",
-        )
-        target_id = str(kwargs.get("draft_id") or kwargs.get("event_id")
-                        or kwargs.get("id") or "-")
-    else:
-        chash = content_hash(dict(kwargs))
-        target_id = "-"
-    return make_token(
-        mailbox=ctx.settings.ews_email, action=spec.name, target_id=target_id,
-        chash=chash,
-        ttl_seconds=ctx.settings.confirm_ttl_seconds,
-        secret=ctx.settings.send_confirm_secret,
-    )["confirm_token"]
-
-
 def resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(kwargs)
     try:
@@ -275,9 +273,6 @@ def resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     except KeyError as e:
         raise ToolError("validation", str(e.args[0] if e.args else e))
     return out
-
-
-_resolve_ids = resolve_ids
 
 
 async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],

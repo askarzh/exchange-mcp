@@ -80,9 +80,7 @@ OneDrive/Dropbox/iCloud, set `DATA_DIR` to a plain local path.
 - "What's on my calendar this week?" → `list_events`
 
 Ids like `m3` / `e1` are the server's short aliases — the assistant uses
-them exactly as returned; raw Exchange ids never appear. (5.0 mints
-fresh aliases on first sync; ids from a prior 4.5 mailbox do not carry
-over — see DESIGN.md §Ids.)
+them exactly as returned; raw Exchange ids never appear.
 
 **4. HTTP mode** — when `ewsmcp` runs where the client isn't (a home
 server, claude.ai connector, etc.):
@@ -117,7 +115,7 @@ docker compose up
 
 - **Token economy.** One legacy detail call shipped 115 kB of duplicated
   raw HTML for a 150-char message. Here a search result is a ~60-token
-  card, bodies are cleaned once at sync time (bilingual quoted-history +
+  card, bodies are cleaned once at sync time (quoted-history +
   signature stripping), and raw HTML requires an explicit flag.
 - **Ids the model can actually copy.** Raw EWS ids are ~150 chars of
   case-sensitive base64 that change when items move. Tools emit short
@@ -133,7 +131,8 @@ docker compose up
   `{"source": "cache", "as_of": …}` provenance and forwards to `ewsd`'s
   live route when a caller passes `fresh=true`. Search runs on a
   generated `tsvector` column (Postgres `simple` config); accent folding
-  happens in Python before indexing, so "café" finds "cafe" and back.
+  happens in the database via an `unaccent`-backed wrapper, so "café"
+  finds "cafe" and back.
 - **Never-exit boot.** Transports bind before any Exchange contact;
   `/livez` is up immediately, `/readyz` reports the warmup honestly, and
   the connection manager owns recovery.
@@ -162,17 +161,10 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` / `MCP_API_KEY` | stdio | `ewsmcp` HTTP serving + bearer auth (all unused in stdio mode) |
 | `DATA_DIR` | `~/.ewsmcp` | `ewsd`'s local mail-at-rest (audit chain). Absolute; cloud-synced paths are refused (`DATA_DIR_ALLOW_SYNCED=true` to override) |
 | `SHARED_DIR` | — | Optional shared-space root for saved attachments (see `add_attachment`/`get_attachment`) |
-| `EWS_CACHE_FOLDERS` | `inbox,sent` | Delta-synced folders |
+| `EWS_MIRROR_EXCLUDE` | `drafts,junk,trash,outbox` | Well-known folders NOT mirrored; every other mail folder is mirrored in full. Exclusion is by well-known key only — sub-folders of an excluded folder are still mirrored. |
 | `EWS_CACHE_SYNC_SECONDS` | `45` | Delta cadence |
-| `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence |
-| `EWS_CACHE_WINDOW_DAYS` | `365` | Mirror backfill window |
+| `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence. The folder walk clears exchangelib's cached tree and re-fetches it this often (not every cycle), so a new or deleted folder and fresh unread counts show up within this window while mail keeps syncing every `EWS_CACHE_SYNC_SECONDS`. |
 | `EWS_TZ` | `Asia/Riyadh` | Server timezone for date grammar + display |
-
-Removed from the 4.5 line and no longer read: `EWS_CACHE_ENABLED`,
-`EWS_CACHE_PURGE_ON_BOOT`, `EWS_SEMANTIC_INDEX`, `EWS_SEMANTIC_PG_DSN`,
-`EWS_SEMANTIC_OLLAMA_URL`, `EWS_SEMANTIC_MODEL` — the mirror is always
-on (Postgres, not an opt-in SQLite file) and semantic search is Phase 2
-work, not an optional tier.
 
 ## The send flow (two-phase, content-bound)
 

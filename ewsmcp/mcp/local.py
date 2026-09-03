@@ -2,15 +2,22 @@
 
 Deviation from the brief's literal `_try`: `tools.cache_reads` (Task 5) and
 `cache.store.CacheStore.watermark(s)` (Task 5) deliberately swallow
-`psycopg.Error` themselves — a stale/unreachable mirror degrades to a clean
-cache miss ("live fallback"), not an exception, so live EWS reads keep
-working through the combined 4.5 process. That means a closed pool never
-raises through `cache_reads.search_messages` et al.; it just returns None
-like an unsynced folder would. To still distinguish "mirror unreachable"
-from "not synced yet" (the `test_db_down_is_backend_unavailable` contract),
-`_try` follows a clean miss with one cheap liveness probe
+`psycopg.Error` themselves for the fall-back-capable reads (get_message,
+get_thread, list_folders, get_mailbox_overview, list_tasks) — a stale/
+unreachable mirror degrades to a clean cache miss ("live fallback"), not an
+exception, so live EWS reads keep working through the combined 4.5 process.
+That means a closed pool never raises through those helpers; it just
+returns None like an unsynced folder would. To still distinguish "mirror
+unreachable" from "not synced yet" (the `test_db_down_is_backend_unavailable`
+contract), `_try` follows a clean miss with one cheap liveness probe
 (`ctx.db.schema_version()`, uncaught by any store-level swallowing) and
 raises `_MirrorDown` only when THAT fails too.
+
+`search_messages` and `get_thread` are store-only (Task 6): there is no live
+fallback for either, so neither goes through `_try`/`_cache_then_forward`.
+Both let `cache_reads`' `psycopg.Error`/`RuntimeError` propagate and map it
+straight to `backend_unavailable` themselves; `get_thread` treats a clean
+mirror miss (and ONLY that) as `not_found` — never a forward to ewsd.
 """
 
 from __future__ import annotations
@@ -118,20 +125,21 @@ async def list_folders(ctx: Context, **kw) -> dict[str, Any]:
 
 
 async def search_messages(ctx: Context, **kw) -> dict[str, Any]:
+    """Store-only, never forwarded: the mirror is the whole mailbox and ewsd
+    has no live search path to fall back to."""
     if kw.get("mode", "keyword") == "semantic":
         raise ToolError("validation", "semantic search is not available in this build "
                          "(it returns with the archive tier).", hint="Use mode='keyword'.")
-    cache_call = None
-    if not kw.get("fresh"):
-        sender = cache_reads.validate_search_args(
-            kw.get("sender"), kw.get("from_"), kw.get("subject"), kw.get("since"),
-            kw.get("until"), kw.get("is_unread"), kw.get("has_attachments"), kw.get("query"))
-        cache_call = lambda: cache_reads.search_messages(
-            ctx, folder=kw.get("folder", "f:inbox"), query=kw.get("query"), sender=sender,
+    sender = cache_reads.validate_search_args(kw.get("sender"), kw.get("from_"))
+    try:
+        return await cache_reads.search_messages(
+            ctx, folder=kw.get("folder"), query=kw.get("query"), sender=sender,
             subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),
             is_unread=kw.get("is_unread"), has_attachments=kw.get("has_attachments"),
             offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20)))
-    return await _cache_then_forward(ctx, "search_messages", kw, cache_call)
+    except (psycopg.Error, RuntimeError) as exc:
+        raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
+                         hint="Check DATABASE_URL.", retry_after_s=15) from exc
 
 
 async def get_message(ctx: Context, **kw) -> dict[str, Any]:
@@ -143,11 +151,21 @@ async def get_message(ctx: Context, **kw) -> dict[str, Any]:
 
 
 async def get_thread(ctx: Context, **kw) -> dict[str, Any]:
-    cache_call = None
-    if not kw.get("fresh"):
-        cache_call = lambda: cache_reads.get_thread(
+    """Store-only: every mail folder is mirrored, so a miss never forwards
+    — it means the seed is in an excluded folder or not synced yet."""
+    try:
+        hit = await cache_reads.get_thread(
             ctx, kw["id"], int(kw.get("limit", 20)), int(kw.get("offset", 0)))
-    return await _cache_then_forward(ctx, "get_thread", kw, cache_call)
+    except (psycopg.Error, RuntimeError) as exc:
+        raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
+                        hint="Check DATABASE_URL.", retry_after_s=15) from exc
+    if hit is not None:
+        return hit
+    raise ToolError(
+        "not_found",
+        "That message is not in the mirror (excluded folder or not synced yet).",
+        hint="Use get_message with fresh=true, or wait for the next sync cycle.",
+    )
 
 
 async def get_mailbox_overview(ctx: Context, **kw) -> dict[str, Any]:

@@ -13,11 +13,8 @@ from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
-from conftest import make_settings
+from conftest import FakeGateway, make_context
 
-from ewsmcp.audit import AuditLog
-from ewsmcp.ids import IdAliaser
-from ewsmcp.tools import build_registry
 from ewsmcp.tools.base import Context, dispatch
 
 TZ = ZoneInfo("Asia/Riyadh")
@@ -37,17 +34,6 @@ class _Query(list):
 
     def count(self):
         return len(self)
-
-
-class _FakeGateway:
-    def __init__(self, account):
-        self.account = account
-
-    async def call(self, fn):
-        return fn(self.account)
-
-    def resolve_folder(self, account, ref, aliaser):
-        return account.inbox
 
 
 def _msg(raw_id):
@@ -84,15 +70,13 @@ def _account():
 
 
 def _ctx(tmp_path, db) -> Context:
-    ctx = Context(
-        settings=make_settings(),
-        gateway=_FakeGateway(_account()),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-    )
-    build_registry(ctx)
-    return ctx
+    # cache=True (but unseeded): search_messages is store-only now and needs
+    # a mirror to answer at all — an empty mirror still ships the canonical
+    # empty envelope. list_folders/list_events/find_people don't have rows
+    # synced either, so their cache_reads helpers report a clean miss and
+    # they fall through to the live `_account()` path exactly as before.
+    return make_context(db, gateway=FakeGateway(_account()), cache=True,
+                        audit_dir=str(tmp_path / "audit"))
 
 
 _ARGS = {

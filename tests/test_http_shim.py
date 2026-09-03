@@ -8,11 +8,9 @@ http.disconnect handling that used to hang the receive loop forever.
 import asyncio
 import json
 
-from conftest import make_settings
+from conftest import make_context, make_settings
 
-from ewsmcp.audit import AuditLog
 from ewsmcp.http import MAX_BODY_BYTES, build_app
-from ewsmcp.ids import IdAliaser
 from ewsmcp.tools.base import Context, ToolSpec
 
 
@@ -30,12 +28,7 @@ def _ctx(tmp_path, db) -> Context:
         },
         handler=_echo, requires_ews=False,
     )
-    ctx = Context(
-        settings=make_settings(),
-        gateway=None, manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-    )
+    ctx = make_context(db, audit_dir=str(tmp_path / "audit"))
     ctx.registry = {"echo": spec}
     return ctx
 
@@ -63,7 +56,7 @@ def _status_and_body(sent):
 
 def _post(app, name, payload):
     body = json.dumps(payload).encode() if not isinstance(payload, bytes) else payload
-    return _drive(app, f"/api/tools/{name}",
+    return _drive(app, f"/v1/tools/{name}",
                   [{"type": "http.request", "body": body, "more_body": False}])
 
 
@@ -108,7 +101,7 @@ def test_oversize_body_is_capped(tmp_path, db):
 
 def test_disconnect_mid_body_does_not_hang_or_crash(tmp_path, db):
     app = build_app(_ctx(tmp_path, db), make_settings())
-    sent = _drive(app, "/api/tools/echo", [
+    sent = _drive(app, "/v1/tools/echo", [
         {"type": "http.request", "body": b'{"q":', "more_body": True},
         {"type": "http.disconnect"},
     ])

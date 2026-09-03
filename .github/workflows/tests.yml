@@ -62,10 +62,6 @@ jobs:
         run: python scripts/boot_smoke.py full
       - name: Boot smoke (tier=draft)
         run: python scripts/boot_smoke.py draft
-      - name: Boot smoke (cache disabled)
-        env:
-          EWS_CACHE_ENABLED: "false"
-        run: python scripts/boot_smoke.py full
 
   docker-build:
     needs: [tests, boot-smoke]

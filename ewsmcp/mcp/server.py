@@ -8,11 +8,12 @@ import psycopg_pool
 from mcp.server import Server
 from mcp.types import Tool
 
+from ..audit import NullAudit
 from ..cache.store import CacheStore
 from ..config import Settings
 from ..db import SCHEMA_VERSION, Database, SchemaOutdated
 from ..ids import IdAliaser
-from ..server import ANNOTATIONS, _NullAudit
+from ..server import ANNOTATIONS
 from ..tools.base import Context
 from .client import DaemonClient
 from .dispatch import dispatch_mcp
@@ -36,7 +37,7 @@ def build_mcp_context(settings: Settings) -> Context:
         logger.error("could not reach Postgres at boot (%s); continuing "
                       "degraded, will retry in the background", exc)
     ctx = Context(settings=settings, gateway=None, manager=None, aliaser=IdAliaser(db),
-                  audit=_NullAudit(), cache=CacheStore(db), db=db,
+                  audit=NullAudit(), cache=CacheStore(db), db=db,
                   daemon=DaemonClient(settings.ewsd_url, settings.ewsd_api_key))
     build_mcp_registry(ctx)
     return ctx

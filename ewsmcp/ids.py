@@ -247,32 +247,3 @@ class IdAliaser:
             _LOG.warning("id_alias: stats failed (%s)", exc)
             return {}
         return {r["kind"]: r["c"] for r in rows}
-
-
-class NullAliaser:
-    """Pass-through stand-in used when the aliaser store cannot initialise.
-
-    Aliasing is sugar — a broken database must degrade the server to raw
-    EWS ids, never kill the boot. ``resolve`` passes everything through (no
-    KeyError: without a store, alias-shaped strings can't be looked up,
-    and raw ids must keep working).
-    """
-
-    def alias_for(self, ews_id: str, kind: str = "m", changekey=None,
-                  internet_message_id=None) -> str:
-        return ews_id
-
-    def alias_many(self, entries) -> dict:
-        return {e[0]: e[0] for e in entries if e and e[0]}
-
-    def resolve(self, value: str) -> str:
-        return value
-
-    def rebind(self, old_ews_id: str, new_ews_id: str, changekey=None):
-        return None
-
-    def imid_for(self, alias_or_id: str):
-        return None
-
-    def stats(self) -> dict:
-        return {}

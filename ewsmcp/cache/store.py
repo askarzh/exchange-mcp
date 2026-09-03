@@ -2,9 +2,16 @@
 the daemon (writer) and every MCP process (readers).
 
 - Cleaned bodies are stored ONCE at sync time (``bodyclean`` output).
-- Full-text search: ``messages.search_tsv`` is a generated tsvector over
-  ``norm_text`` (``normalize.normalize_text`` of subject + sender + body);
-  queries go through ``normalize.tsquery``. Ranked by ``ts_rank_cd`` then date.
+- Folders are identified by their EWS id (``messages.folder_id``);
+  ``ews.folders.wk`` is the only place a well-known key like ``f:inbox``
+  is resolved.
+- Full-text search: ``messages.search_tsv`` is generated from subject,
+  sender and body through ``ews.immutable_unaccent(lower(...))``. Queries
+  tokenize in Python (``\\w+``) but fold AND re-sanitise in SQL, per token,
+  via ``_TSQUERY`` — ``ews.immutable_unaccent`` can turn a single input
+  character into tsquery metacharacters (e.g. a modifier apostrophe →
+  ``'``), so the prefix expression is only safe to build after folding.
+  Ranked by ``ts_rank_cd`` then date.
 - Timestamps are stored twice: epoch seconds (filter/sort) and the display
   ISO string in the server timezone.
 - Archive columns (``archive_state``, ``mime_*`` …) are owned by the Phase 2
@@ -13,65 +20,74 @@ the daemon (writer) and every MCP process (readers).
 
 from __future__ import annotations
 
-import hashlib
 import json
-import logging
+import re
 import time
 from typing import Any
 
 import psycopg
 
 from ..db import Database
-from ..normalize import normalize_text, tsquery
 
-logger = logging.getLogger(__name__)
-
-SIG_MIN_HITS = 3
-_SIG_MAX_LINES = 6
-_SIG_MAX_CHARS = 400
 _ARCHIVED = {"any": "TRUE", "only": "m.archive_state <> 'live'",
              "exclude": "m.archive_state = 'live'"}
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+# Well-known folder ids resolved in SQL, so no Python-side lookup is needed
+# and a missing folders row degrades to "matches nothing" rather than an error.
+_INBOX_ID = "(SELECT ews_id FROM ews.folders WHERE wk = 'f:inbox' LIMIT 1)"
+_SENT_ID = "(SELECT ews_id FROM ews.folders WHERE wk = 'f:sent' LIMIT 1)"
+
+# %s is a text[] of raw (lowercased) \w+ tokens. Folding (immutable_unaccent)
+# can turn a single input character into tsquery metacharacters — e.g. a
+# modifier apostrophe folds to "'", a circled digit to "(1)" — so the folded
+# text is never handed to to_tsquery directly (it would raise a syntax
+# error). Instead each token is re-lexed with to_tsvector (which, unlike
+# to_tsquery, never errors on odd input) to recover its real word-lexeme(s)
+# post-folding; a token that splits into more than one lexeme (e.g. the
+# circled digit example, "(1)budget" -> '1','budget') ORs its lexemes
+# together — either could be "the word" the user meant — and distinct
+# original tokens AND together, same as plain prefix search. Each per-token
+# OR group is wrapped in parens: tsquery binds "&" tighter than "|", so an
+# unparenthesised "'1':* | 'budget':* & 'review':*" parses as
+# "1 | (budget & review)" and would match a document containing only "1" —
+# ("1":* | "budget":*) & "review":* is what "and across tokens" actually
+# requires. A token that folds to nothing (pure punctuation) drops out; if
+# every token does, string_agg returns NULL and to_tsquery(NULL) is NULL
+# (matches nothing, never raises).
+_TSQUERY = """
+(SELECT to_tsquery('simple', string_agg(grp, ' & '))
+   FROM (SELECT '(' || string_agg(lex || ':*', ' | ') || ')' AS grp
+           FROM unnest(%s::text[]) WITH ORDINALITY AS tok(word, ord)
+           CROSS JOIN LATERAL unnest(tsvector_to_array(to_tsvector(
+               'simple', ews.immutable_unaccent(lower(tok.word))))) AS lex
+          GROUP BY tok.ord) s
+  WHERE grp IS NOT NULL)
+"""
 
 
-def trailing_block(body: str) -> str | None:
-    """The candidate signature block: the last blank-line-separated block,
-    when it is short enough to be a signature and is not the whole body."""
-    body = (body or "").rstrip()
-    if not body:
-        return None
-    head, sep, tail = body.rpartition("\n\n")
-    if not sep or not head.strip():
-        return None
-    tail = tail.strip()
-    if not tail or len(tail) > _SIG_MAX_CHARS:
-        return None
-    if tail.count("\n") + 1 > _SIG_MAX_LINES:
-        return None
-    return tail
-
-
-def _sig_hash(sender_email: str, block: str) -> str:
-    return hashlib.sha256(
-        f"{sender_email.lower()}|{normalize_text(block)}".encode()).hexdigest()
+def _tokens(query: str | None) -> list[str]:
+    """Raw (lowercased) \\w+ tokens — no folding, no sanitising: that all
+    happens in SQL, in ``_TSQUERY``, after unaccent (see its docstring)."""
+    return [t for t in _TOKEN_RE.findall((query or "").lower()) if t]
 
 
 _UPSERT_MESSAGE = """
-INSERT INTO ews.messages (ews_id, changekey, folder, conversation_id, sender_name,
+INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id, sender_name,
     sender_email, to_json, subject, date_ts, date_iso, is_read, has_attachments,
-    importance, categories_json, body_clean, internet_message_id, norm_text)
-VALUES (%(ews_id)s, %(changekey)s, %(folder)s, %(conversation_id)s, %(sender_name)s,
+    importance, categories_json, body_clean, internet_message_id)
+VALUES (%(ews_id)s, %(changekey)s, %(folder_id)s, %(conversation_id)s, %(sender_name)s,
     %(sender_email)s, %(to_json)s, %(subject)s, %(date_ts)s, %(date_iso)s, %(is_read)s,
     %(has_attachments)s, %(importance)s, %(categories_json)s, %(body_clean)s,
-    %(internet_message_id)s, %(norm_text)s)
+    %(internet_message_id)s)
 ON CONFLICT (ews_id) DO UPDATE SET
-    changekey = EXCLUDED.changekey, folder = EXCLUDED.folder,
+    changekey = EXCLUDED.changekey, folder_id = EXCLUDED.folder_id,
     conversation_id = EXCLUDED.conversation_id, sender_name = EXCLUDED.sender_name,
     sender_email = EXCLUDED.sender_email, to_json = EXCLUDED.to_json,
     subject = EXCLUDED.subject, date_ts = EXCLUDED.date_ts, date_iso = EXCLUDED.date_iso,
     is_read = EXCLUDED.is_read, has_attachments = EXCLUDED.has_attachments,
     importance = EXCLUDED.importance, categories_json = EXCLUDED.categories_json,
-    body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id,
-    norm_text = EXCLUDED.norm_text
+    body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id
 """
 
 
@@ -81,30 +97,12 @@ class CacheStore:
     def __init__(self, db: Database):
         self.db = db
 
-    def close(self) -> None:  # kept for call-site compatibility
-        return None
-
     # ------------------------------------------------------------- writers
-
-    @staticmethod
-    def norm_for_row(subject: str, sender_name: str, sender_email: str,
-                     body_clean: str) -> str:
-        return normalize_text(
-            " ".join(p for p in (subject, sender_name, sender_email, body_clean) if p))
 
     def upsert_messages(self, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
         with self.db.conn() as c:
-            for r in rows:
-                block = trailing_block(r.get("body_clean") or "")
-                sender = (r.get("sender_email") or "").lower()
-                if block and sender:
-                    c.execute(
-                        "INSERT INTO ews.sender_sigs (sender_email, sig_hash, hits) "
-                        "VALUES (%s, %s, 1) ON CONFLICT (sender_email, sig_hash) "
-                        "DO UPDATE SET hits = ews.sender_sigs.hits + 1",
-                        (sender, _sig_hash(sender, block)))
             c.cursor().executemany(_UPSERT_MESSAGE, rows)
         return len(rows)
 
@@ -189,11 +187,27 @@ class CacheStore:
                 "as_of = EXCLUDED.as_of",
                 (key, token, int(as_of_ts if as_of_ts is not None else time.time())))
 
-    def purge(self) -> None:
+    def folder_id_for_wk(self, wk: str) -> str | None:
+        """The EWS id of a well-known folder ('f:inbox'), or None when the
+        hierarchy lane has not recorded it yet."""
         with self.db.conn() as c:
-            c.execute("TRUNCATE ews.messages, ews.events, ews.tasks, ews.folders, "
-                      "ews.sync_state, ews.sender_sigs")
-        logger.warning("mirror purged")
+            row = c.execute(
+                "SELECT ews_id FROM ews.folders WHERE wk = %s LIMIT 1",
+                (wk,)).fetchone()
+        return row["ews_id"] if row else None
+
+    def drop_sync_state(self, key: str) -> None:
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.sync_state WHERE key = %s", (key,))
+
+    def delete_live_messages_in_folder(self, folder_id: str) -> int:
+        """Forget a vanished folder's un-archived rows. Archived rows stay:
+        they are the Phase 2 archive, not a mirror of a live folder."""
+        with self.db.conn() as c:
+            cur = c.execute(
+                "DELETE FROM ews.messages WHERE folder_id = %s "
+                "AND archive_state = 'live'", (folder_id,))
+            return cur.rowcount
 
     # -------------------------------------------------------------- reads
 
@@ -232,21 +246,24 @@ class CacheStore:
         return {"rows": counts, "db_mb": db_mb, "watermarks": self.watermarks()}
 
     def search_messages(
-        self, *, folders: list[str] | None = None, text: str | None = None,
+        self, *, folder_ids: list[str] | None = None, text: str | None = None,
         sender: str | None = None, subject: str | None = None,
         since_ts: int | None = None, until_ts: int | None = None,
         is_unread: bool | None = None, has_attachments: bool | None = None,
         archived: str = "any", offset: int = 0, limit: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
+        """Full-text + structured search over the mirror. Every argument is
+        optional and freely combinable; `folder_ids=None` searches every
+        mirrored folder. Returns (page rows, exact total)."""
         where: list[str] = [_ARCHIVED.get(archived, "TRUE")]
         params: list[Any] = []
-        q = tsquery(text) if text else ""
-        if q:
-            where.append("m.search_tsv @@ to_tsquery('simple', %s)")
-            params.append(q)
-        if folders:
-            where.append("m.folder = ANY(%s)")
-            params.append(list(folders))
+        tokens = _tokens(text) if text else []
+        if tokens:
+            where.append(f"m.search_tsv @@ {_TSQUERY}")
+            params.append(tokens)
+        if folder_ids:
+            where.append("m.folder_id = ANY(%s)")
+            params.append(list(folder_ids))
         if sender:
             needle = f"%{sender.strip().lower()}%"
             where.append("(lower(m.sender_email) LIKE %s OR lower(m.sender_name) LIKE %s)")
@@ -268,31 +285,15 @@ class CacheStore:
             params.append(1 if has_attachments else 0)
         base = "FROM ews.messages m WHERE " + " AND ".join(where)
         order, order_params = "m.date_ts DESC", []
-        if q:
-            order = "ts_rank_cd(m.search_tsv, to_tsquery('simple', %s)) DESC, m.date_ts DESC"
-            order_params = [q]
+        if tokens:
+            order = f"ts_rank_cd(m.search_tsv, {_TSQUERY}) DESC, m.date_ts DESC"
+            order_params = [tokens]
         with self.db.conn() as c:
             total = c.execute(f"SELECT COUNT(*) AS n {base}", params).fetchone()["n"]
             rows = c.execute(
                 f"SELECT m.* {base} ORDER BY {order} LIMIT %s OFFSET %s",
                 [*params, *order_params, int(limit), int(offset)]).fetchall()
         return rows, int(total)
-
-    def strip_learned_signature(self, sender_email: str, body: str) -> str:
-        block = trailing_block(body)
-        sender = (sender_email or "").lower()
-        if not block or not sender:
-            return body
-        try:
-            with self.db.conn() as c:
-                row = c.execute(
-                    "SELECT hits FROM ews.sender_sigs WHERE sender_email = %s "
-                    "AND sig_hash = %s", (sender, _sig_hash(sender, block))).fetchone()
-        except psycopg.Error:
-            return body
-        if row is not None and row["hits"] >= SIG_MIN_HITS:
-            return body.rstrip().rpartition("\n\n")[0].rstrip()
-        return body
 
     def get_message(self, ews_id: str) -> dict[str, Any] | None:
         with self.db.conn() as c:
@@ -309,12 +310,12 @@ class CacheStore:
     def unread_page(self, limit: int = 10) -> tuple[int, list[dict[str, Any]]]:
         with self.db.conn() as c:
             total = c.execute(
-                "SELECT COUNT(*) AS n FROM ews.messages WHERE folder = 'inbox' "
+                f"SELECT COUNT(*) AS n FROM ews.messages WHERE folder_id = {_INBOX_ID} "
                 "AND is_read = 0 AND archive_state = 'live'").fetchone()["n"]
             rows = c.execute(
-                "SELECT * FROM ews.messages WHERE folder = 'inbox' AND is_read = 0 "
-                "AND archive_state = 'live' ORDER BY date_ts DESC LIMIT %s",
-                (int(limit),)).fetchall()
+                f"SELECT * FROM ews.messages WHERE folder_id = {_INBOX_ID} "
+                "AND is_read = 0 AND archive_state = 'live' "
+                "ORDER BY date_ts DESC LIMIT %s", (int(limit),)).fetchall()
         return int(total), rows
 
     def events_window(self, start_ts: int, end_ts: int,
@@ -346,11 +347,11 @@ class CacheStore:
         with self.db.conn() as c:
             received = c.execute(
                 "SELECT COUNT(*) AS n, MIN(date_iso) AS first, MAX(date_iso) AS last "
-                "FROM ews.messages WHERE lower(sender_email) = %s AND folder <> 'sent'",
-                (needle,)).fetchone()
+                "FROM ews.messages WHERE lower(sender_email) = %s "
+                f"AND folder_id IS DISTINCT FROM {_SENT_ID}", (needle,)).fetchone()
             sent = c.execute(
-                "SELECT COUNT(*) AS n, MAX(date_iso) AS last FROM ews.messages "
-                "WHERE folder = 'sent' AND lower(to_json) LIKE %s",
+                f"SELECT COUNT(*) AS n, MAX(date_iso) AS last FROM ews.messages "
+                f"WHERE folder_id = {_SENT_ID} AND lower(to_json) LIKE %s",
                 (f"%{needle}%",)).fetchone()
         out: dict[str, Any] = {}
         if received and received["n"]:
@@ -366,23 +367,25 @@ class CacheStore:
             return c.execute(
                 "SELECT lower(sender_email) AS sender_email, MAX(sender_name) AS sender_name, "
                 "COUNT(*) AS msgs, MAX(date_iso) AS last_seen FROM ews.messages "
-                "WHERE folder <> 'sent' AND (lower(sender_email) LIKE %s OR "
-                "lower(sender_name) LIKE %s) GROUP BY lower(sender_email) "
-                "ORDER BY msgs DESC LIMIT %s", (needle, needle, int(limit))).fetchall()
+                f"WHERE folder_id IS DISTINCT FROM {_SENT_ID} AND "
+                "(lower(sender_email) LIKE %s OR lower(sender_name) LIKE %s) "
+                "GROUP BY lower(sender_email) ORDER BY msgs DESC LIMIT %s",
+                (needle, needle, int(limit))).fetchall()
 
     def sent_without_reply(self, days: int = 5, limit: int = 25) -> list[dict[str, Any]]:
         cutoff = int(time.time() - days * 86400)
         with self.db.conn() as c:
             return c.execute(
-                """
+                f"""
                 SELECT s.* FROM ews.messages s
-                WHERE s.folder = 'sent' AND s.date_ts <= %s
+                WHERE s.folder_id = {_SENT_ID} AND s.date_ts <= %s
                   AND s.conversation_id IS NOT NULL
                   AND s.date_ts = (SELECT MAX(x.date_ts) FROM ews.messages x
                                    WHERE x.conversation_id = s.conversation_id
-                                     AND x.folder = 'sent')
+                                     AND x.folder_id = {_SENT_ID})
                   AND NOT EXISTS (SELECT 1 FROM ews.messages i
                                   WHERE i.conversation_id = s.conversation_id
-                                    AND i.folder <> 'sent' AND i.date_ts > s.date_ts)
+                                    AND i.folder_id IS DISTINCT FROM {_SENT_ID}
+                                    AND i.date_ts > s.date_ts)
                 ORDER BY s.date_ts DESC LIMIT %s
                 """, (cutoff, int(limit))).fetchall()

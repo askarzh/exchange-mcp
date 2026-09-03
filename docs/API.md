@@ -12,9 +12,9 @@ the registry is the single source of truth for what exists.
 | tool | class | min tier | what it does |
 |---|---|---|---|
 | `list_folders` | read | read | List mail folders as a depth-limited tree walk. |
-| `search_messages` | read | read | Search mail. |
+| `search_messages` | read | read | Search mail across the local mirror of the whole mailbox. |
 | `get_message` | read | read | Fetch one message by id (short alias from search results, e.g. |
-| `get_thread` | read | read | Rebuild the conversation containing the given message id: Inbox and Sent are merged and sorted chronologically, each entry's body cleaned to its latest-reply-only text. |
+| `get_thread` | read | read | Rebuild the conversation containing the given message id from the local mirror: every mail folder is mirrored and merged, sorted chronologically, each entry's body cleaned to its latest-reply-only text. |
 | `get_attachment` | read | read | Read one attachment of a message. |
 | `get_mailbox_overview` | read | read | The morning-brief workflow tool — start here. |
 | `list_events` | read | read | List calendar events overlapping a time window (default: today through +7d, server timezone). |
@@ -65,13 +65,13 @@ List mail folders as a depth-limited tree walk. Each row is {id, name, path, tot
 
 #### `search_messages` — read (min tier: read)
 
-Search mail. TWO ENGINES, mutually exclusive: pass `query` (an Exchange AQS string, e.g. 'from:ahmed subject:rfp hasattachment:yes') OR the structured filters (sender/subject/since/until/is_unread/has_attachments) — combining `query` with any structured filter is a validation error. `sender` is matched client-side against the fetched page's sender email/name, so total_available is unknown when it is used. Results are compact cards, newest first; their `id` values are short aliases (m12) for get_message / get_thread / get_attachment. If an id later goes stale (items move), re-run this search for fresh ids.
+Search mail across the local mirror of the whole mailbox. `query` is full-text over subject, sender and cleaned body (accent- and case-folded, every word matched as a prefix) and combines freely with the structured filters (sender/subject/since/until/is_unread/has_attachments) — they all AND together. Omit `folder` to search every mirrored folder; drafts/junk/trash/outbox are not mirrored and naming one is a validation error. Results are compact cards, most relevant then newest first, with an exact total_available; their `id` values are short aliases (m12) for get_message / get_thread / get_attachment. If an id later goes stale (items move), re-run this search for fresh ids.
 
 | parameter | type | required | description |
 |---|---|---|---|
-| `query` | string | no | AQS query string — cannot be combined with the structured filters below. |
-| `folder` | string | no | Folder alias (f:inbox, f:sent, f7), path, or raw id. (default `f:inbox`) |
-| `sender` | string | no | Sender substring, matched client-side on the fetched page (email or display name). |
+| `query` | string | no | Full-text query over subject, sender and cleaned body; combines freely with the structured filters below. |
+| `folder` | string | no | Restrict to one folder: wk alias (f:inbox, f:sent), folder alias (f7), path, or raw id. Omit to search EVERY mirrored folder. |
+| `sender` | string | no | Sender substring, matched in the mirror against the sender's email or display name. |
 | `from_` | string | no | DEPRECATED alias of `sender` — do not combine the two. |
 | `subject` | string | no | Subject substring. |
 | `since` | string | no | Window start: 'today', '+Nd', YYYY-MM-DD, or ISO datetime (server timezone). |
@@ -81,7 +81,6 @@ Search mail. TWO ENGINES, mutually exclusive: pass `query` (an Exchange AQS stri
 | `offset` | integer | no | (default `0`) |
 | `limit` | integer | no | (default `20`) |
 | `mode` | string | no | semantic is reserved; keyword only in this build. (one of: `keyword`, `semantic`; default `keyword`) |
-| `fresh` | boolean | no | true forces a live Exchange read instead of the local mirror (responses are stamped source=cache\|live). (default `False`) |
 
 #### `get_message` — read (min tier: read)
 
@@ -96,14 +95,13 @@ Fetch one message by id (short alias from search results, e.g. m12; raw EWS ids 
 
 #### `get_thread` — read (min tier: read)
 
-Rebuild the conversation containing the given message id: Inbox and Sent are merged and sorted chronologically, each entry's body cleaned to its latest-reply-only text. Returns thread_id (t-alias), participants with message counts, and the most recent `limit` entries. Entry ids are m-aliases usable with get_message/get_attachment. Stale id → re-run search_messages.
+Rebuild the conversation containing the given message id from the local mirror: every mail folder is mirrored and merged, sorted chronologically, each entry's body cleaned to its latest-reply-only text. Returns thread_id (t-alias), participants with message counts, and the most recent `limit` entries. Entry ids are m-aliases usable with get_message/get_attachment. A not_found means the seed id is not in the mirror (an excluded folder, or not synced yet).
 
 | parameter | type | required | description |
 |---|---|---|---|
 | `id` | string | yes | Any message id in the thread (m-alias or raw). |
 | `limit` | integer | no | (default `20`) |
 | `offset` | integer | no | History paging: 0 = the most recent entries; pass the returned next_offset for older ones. (default `0`) |
-| `fresh` | boolean | no | true forces a live Exchange read instead of the local mirror (responses are stamped source=cache\|live). (default `False`) |
 
 #### `get_attachment` — read (min tier: read)
 
@@ -414,8 +412,10 @@ Every list-shaped tool ships exactly:
   listings) and `null` otherwise; `next_offset` is `null` when no further
   page exists (live paths prove it with a one-item lookahead, never a
   `count()` scan).
-- `source` is `cache` (with `as_of`) or `live`; pass `fresh: true` to any
-  cache-first tool to force a live read.
+- `source` is `cache` (with `as_of`) or `live`; `fresh: true` forces a
+  live read, but only on `get_message`, `list_folders` and
+  `get_mailbox_overview` — `search_messages` and `get_thread` are
+  store-only and do not accept it.
 
 ## Ids
 
@@ -458,72 +458,18 @@ when they would notify attendees) run in two phases:
    `send_draft` retries with the same `idempotency_key` replay the cached
    receipt instead of sending twice.
 
-## Cache freshness contract
+## Freshness contract
 
-Reads answered by `ewsmcp` from the Postgres mirror carry
-`source: "cache"` and `as_of` (the folder's last sync watermark; delta
-cadence `EWS_CACHE_SYNC_SECONDS`, default 45 s). `fresh: true` is
-forwarded to `ewsd`'s live route and forces a fresh Exchange read.
+`search_messages` answers only from the Postgres mirror of the whole
+mailbox — there is no live search — and is stamped `source: "cache"` with
+`as_of` (the oldest watermark among the folders it searched; delta
+cadence `EWS_CACHE_SYNC_SECONDS`, default 45 s). `get_thread` is
+store-only — mail is fully mirrored, so a message not in the mirror
+(excluded folder, or not yet synced) returns `not_found`; there is no
+live rebuild. `fresh: true` is available on `get_message`
+(attachment inventory, raw HTML), `list_folders` and
+`get_mailbox_overview` (live counts) and forwards to `ewsd`'s live route.
 `get_server_status.cache` exposes per-folder watermarks, row counts and
-sync health. `mode: "semantic"` on `search_messages`, and the
-`find_similar` tool, are Phase 2 work — not registered in this build;
-`mode: "semantic"` returns a `validation` error until embeddings land
-(see `docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`
-at the repo root).
-
-## v3 → 5.0 tool rename map
-
-Unchanged from the 4.5 line — the 5.0 rewrite changed storage and
-process model, not tool names.
-
-| v3 (67-tool surface) | 5.0 |
-|---|---|
-| `read_emails` / `search_emails` / `advanced_search` | `search_messages` |
-| `get_email_details` | `get_message` |
-| `get_thread` / `search_by_conversation` | `get_thread` |
-| `list_folders` / `get_folder_tree` | `list_folders` |
-| `read_attachment` / `download_attachment` | `get_attachment` |
-| `get_calendar` / `list_appointments` | `list_events` |
-| `get_appointment_details` | `get_event` |
-| `check_availability` / `find_meeting_slots` | `check_availability` |
-| `find_person` / `search_gal` / `list_contacts` | `find_people` |
-| `get_person_details` | `get_contact` |
-| `get_oof_settings` / `oof_settings(action=get)` | `get_oof_settings` |
-| `oof_settings(action=set)` | `set_oof` |
-| `whoami` / `get_server_info` | `get_server_status` |
-| `create_draft` / `create_reply_draft` / `create_forward_draft` | `create_draft` (modes) |
-| `update_draft` | `update_draft` |
-| `send_draft` | `send_draft` (content-bound two-phase) |
-| `send_email` / `reply_email` / `forward_email` | **removed** — draft-first only |
-| `update_email` / `mark_read` / `update_messages` | `update_messages` (bulk) |
-| `move_email` / `move_messages` | `move_messages` (bulk) |
-| `delete_email` / `delete_messages` | `delete_messages` (bulk) |
-| `create_appointment` | `create_event` |
-| `update_appointment` | `update_event` |
-| `respond_to_meeting` | `respond_to_event` |
-| `delete_appointment` | `cancel_event` |
-| `get_tasks` | `list_tasks` |
-| `update_task` / `complete_task` | `update_task` |
-| — (new) | `get_mailbox_overview`, `waiting_on` |
-| — (Phase 2, not yet built) | `find_similar` |
-
-## Intentionally dropped vs v3
-
-Removed deliberately — most belong to the calling assistant (skills), not
-a data-plane server:
-
-- **One-shot send tools** (`send_email`, `reply_email`, `forward_email`):
-  the ONLY way mail leaves the mailbox is `create_draft` → `send_draft`.
-- **Impersonation / delegated mailboxes** (`target_mailbox` everywhere):
-  one server = one mailbox.
-- **OAuth2/MSAL flows**: the target deployment is on-prem Exchange with
-  auto-negotiated auth; a Graph/OAuth backend would be a different
-  gateway, not a flag.
-- **Contacts folder management** (create/update/delete contacts).
-- **Folder management** (create/rename/delete folders).
-- **MIME export** and raw-content endpoints.
-- **The agent-secretary stack** (server-side classify/summarize/brief/
-  voice/commitments/approval queue): the caller already IS an LLM;
-  `examples/skills/exchange-assistant/` shows the skill-side pattern.
-- **Inbox rules tools**: prefer real server-side Exchange rules
-  (revisit after an exchangelib ≥5.2 bump).
+sync health. `mode: "semantic"` on `search_messages` is Phase 2 work and
+returns a `validation` error until embeddings land — see
+`docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`.

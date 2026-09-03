@@ -1,18 +1,27 @@
-"""MCP-side dispatcher: alias resolution for local reads, verbatim forwarding
-for everything else. No kill-switch/tier/confirm here — ewsd owns those."""
+"""MCP-side dispatcher: schema validation, alias resolution for local reads,
+verbatim forwarding for everything else. No kill-switch/tier/confirm here —
+ewsd owns those.
+
+Arguments are validated against the tool's own input schema BEFORE anything
+runs, exactly as the REST shim does (``tools.base.validate_arguments``). That
+is the one place every declared bound is enforced, so a local handler never
+has to re-clamp `limit`/`offset` by hand (the daemon's handlers do clamp, but
+`mcp.local`'s did not) and no out-of-range argument is forwarded to ewsd.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ..errors import ToolError, map_exception
-from ..tools.base import Context, ToolSpec, resolve_ids
+from ..tools.base import Context, ToolSpec, resolve_ids, validate_arguments
 from .registry import LOCAL_TOOLS
 
 
 async def dispatch_mcp(ctx: Context, spec: ToolSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
     outcome = "ok"
     try:
+        validate_arguments(spec, kwargs)
         if spec.name in LOCAL_TOOLS:
             kwargs = resolve_ids(ctx, kwargs)
         result = await spec.handler(ctx, **kwargs)

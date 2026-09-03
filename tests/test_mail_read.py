@@ -11,12 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
-from conftest import make_settings
+from conftest import FakeGateway, make_context
 
-from ewsmcp.audit import AuditLog
-from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import mail_read
-from ewsmcp.tools.base import Context, dispatch
+from ewsmcp.tools.base import dispatch
 
 TZ = ZoneInfo("Asia/Riyadh")
 SPECS = {spec.name: spec for spec in mail_read.TOOLS}
@@ -63,17 +61,6 @@ class _Query(list):
         self.refresh_calls += 1
 
 
-class _FakeGateway:
-    def __init__(self, account):
-        self.account = account
-
-    async def call(self, fn):
-        return fn(self.account)
-
-    def resolve_folder(self, account, ref, aliaser):
-        return self.account.inbox
-
-
 def _msg(raw_id, subject="Subj", sender="ahmed@corp.example", *, sender_name=None,
          dt=None, is_read=True, has_attachments=False, text_body="",
          conv="CONV-RAW-1=", message_id=None, attachments=None, to=None):
@@ -104,13 +91,8 @@ def _account(inbox=None, sent=None):
 
 def _ctx(tmp_path, db, account, **overrides):
     overrides.setdefault("data_dir", str(tmp_path / "data"))
-    return Context(
-        settings=make_settings(**overrides),
-        gateway=_FakeGateway(account),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "audit")),
-    )
+    return make_context(db, gateway=FakeGateway(account), cache=False,
+                        audit_dir=str(tmp_path / "audit"), **overrides)
 
 
 def _run(ctx, name, **kwargs):
@@ -135,110 +117,34 @@ def test_pack_exports_six_read_specs():
 # --- search_messages -----------------------------------------------------------
 
 
-def test_search_envelope_alias_ids_and_clean_snippet(tmp_path, db):
-    inbox = _Query([
-        _msg("RAW-1=", subject="RFP timeline",
-             text_body="Confirming the new deadline works." + QUOTED_TAIL),
-        _msg("RAW-2=", subject="Budget", text_body="Numbers attached."),
-    ])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
+def test_search_messages_no_longer_has_a_live_path(tmp_path, db):
+    """The handler never calls the gateway: with no mirror it errors, it
+    does not fall through to Exchange."""
+    import inspect
+
+    from ewsmcp.tools import mail_read
+    source = inspect.getsource(mail_read._search_messages)
+    assert "ctx.gateway" not in source
+    assert "paginate" not in source
+
+
+def test_search_messages_without_a_mirror_is_backend_unavailable(tmp_path, db):
+    """This pack's `_ctx` always builds with cache=False — search_messages is
+    store-only now, so with no mirror it errors rather than falling through
+    to Exchange."""
+    account = _account()
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "search_messages")
-    assert res["ok"] is True
-    assert res["count"] == 2 and res["total_available"] == 2
-    assert res["next_offset"] is None
-    assert res["items"][0]["id"] == "m1"
-    assert res["items"][1]["id"] == "m2"
-    assert res["items"][0]["snippet"] == "Confirming the new deadline works."
-    assert "OLD QUOTED" not in res["items"][0]["snippet"]
+    assert res["ok"] is False
+    assert res["error"]["code"] == "backend_unavailable"
+    account.fetch.assert_not_called()
 
 
-def test_search_engine_conflict_is_validation_error(tmp_path, db):
+def test_search_sender_and_deprecated_alias_conflict_is_validation(tmp_path, db):
     ctx = _ctx(tmp_path, db, _account())
-    res = _run(ctx, "search_messages", query="from:ahmed", subject="rfp")
+    res = _run(ctx, "search_messages", sender="ahmed", from_="ahmed")
     assert res["ok"] is False
     assert res["error"]["code"] == "validation"
-    assert "hint" in res["error"]
-
-
-def test_search_aqs_passes_query_string_to_filter(tmp_path, db):
-    inbox = _Query([_msg("RAW-1=")])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
-    res = _run(ctx, "search_messages", query='subject:"RFP" hasattachment:yes')
-    assert res["ok"] is True
-    assert inbox.filter_calls[0] == (('subject:"RFP" hasattachment:yes',), {})
-
-
-def test_search_structured_filters_become_lookups(tmp_path, db):
-    inbox = _Query([_msg("RAW-1=")])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
-    res = _run(ctx, "search_messages", subject="rfp", since="2026-06-01",
-               until="2026-06-12T18:30+03:00", is_unread=True, has_attachments=True)
-    assert res["ok"] is True
-    args, kwargs = inbox.filter_calls[0]
-    assert args == ()
-    assert kwargs["subject__icontains"] == "rfp"
-    assert kwargs["datetime_received__gte"] == datetime(2026, 6, 1, 0, 0, tzinfo=TZ)
-    assert kwargs["datetime_received__lte"] == datetime(2026, 6, 12, 18, 30, tzinfo=TZ)
-    assert kwargs["is_read"] is False
-    assert kwargs["has_attachments"] is True
-    assert inbox.order_calls and inbox.only_calls  # projection applied
-
-
-def test_search_from_is_a_client_side_postfilter(tmp_path, db):
-    inbox = _Query([
-        _msg("RAW-1=", sender="ahmed@corp.example"),
-        _msg("RAW-2=", sender="sara@corp.example"),
-    ])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
-    res = _run(ctx, "search_messages", from_="ahmed")
-    assert res["ok"] is True
-    assert res["count"] == 1
-    assert res["items"][0]["from"] == "ahmed@corp.example"
-    assert res["total_available"] is None  # post-filter voids the upstream count
-
-
-def test_search_pagination_next_offset(tmp_path, db):
-    inbox = _Query([_msg(f"RAW-{n}=") for n in range(3)])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
-    res = _run(ctx, "search_messages", limit=2)
-    assert res["count"] == 2
-    # Unfiltered listing: the exact total comes from the REFRESHED folder
-    # property, never from a count() full-folder scan.
-    assert res["total_available"] == 3
-    assert res["next_offset"] == 2
-    assert inbox.refresh_calls == 1
-    assert inbox.count_calls == 0
-
-
-def test_search_never_calls_queryset_count(tmp_path, db):
-    """count() iterates every matching id server-side — banned on all
-    search paths (the v3 latency root cause)."""
-    inbox = _Query([_msg(f"RAW-{n}=") for n in range(5)])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
-    _run(ctx, "search_messages", subject="x", limit=2)
-    _run(ctx, "search_messages", limit=2)
-    assert inbox.count_calls == 0
-
-
-def test_search_filtered_has_lookahead_next_offset_but_no_total(tmp_path, db):
-    inbox = _Query([_msg(f"RAW-{n}=") for n in range(4)])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
-    res = _run(ctx, "search_messages", subject="Subj", limit=2)
-    assert res["total_available"] is None  # filtered: total would need a scan
-    assert res["next_offset"] == 2  # lookahead saw a third item
-    assert inbox.refresh_calls == 0  # refresh only pays off unfiltered
-
-
-def test_search_sender_param_and_deprecated_alias(tmp_path, db):
-    inbox = _Query([
-        _msg("RAW-1=", sender="ahmed@corp.example"),
-        _msg("RAW-2=", sender="sara@corp.example"),
-    ])
-    ctx = _ctx(tmp_path, db, _account(inbox=inbox))
-    res = _run(ctx, "search_messages", sender="ahmed")
-    assert res["count"] == 1
-    both = _run(ctx, "search_messages", sender="ahmed", from_="ahmed")
-    assert both["error"]["code"] == "validation"
 
 
 # --- get_message -----------------------------------------------------------------
@@ -252,7 +158,7 @@ def test_get_message_full_shape_and_alias_roundtrip(tmp_path, db):
     inbox = _Query([item])
     account = _account(inbox=inbox)
     ctx = _ctx(tmp_path, db, account)
-    assert _run(ctx, "search_messages")["items"][0]["id"] == "m1"  # mints m1
+    assert ctx.aliaser.alias_for("RAW-1=", "m") == "m1"  # mints m1
 
     account.fetch = MagicMock(return_value=[item])
     res = _run(ctx, "get_message", id="m1")  # dispatcher resolves m1 -> RAW-1=
@@ -294,72 +200,16 @@ def test_get_message_stale_id_maps_to_not_found(tmp_path, db):
 # --- get_thread --------------------------------------------------------------------
 
 
-def test_get_thread_merges_inbox_and_sent_chronologically(tmp_path, db):
-    msg_a = _msg("RAW-A=", subject="RFP", sender="ahmed@corp.example",
-                 dt=datetime(2026, 6, 10, 9, 0, tzinfo=TZ),
-                 text_body="Opening question?")
-    msg_b = _msg("RAW-B=", subject="Re: RFP", sender="exec@corp.example",
-                 dt=datetime(2026, 6, 10, 10, 0, tzinfo=TZ),
-                 text_body="Agreed, Sunday 10am." + QUOTED_TAIL)
-    msg_c = _msg("RAW-C=", subject="Re: RFP", sender="ahmed@corp.example",
-                 dt=datetime(2026, 6, 10, 11, 0, tzinfo=TZ),
-                 text_body="Confirmed, thanks.", has_attachments=True)
-    account = _account(inbox=_Query([msg_c, msg_a]), sent=_Query([msg_b]))
-    account.fetch = MagicMock(return_value=[msg_a])
-    ctx = _ctx(tmp_path, db, account)
+def test_get_thread_has_no_live_fallback(tmp_path, db):
+    """Every mail folder is mirrored now, so a miss on the mirror means the
+    seed is in an excluded folder or not synced yet — not_found, and the
+    gateway is never touched to try to rebuild the thread live."""
+    account = _account()
+    ctx = _ctx(tmp_path, db, account)  # cache=False: always a mirror miss
     res = _run(ctx, "get_thread", id="RAW-A=")
-    assert res["ok"] is True
-    assert res["thread_id"].startswith("t")
-    assert res["subject"] == "RFP"
-    assert res["count"] == 3 and res["total_available"] == 3
-    dates = [entry["date"] for entry in res["items"]]
-    assert dates == sorted(dates)
-    assert res["items"][1]["body"] == "Agreed, Sunday 10am."
-    assert "OLD QUOTED" not in res["items"][1]["body"]
-    assert res["items"][2].get("attach") is True
-    assert sum(p["msgs"] for p in res["participants"]) == 3
-    assert res["participants"][0]["name_or_email"] == "ahmed@corp.example"
-    # conversation_id must be passed as the ConversationId OBJECT — 5.0.3
-    # raises TypeError on a plain string (verified against the installed
-    # library; the old pin here asserted the broken behavior).
-    for folder in (account.inbox, account.sent):
-        passed = folder.filter_calls[0][1]["conversation_id"]
-        assert passed is msg_a.conversation_id
-        assert passed.id == "CONV-RAW-1="
-
-
-def test_get_thread_caps_at_limit_keeping_latest(tmp_path, db):
-    msgs = [
-        _msg(f"RAW-{n}=", dt=datetime(2026, 6, 10, 8 + n, 0, tzinfo=TZ),
-             text_body=f"entry {n}")
-        for n in range(4)
-    ]
-    account = _account(inbox=_Query(msgs), sent=_Query())
-    account.fetch = MagicMock(return_value=[msgs[0]])
-    ctx = _ctx(tmp_path, db, account)
-    res = _run(ctx, "get_thread", id="RAW-0=", limit=2)
-    assert res["count"] == 2 and res["total_available"] == 4
-    assert [entry["body"] for entry in res["items"]] == ["entry 2", "entry 3"]
-    assert res["next_offset"] == 2  # older history exists
-
-
-def test_get_thread_offset_pages_older_history(tmp_path, db):
-    msgs = [
-        _msg(f"RAW-{n}=", dt=datetime(2026, 6, 10, 8 + n, 0, tzinfo=TZ),
-             text_body=f"entry {n}")
-        for n in range(5)
-    ]
-    account = _account(inbox=_Query(msgs), sent=_Query())
-    account.fetch = MagicMock(return_value=[msgs[0]])
-    ctx = _ctx(tmp_path, db, account)
-    older = _run(ctx, "get_thread", id="RAW-0=", limit=2, offset=2)
-    assert [e["body"] for e in older["items"]] == ["entry 1", "entry 2"]
-    assert older["next_offset"] == 4
-    oldest = _run(ctx, "get_thread", id="RAW-0=", limit=2, offset=4)
-    assert [e["body"] for e in oldest["items"]] == ["entry 0"]
-    assert oldest["next_offset"] is None
-    # participants always count the WHOLE thread, not the returned page
-    assert sum(p["msgs"] for p in oldest["participants"]) == 5
+    assert res["ok"] is False
+    assert res["error"]["code"] == "not_found"
+    account.fetch.assert_not_called()
 
 
 # --- get_attachment --------------------------------------------------------------

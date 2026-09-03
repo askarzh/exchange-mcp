@@ -1,9 +1,12 @@
 """v5 test fixtures: import path, a real Postgres, per-test schema isolation."""
 
+import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -68,16 +71,100 @@ def make_settings(**overrides):
     return Settings(**base)
 
 
-def make_context(db, gateway=None, cache=True, **overrides):
-    """A Context wired to the test database (aliases + mirror), no audit disk,
-    registry built. `cache=False` leaves ctx.cache None (pure-EWS reads)."""
+class FakeGateway:
+    """The ONE gateway double.
+
+    `raise_on_call=True` is the NoTouchGateway posture: any attempt to reach
+    Exchange is an assertion failure, which is how the mirror-served read
+    tests prove they never contact EWS. `folders` maps a folder ref onto the
+    object `resolve_folder` should hand back.
+    """
+
+    def __init__(self, account: Any = None, *, raise_on_call: bool = False,
+                 folders: dict[str, Any] | None = None):
+        self.account = account
+        self.calls = 0
+        self.raise_on_call = raise_on_call
+        self.folders = dict(folders or {})
+
+    async def call(self, fn):
+        if self.raise_on_call:
+            raise AssertionError("EWS was contacted — the mirror path failed")
+        self.calls += 1
+        return fn(self.account)
+
+    def resolve_folder(self, account, ref, aliaser):
+        if self.raise_on_call:
+            raise AssertionError("EWS folder resolution — the mirror path failed")
+        if ref in self.folders:
+            return self.folders[ref]
+        return getattr(self.account, "inbox", None)
+
+
+INBOX_ID = "F-INBOX"
+SENT_ID = "F-SENT"
+JUNK_ID = "F-JUNK"
+ARCHIVE_ID = "F-ARCHIVE"
+
+_FOLDER_ROWS = [
+    {"ews_id": INBOX_ID, "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
+     "total": 0, "unread": 0, "children": 0},
+    {"ews_id": SENT_ID, "name": "Sent Items", "path": "Sent Items", "wk": "f:sent",
+     "total": 0, "unread": 0, "children": 0},
+    {"ews_id": JUNK_ID, "name": "Junk Email", "path": "Junk Email", "wk": "f:junk",
+     "total": 0, "unread": 0, "children": 0},
+    # a custom, non-well-known folder: mirrored (not excluded) but never
+    # synced — the "known but empty" case, distinct from f:junk which is
+    # excluded from the mirror entirely by EWS_MIRROR_EXCLUDE.
+    {"ews_id": ARCHIVE_ID, "name": "Archive 2024", "path": "Archive 2024", "wk": None,
+     "total": 0, "unread": 0, "children": 0},
+]
+
+
+def seed_folders(store):
+    """The hierarchy rows every folder-id lookup resolves against."""
+    store.replace_folders([dict(r) for r in _FOLDER_ROWS])
+
+
+def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
+             sender_email="a@corp.example", sender_name="Ahmed",
+             body="please review the numbers", date_ts=None, is_read=1,
+             has_attachments=0, conv="CONV-1", imid=None, to=None):
+    """One `CacheStore.upsert_messages` row."""
+    return {
+        "ews_id": ews_id,
+        "changekey": "CK",
+        "folder_id": folder_id,
+        "conversation_id": conv,
+        "sender_name": sender_name,
+        "sender_email": sender_email,
+        "to_json": json.dumps(to or []),
+        "subject": subject,
+        "date_ts": int(date_ts if date_ts is not None else time.time()),
+        "date_iso": "2026-07-01T09:00+03:00",
+        "is_read": is_read,
+        "has_attachments": has_attachments,
+        "importance": None,
+        "categories_json": "[]",
+        "body_clean": body,
+        "internet_message_id": imid or f"<{ews_id}@corp.example>",
+    }
+
+
+def make_context(db, gateway=None, cache=True, audit_dir=None, **overrides):
+    """A Context wired to the test database (aliases + mirror), registry built.
+
+    `cache=False` leaves ctx.cache None. `audit_dir` swaps the null audit for
+    a real hash-chained AuditLog rooted there.
+    """
+    from ewsmcp.audit import AuditLog, NullAudit
     from ewsmcp.cache.store import CacheStore
     from ewsmcp.ids import IdAliaser
-    from ewsmcp.server import _NullAudit
     from ewsmcp.tools import build_registry
     from ewsmcp.tools.base import Context
+    audit = AuditLog(audit_dir) if audit_dir else NullAudit()
     ctx = Context(settings=make_settings(**overrides), gateway=gateway, manager=None,
-                  aliaser=IdAliaser(db), audit=_NullAudit(),
+                  aliaser=IdAliaser(db), audit=audit,
                   cache=CacheStore(db) if cache else None, db=db)
     build_registry(ctx)
     return ctx

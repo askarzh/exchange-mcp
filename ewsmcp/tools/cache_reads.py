@@ -2,10 +2,14 @@
 
 Extracted out of ``mail_read.py`` / ``tasks.py`` so both the daemon's
 `ToolSpec` handlers and the thin MCP (Task 8) can hit the same mirror
-logic. Every function here returns ``None`` when the mirror cannot
-answer (folder not synced, row missing, cache disabled, or an
-unexpected error) — the caller then falls through to the live EWS
-path. Nothing here ever imports exchangelib or touches the gateway.
+logic. ``search_messages`` and ``get_thread`` answer only from the store:
+they raise ``ToolError`` on a bad folder rather than falling back, and let
+``psycopg.Error``/``RuntimeError`` (a closed pool) propagate so the caller
+can report `backend_unavailable` instead of passing a dead database off as
+a miss. Every other function here returns ``None`` when the mirror cannot
+answer (folder not synced, row missing, cache disabled, or an unexpected
+error) — the caller then falls through to the live EWS path. Nothing here
+ever imports exchangelib or touches the gateway.
 """
 
 import asyncio
@@ -14,6 +18,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import psycopg
 
 from ..dates import parse_when
 from ..dto import envelope
@@ -33,15 +39,8 @@ def _stamp(result: dict[str, Any], source: str,
 
 
 def _row_body(ctx: Context, row: Any) -> str:
-    """Cleaned body with the sender's LEARNED signature stripped (the
-    deterministic per-sender trailing-block learning from sync time)."""
-    body = row["body_clean"] or ""
-    if ctx.cache is not None and body:
-        try:
-            body = ctx.cache.strip_learned_signature(row["sender_email"], body)
-        except Exception as exc:  # noqa: BLE001 - best effort, body stays uncleaned
-            logger.debug("strip_learned_signature failed (%s) — body unstripped", exc)
-    return body
+    """The cleaned body exactly as ``bodyclean`` produced it at sync time."""
+    return row["body_clean"] or ""
 
 
 def _row_card(ctx: Context, row: Any) -> dict[str, Any]:
@@ -97,7 +96,7 @@ def _row_full(ctx: Context, row: Any) -> dict[str, Any]:
 
 
 def _thread_from_cache(ctx: Context, raw_id: str, limit: int,
-                       offset: int) -> dict[str, Any] | None:
+                       offset: int) -> tuple[dict[str, Any], int | None] | None:
     """Local conversation_id join — sync helper, runs on a worker thread."""
     seed = ctx.cache.get_message(raw_id)
     if seed is None or not seed["conversation_id"]:
@@ -130,7 +129,11 @@ def _thread_from_cache(ctx: Context, raw_id: str, limit: int,
         {"name_or_email": who, "msgs": n}
         for who, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
-    return {
+    marks = ctx.cache.watermarks()
+    seen = [marks[f"item:{r['folder_id']}"] for r in rows
+            if f"item:{r['folder_id']}" in marks]
+    as_of = min(seen) if seen else None
+    return ({
         "ok": True,
         "thread_id": ctx.aliaser.alias_for(seed["conversation_id"], "t"),
         "subject": seed["subject"] or "",
@@ -139,52 +142,75 @@ def _thread_from_cache(ctx: Context, raw_id: str, limit: int,
         "count": len(entries),
         "total_available": total,
         "next_offset": next_offset,
-    }
+    }, as_of)
 
 
-def folder_key(ctx: Context, folder_ref: str | None) -> str | None:
-    """Map a folder argument onto a mirrored folder key, or None (→ live).
+def _excluded_wks(ctx: Context) -> set[str]:
+    raw = getattr(ctx.settings, "ews_mirror_exclude", "") or ""
+    return {f"f:{part.strip().lower()}" for part in raw.split(",") if part.strip()}
 
-    Mirrored means ``f"item:{key}"`` is present in ``ctx.cache.watermarks()``
-    — i.e. the sync engine has actually populated that folder, not merely
-    that it is listed in settings.
+
+async def resolve_folder_id(ctx: Context, folder_ref: str) -> str:
+    """well-known alias (f:inbox / inbox) | folder alias (f7) | path | raw
+    EWS id → the folder's EWS id, resolved against ``ews.folders``.
+
+    Raises ToolError("validation") for a folder excluded from the mirror,
+    ToolError("upstream_unavailable") when the hierarchy lane has not synced
+    ANY folders yet (cold boot — degrading, not a claim that the folder
+    itself is wrong), and ToolError("not_found") when the hierarchy IS
+    populated but nothing matches.
     """
+    ref = (folder_ref or "").strip()
+    rows = await asyncio.to_thread(ctx.cache.folder_rows)
+    if not rows:
+        raise ToolError(
+            "upstream_unavailable", "folder hierarchy not synced yet",
+            hint="ewsd syncs the folder tree shortly after boot; check "
+                 "get_server_status", retry_after_s=30)
+    wk = ref.lower() if ref.lower().startswith("f:") else f"f:{ref.lower()}"
+    row = next((r for r in rows if r["wk"] == wk), None)
+    if row is None:
+        try:
+            raw = ctx.aliaser.resolve(ref)
+        except KeyError as exc:
+            raise ToolError("validation", str(exc.args[0] if exc.args else exc))
+        row = next((r for r in rows if r["ews_id"] == raw), None)
+    if row is None:
+        row = next((r for r in rows
+                    if (r["path"] or "").lower() == ref.lower()), None)
+    if row is None:
+        raise ToolError(
+            "not_found", f"No mirrored folder matches {folder_ref!r}.",
+            hint="Call list_folders and pass one of its ids, paths or wk aliases.")
+    if (row["wk"] or "") in _excluded_wks(ctx):
+        raise ToolError(
+            "validation",
+            f"{folder_ref!r} is not mirrored (EWS_MIRROR_EXCLUDE="
+            f"{ctx.settings.ews_mirror_exclude}).",
+            hint="Search a mirrored folder, or omit `folder` to search all of them.")
+    return row["ews_id"]
+
+
+def folder_watermark(ctx: Context, folder_id: str) -> int | None:
+    return None if ctx.cache is None else ctx.cache.watermark(f"item:{folder_id}")
+
+
+def wk_watermark(ctx: Context, wk: str) -> int | None:
+    """Watermark of a well-known folder, or None when it is not synced."""
     if ctx.cache is None:
         return None
-    key = (folder_ref or "f:inbox").strip().lower()
-    key = key.removeprefix("f:")
-    return key if f"item:{key}" in ctx.cache.watermarks() else None
+    folder_id = ctx.cache.folder_id_for_wk(wk)
+    return None if folder_id is None else ctx.cache.watermark(f"item:{folder_id}")
 
 
-def watermark(ctx: Context, key: str) -> int | None:
-    return None if ctx.cache is None else ctx.cache.watermark(f"item:{key}")
-
-
-def validate_search_args(sender: str | None, from_: str | None,
-                         subject: str | None, since: str | None,
-                         until: str | None, is_unread: bool | None,
-                         has_attachments: bool | None,
-                         query: str | None) -> str | None:
-    """Resolve `sender`/`from_` and raise the shared 4.5 validation errors.
-
-    Returns the effective sender (sender or from_)."""
+def validate_search_args(sender: str | None, from_: str | None) -> str | None:
+    """Resolve `sender`/`from_`. Phase 1.5 removed the AQS-exclusivity rule:
+    `query` is full-text over the mirror and combines freely with the
+    structured filters."""
     if sender and from_:
         raise ToolError("validation",
                         "pass `sender` only — `from_` is its deprecated alias.")
-    sender = sender or from_
-    structured = any(v is not None for v in
-                     (sender, subject, since, until, is_unread, has_attachments))
-    if query and structured:
-        raise ToolError(
-            "validation",
-            "`query` (AQS) cannot be combined with the structured filters "
-            "(sender/subject/since/until/is_unread/has_attachments) — Exchange "
-            "runs them on different engines.",
-            hint="Either fold everything into the AQS string (e.g. 'from:ahmed "
-                 "subject:rfp received>=2026-06-01') or drop `query` and use "
-                 "only structured filters.",
-        )
-    return sender
+    return sender or from_
 
 
 async def list_folders(ctx: Context, depth: int,
@@ -213,7 +239,9 @@ async def list_folders(ctx: Context, depth: int,
         if r["wk"]:
             row["wk"] = r["wk"]
         rows.append(row)
-    as_of = ctx.cache.watermark("events")  # slow-lane watermark
+    # The hierarchy lane's own watermark — `events` belongs to the slow
+    # (calendar/tasks) lane and says nothing about when these rows were read.
+    as_of = await asyncio.to_thread(ctx.cache.watermark, "folders")
     return _stamp(envelope(rows, total_available=len(rows), offset=0),
                   "cache", as_of)
 
@@ -224,33 +252,32 @@ async def search_messages(ctx: Context, *, folder: str | None,
                           until: str | None, is_unread: bool | None,
                           has_attachments: bool | None, offset: int,
                           limit: int) -> dict[str, Any] | None:
-    key = folder_key(ctx, folder)
-    if not key:
+    """Store-only search over the mirror. None only when there is no cache
+    at all (``ctx.cache is None``) — the caller then goes straight to live
+    EWS, same as every other cache_reads helper. Otherwise raises ToolError
+    on a bad `folder`; psycopg errors propagate (the caller maps them to
+    backend_unavailable)."""
+    if ctx.cache is None:
         return None
-    as_of = watermark(ctx, key)
-    if not as_of:
-        return None
+    folder_ids = [await resolve_folder_id(ctx, folder)] if folder else None
+    marks = ctx.cache.watermarks()
+    keys = ([f"item:{fid}" for fid in folder_ids] if folder_ids
+            else [k for k in marks if k.startswith("item:")])
+    seen = [marks[k] for k in keys if k in marks]
+    as_of = min(seen) if seen else None
     tz = ctx.settings.ews_tz
-    try:
-        since_ts = (int(parse_when(since, "since", tz).timestamp())
-                    if since else None)
-        until_ts = (int(parse_when(until, "until", tz).timestamp())
-                    if until else None)
-        rows, total = await asyncio.to_thread(
-            ctx.cache.search_messages,
-            folders=[key], text=query, sender=sender,
-            subject=subject, since_ts=since_ts, until_ts=until_ts,
-            is_unread=is_unread, has_attachments=has_attachments,
-            offset=offset, limit=limit, archived="any",
-        )
-        cards = await asyncio.to_thread(lambda: [_row_card(ctx, r) for r in rows])
-        return _stamp(envelope(cards, total_available=total, offset=offset),
-                      "cache", as_of)
-    except ToolError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - mirror error → live fallback
-        logger.warning("cache search failed (%s) — falling back live", exc)
-        return None
+    since_ts = int(parse_when(since, "since", tz).timestamp()) if since else None
+    until_ts = int(parse_when(until, "until", tz).timestamp()) if until else None
+    rows, total = await asyncio.to_thread(
+        ctx.cache.search_messages,
+        folder_ids=folder_ids, text=query, sender=sender,
+        subject=subject, since_ts=since_ts, until_ts=until_ts,
+        is_unread=is_unread, has_attachments=has_attachments,
+        offset=offset, limit=limit, archived="any",
+    )
+    cards = await asyncio.to_thread(lambda: [_row_card(ctx, r) for r in rows])
+    return _stamp(envelope(cards, total_available=total, offset=offset),
+                  "cache", as_of)
 
 
 async def get_message(ctx: Context, raw_id: str,
@@ -264,32 +291,37 @@ async def get_message(ctx: Context, raw_id: str,
         return None
     if row is None:
         return None
-    as_of = watermark(ctx, row["folder"])
+    as_of = folder_watermark(ctx, row["folder_id"])
     message = _row_card(ctx, row) if format == "concise" else _row_full(ctx, row)
     return _stamp({"ok": True, "message": message}, "cache", as_of)
 
 
 async def get_thread(ctx: Context, raw_id: str, limit: int,
                      offset: int) -> dict[str, Any] | None:
+    """Store-only, like ``search_messages``: None means a genuine miss (the
+    seed is not mirrored), which the callers turn into `not_found`. A dead
+    Postgres must NOT look like a miss, so psycopg/pool errors propagate for
+    the callers to map to `backend_unavailable`."""
     if ctx.cache is None:
         return None
     try:
         cached = await asyncio.to_thread(
             _thread_from_cache, ctx, raw_id, limit, offset)
-    except Exception as exc:  # noqa: BLE001 - mirror error → live fallback
-        logger.warning("cache get_thread failed (%s) — live", exc)
+    except (psycopg.Error, RuntimeError):  # pool closed/unreachable — never a miss
+        raise
+    except Exception as exc:  # noqa: BLE001 - bad row/shape → clean miss
+        logger.warning("cache get_thread failed (%s)", exc)
         return None
     if cached is None:
         return None
-    as_of = min(filter(None, (watermark(ctx, k) for k in ("inbox", "sent"))),
-                default=None)
-    return _stamp(cached, "cache", as_of)
+    payload, as_of = cached
+    return _stamp(payload, "cache", as_of)
 
 
 async def overview(ctx: Context, horizon_days: int) -> dict[str, Any] | None:
     if ctx.cache is None:
         return None
-    as_of = watermark(ctx, "inbox")
+    as_of = wk_watermark(ctx, "f:inbox")
     if not as_of:
         return None
     tz = ctx.settings.ews_tz

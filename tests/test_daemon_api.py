@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-from conftest import make_context, make_settings  # noqa: F401 - make_settings kept for parity
+from conftest import make_context
 
 from ewsmcp.daemon import build_daemon_app
 

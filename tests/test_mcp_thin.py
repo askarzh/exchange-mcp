@@ -5,8 +5,7 @@ import asyncio
 import time
 
 import httpx
-from conftest import make_context, make_settings
-from test_pg_store import make_row
+from conftest import INBOX_ID, SENT_ID, make_context, make_row, make_settings, seed_folders
 
 from ewsmcp.daemon import build_daemon_app
 from ewsmcp.mcp.client import DaemonClient
@@ -38,26 +37,27 @@ class RecordingDaemon:
 
 
 def _mcp_ctx(db, daemon, **overrides):
+    from ewsmcp.audit import NullAudit
     from ewsmcp.cache.store import CacheStore
     from ewsmcp.ids import IdAliaser
-    from ewsmcp.server import _NullAudit
     ctx = Context(settings=make_settings(**overrides), gateway=None, manager=None,
-                  aliaser=IdAliaser(db), audit=_NullAudit(), cache=CacheStore(db),
+                  aliaser=IdAliaser(db), audit=NullAudit(), cache=CacheStore(db),
                   db=db, daemon=daemon)
     build_mcp_registry(ctx)
     return ctx
 
 
 def _seed(ctx):
+    seed_folders(ctx.cache)
     now = int(time.time())
     ctx.cache.upsert_messages([
         make_row("RAW-1", subject="Budget review", body="please review", conv="C1",
                  is_read=0, date_ts=now - 300),
-        make_row("RAW-2", subject="Re: Budget review", folder="sent", conv="C1",
+        make_row("RAW-2", subject="Re: Budget review", folder_id=SENT_ID, conv="C1",
                  sender_email="exec@corp.example", body="looks good", date_ts=now - 200),
     ])
-    ctx.cache.set_sync_state("item:inbox", "T", now)
-    ctx.cache.set_sync_state("item:sent", "T", now)
+    ctx.cache.set_sync_state(f"item:{INBOX_ID}", "T", now)
+    ctx.cache.set_sync_state(f"item:{SENT_ID}", "T", now)
     ctx.cache.set_sync_state("events", None, now)
 
 
@@ -78,7 +78,7 @@ def test_registry_matches_daemon_counts(db):
 def test_local_reads_work_with_daemon_down(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     _seed(ctx)
-    res = _run(ctx, "search_messages", query="budget")
+    res = _run(ctx, "search_messages", query="budget", folder="f:inbox")
     assert res["ok"] and res["source"] == "cache" and res["count"] == 1
     alias = res["items"][0]["id"]
     assert alias.startswith("m")
@@ -92,20 +92,67 @@ def test_local_reads_work_with_daemon_down(db):
     assert st["ok"] and st["daemon"]["reachable"] is False
 
 
+def test_search_with_no_folder_spans_every_mirrored_folder(db):
+    """folder omitted = every mirrored folder — on the MCP side too, a search
+    with no folder returns rows from two different mirrored folders (inbox
+    and sent)."""
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    res = _run(ctx, "search_messages", query="budget")
+    assert res["ok"] and res["source"] == "cache"
+    assert res["count"] == 2
+    subjects = {it["subject"] for it in res["items"]}
+    assert subjects == {"Budget review", "Re: Budget review"}
+
+
 def test_fresh_and_misses_fall_through_to_daemon(db):
     daemon = RecordingDaemon()
     ctx = _mcp_ctx(db, daemon)
     _seed(ctx)
     _run(ctx, "get_message", id="RAW-1", fresh=True)
-    _run(ctx, "search_messages", folder="f:junk")
     _run(ctx, "get_message", id="UNKNOWN-RAW")
-    assert [c[0] for c in daemon.calls] == ["get_message", "search_messages", "get_message"]
+    assert [c[0] for c in daemon.calls] == ["get_message", "get_message"]
     assert daemon.calls[0][1]["fresh"] is True
+
+
+def test_unmirrored_folder_is_a_validation_error_without_touching_the_daemon(db):
+    """search_messages now resolves the folder against ews.folders and raises
+    ToolError before ever reaching the mirror or the daemon (Task 4/6)."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    res = _run(ctx, "search_messages", folder="f:doesnotexist")
+    assert res["ok"] is False and res["error"]["code"] == "not_found"
+    assert daemon.calls == []
+
+
+def test_search_of_a_mirrored_but_unsynced_folder_is_empty(db):
+    """The custom Archive folder is known (seed_folders wrote it, no wk) but
+    never synced — an empty cache-served result, not a fall-through to the
+    daemon. (f:junk is EWS_MIRROR_EXCLUDE'd, not merely unsynced — see the
+    validation-error test below.)"""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    res = _run(ctx, "search_messages", folder="Archive 2024")
+    assert res["ok"] is True and res["source"] == "cache" and res["count"] == 0
+    assert daemon.calls == []
+
+
+def test_search_of_an_excluded_folder_is_a_validation_error(db):
+    """f:junk is in EWS_MIRROR_EXCLUDE — it is never item-synced at all, so
+    searching it is refused up front rather than silently returning empty."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    res = _run(ctx, "search_messages", folder="f:junk")
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert daemon.calls == []
 
 
 def test_daemon_down_on_miss_is_daemon_unavailable(db):
     ctx = _mcp_ctx(db, DeadDaemon())
-    res = _run(ctx, "search_messages", folder="f:junk")
+    res = _run(ctx, "get_message", id="UNKNOWN-RAW")
     assert res["ok"] is False and res["error"]["code"] == "daemon_unavailable"
 
 
@@ -148,3 +195,45 @@ def test_semantic_search_is_validation_error_on_mcp_side(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     res = _run(ctx, "search_messages", query="budget", mode="semantic")
     assert res["ok"] is False and res["error"]["code"] == "validation"
+
+
+def test_get_thread_with_a_dead_mirror_is_backend_unavailable(db):
+    """The MCP surface makes the same distinction as the daemon: a closed
+    pool is backend_unavailable, never a not_found."""
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    alias = _run(ctx, "search_messages", query="budget")["items"][0]["id"]
+    assert _run(ctx, "get_thread", id=alias)["ok"] is True
+    db.close()
+    res = asyncio.run(dispatch_mcp(ctx, ctx.registry["get_thread"],
+                                   {"id": alias}))
+    assert res["ok"] is False and res["error"]["code"] == "backend_unavailable"
+
+
+def test_arguments_are_validated_against_the_tool_schema(db):
+    """The MCP dispatcher validates against spec.input_schema before any
+    handler runs — mcp/local.py does not re-clamp limit/offset by hand, and
+    an out-of-range argument must not reach the store or ewsd."""
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    over = _run(ctx, "search_messages", query="budget", limit=5000)
+    assert over["ok"] is False and over["error"]["code"] == "validation"
+    assert "50" in over["error"]["message"]
+
+    negative = _run(ctx, "search_messages", query="budget", offset=-1)
+    assert negative["ok"] is False and negative["error"]["code"] == "validation"
+
+    thread_over = _run(ctx, "get_thread", id="m1", limit=5000)
+    assert thread_over["ok"] is False and thread_over["error"]["code"] == "validation"
+
+    # in-range arguments still work
+    assert _run(ctx, "search_messages", query="budget", limit=50, offset=0)["ok"]
+
+
+def test_validation_rejects_unknown_arguments_before_forwarding(db):
+    """A proxied tool is validated too, so ewsd never sees junk arguments."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon, ews_capability_tier="full")
+    res = _run(ctx, "create_draft", subject="hi", nonsense=1)
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert daemon.calls == []

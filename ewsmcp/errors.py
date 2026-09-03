@@ -43,10 +43,6 @@ class ToolError(Exception):
             err["retry_after_s"] = self.retry_after_s
         return {"ok": False, "error": err}
 
-    @property
-    def http_status(self) -> int:
-        return HTTP_BY_CODE[self.code]
-
 
 def map_exception(exc: Exception) -> ToolError:
     """Classify an arbitrary upstream/library exception."""

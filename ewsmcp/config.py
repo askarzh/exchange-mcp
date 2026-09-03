@@ -40,10 +40,11 @@ class Settings(BaseSettings):
     ewsd_url: str = "http://127.0.0.1:8790"
 
     # --- Mirror sync (daemon) ---------------------------------------------------
-    ews_cache_folders: str = "inbox,sent"
+    # Every mail folder is mirrored in full. These well-known keys are not:
+    # drafts churn, junk/trash are noise, outbox is transient.
+    ews_mirror_exclude: str = "drafts,junk,trash,outbox"
     ews_cache_sync_seconds: int = 45
     ews_cache_hierarchy_seconds: int = 600
-    ews_cache_window_days: int = 365
 
     # --- Reliability --------------------------------------------------------
     ews_warmup_max_backoff_seconds: int = 300

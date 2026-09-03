@@ -13,11 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
-from conftest import make_settings
+from conftest import FakeGateway, make_context
 
 from ewsmcp import __version__
-from ewsmcp.audit import AuditLog
-from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import calendar_people
 from ewsmcp.tools.base import Context, dispatch
 from ewsmcp.tools.calendar_people import merge_busy_and_find_slots
@@ -26,22 +24,9 @@ TZ = ZoneInfo("Asia/Riyadh")
 SPEC = {s.name: s for s in calendar_people.TOOLS}
 
 
-class _FakeGateway:
-    def __init__(self, account):
-        self.account = account
-
-    async def call(self, fn):
-        return fn(self.account)
-
-
 def _ctx(tmp_path, db, account, **settings_overrides) -> Context:
-    return Context(
-        settings=make_settings(**settings_overrides),
-        gateway=_FakeGateway(account),
-        manager=None,
-        aliaser=IdAliaser(db),
-        audit=AuditLog(str(tmp_path / "data")),
-    )
+    return make_context(db, gateway=FakeGateway(account), cache=False,
+                        audit_dir=str(tmp_path / "data"), **settings_overrides)
 
 
 def _run(ctx, name, args=None):
