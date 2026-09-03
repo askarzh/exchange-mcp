@@ -72,19 +72,6 @@ def _tokens(query: str | None) -> list[str]:
     return [t for t in _TOKEN_RE.findall((query or "").lower()) if t]
 
 
-def prefix_tsquery(query: str) -> str:
-    """Rough, Python-only PREVIEW of the shape ``_TSQUERY`` builds
-    server-side — every word becomes a prefix term, terms are ANDed. It does
-    NOT fold accents and does NOT re-lex a token that unaccent might split
-    into more than one lexeme (both happen only in SQL, in ``_TSQUERY`` —
-    see its docstring); it is not what actually runs against Postgres, and
-    its output must never be interpolated into a real query. `search_messages`
-    does not call it — it exists as a small, stable interface for a caller
-    that just wants to know whether `query` is searchable at all (a
-    non-empty result). Returns "" when nothing is searchable."""
-    return " & ".join(f"{t}:*" for t in _tokens(query))
-
-
 _UPSERT_MESSAGE = """
 INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id, sender_name,
     sender_email, to_json, subject, date_ts, date_iso, is_read, has_attachments,

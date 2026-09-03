@@ -17,6 +17,10 @@ REMOVED = [
     ("ewsmcp.tools.mail_read", "_row_card"),
     ("ewsmcp.tools.mail_read", "_row_full"),
     ("ewsmcp.ids", "NullAliaser"),
+    # unused Python-side preview of the SQL-built tsquery (final review)
+    ("ewsmcp.cache.store", "prefix_tsquery"),
+    # no callers: search_messages resolves one folder, never a whole list
+    ("ewsmcp.tools.cache_reads", "mirrored_folder_ids"),
 ]
 
 

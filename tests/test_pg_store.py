@@ -262,13 +262,6 @@ def test_search_underscore_token_group_stays_anded_with_the_next_token(store):
     assert total == 1 and rows[0]["ews_id"] == "BOTH"
 
 
-def test_prefix_tsquery_builds_an_and_of_prefixes():
-    from ewsmcp.cache.store import prefix_tsquery
-    assert prefix_tsquery("Budget Review") == "budget:* & review:*"
-    assert prefix_tsquery("  ") == ""
-    assert prefix_tsquery(None) == ""
-
-
 def test_text_query_combines_with_structured_filters(store, seeded_folders):
     now = int(time.time())
     store.upsert_messages([
