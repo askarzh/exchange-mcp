@@ -185,8 +185,9 @@ send_draft(draft_id="d1", confirm_token="…")
 warming), `GET /health` (tool count), `GET /version`. `ewsd`: `GET
 /livez`, `GET /readyz` (Exchange connection state), `GET /v1/status`,
 `GET /metrics` (Prometheus, bearer-authenticated). `get_server_status`
-tool (connection, tier, kill-switch, sync watermarks — works while cold
-and over stdio too, since `ewsmcp` proxies it). Audit chain:
+tool (answered by `ewsmcp` — tier, alias stats, cache stats, plus
+`ewsd`'s own status merged in, or `daemon.reachable: false` if `ewsd` is
+down — works while cold and over stdio too). Audit chain:
 `python scripts/verify_audit_chain.py $DATA_DIR/audit` (run against
 `ewsd`'s `DATA_DIR`).
 
