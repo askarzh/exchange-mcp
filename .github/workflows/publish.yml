@@ -1,0 +1,46 @@
+# Publish the exchange-mcp image to GHCR on v5.* tags — gated on the FULL
+# test workflow (no continue-on-error anywhere). NEVER tags :latest —
+# promotion of :latest is a deliberate manual act after the canary ladder
+# completes.
+name: publish
+
+on:
+  push:
+    tags: ["v5.*"]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  publish:
+    needs: tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve tags
+        id: tags
+        run: |
+          REF="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            REF="v5-manual-${GITHUB_SHA::8}"
+          fi
+          echo "exact=ghcr.io/askarzh/exchange-mcp:${REF}" >> "$GITHUB_OUTPUT"
+          echo "line=ghcr.io/askarzh/exchange-mcp:v5" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          # The exact tag is what the NAS canary pins; :v5 tracks the line.
+          tags: |
+            ${{ steps.tags.outputs.exact }}
+            ${{ steps.tags.outputs.line }}

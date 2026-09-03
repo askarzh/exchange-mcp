@@ -1,17 +1,23 @@
-# ews-mcp 5.0 — Exchange (EWS) as a safe, fast MCP tool surface
+# exchange-mcp — Exchange (EWS) as a safe, fast MCP tool surface
 
-Two processes, one Postgres database: `ewsd` owns the Exchange session,
-the sync mirror, uploads, the audit chain, and every safety gate;
-`ewsmcp` is a thin MCP server that reads Postgres directly for fast
-lookups and forwards everything else to `ewsd`. **31 tools**, alias-only
-ids, token-lean DTOs, a Postgres mirror with full-text search, and a
-two-phase confirm flow that makes autonomous sending tamper-evident.
+A Postgres-backed, two-process Exchange server: `ewsd` owns the Exchange
+session, the sync mirror, uploads, the audit chain, and every safety
+gate; `ewsmcp` is a thin MCP server that reads Postgres directly for
+fast lookups and forwards everything else to `ewsd`. **31 tools**,
+alias-only ids, token-lean DTOs, a Postgres mirror with full-text
+search, and a two-phase confirm flow that makes autonomous sending
+tamper-evident. This is a personal fork-off of
+[`azizmazrou/ews-mcp`](https://github.com/azizmazrou/ews-mcp) 4.5,
+released under the same MIT license.
 
-> The `v5/` directory name is an internal path; the release line is
-> **5.0.x** (pre-release, `5.0.0a1`). Architecture: [DESIGN.md](DESIGN.md).
-> Full API reference: [docs/API.md](docs/API.md).
+> The release line is **5.0.x** (pre-release, `5.0.0a1`). Architecture:
+> [DESIGN.md](DESIGN.md). Full API reference: [docs/API.md](docs/API.md).
 
 ## Quick start
+
+```bash
+git clone https://github.com/askarzh/exchange-mcp && cd exchange-mcp
+```
 
 **1. Postgres.** Either point at one you already run, or bring up the
 dev stack's `postgres` service:
@@ -29,7 +35,7 @@ both processes below.
 engine, uploads, audit log and the entire gate chain:
 
 ```bash
-pip install ./v5
+pip install .
 EWS_SERVER_URL="https://mail.example.com/EWS/Exchange.asmx" \
 EWS_EMAIL="user@example.com" EWS_USERNAME="user" EWS_PASSWORD="…" \
 DATABASE_URL="postgresql://ews:change-me@127.0.0.1:5432/ews" \
@@ -211,3 +217,7 @@ python scripts/dump_tool_table.py --check   # docs vs registry drift gate
 this tool surface (morning overview → triage → reply-draft with the
 two-phase confirm). It is deliberately generic — judgment lives in the
 calling assistant, the server stays a data plane.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

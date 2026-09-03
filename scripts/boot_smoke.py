@@ -15,7 +15,7 @@ daemon and database. Asserts:
 - ewsmcp's `/mcp` (Streamable HTTP, stateless) answers `initialize` and
   `tools/list`; tier=full lists 31 tools
 
-Run from v5/:  python scripts/boot_smoke.py [draft|full]
+Run from the repo root:  python scripts/boot_smoke.py [draft|full]
 """
 import json
 import os

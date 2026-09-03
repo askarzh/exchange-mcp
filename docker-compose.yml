@@ -1,4 +1,4 @@
-# ews-mcp 5.0 dev stack: Postgres (pgvector-ready for Phase 2) + ewsd + ewsmcp.
+# exchange-mcp dev stack: Postgres (pgvector-ready for Phase 2) + ewsd + ewsmcp.
 # Copy .env.example to .env first. Production lives in the operator's own stack.
 services:
   postgres:
@@ -18,7 +18,7 @@ services:
 
   ewsd:
     build: .
-    image: ews-mcp:dev
+    image: exchange-mcp:dev
     restart: unless-stopped
     command: ["ewsd"]
     env_file: .env
@@ -41,7 +41,7 @@ services:
       retries: 3
 
   ewsmcp:
-    image: ews-mcp:dev
+    image: exchange-mcp:dev
     restart: unless-stopped
     command: ["ewsmcp"]
     env_file: .env
