@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 ewsmcp = "ewsmcp.main:main"
+ewsd = "ewsmcp.daemon:main"
 
 [tool.setuptools.packages.find]
 include = ["ewsmcp*"]

@@ -3,16 +3,16 @@
 import hmac
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 import jsonschema
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
-from . import __version__
-from . import uploads
+from . import __version__, uploads
 from .errors import HTTP_BY_CODE
 from .server import build_context, build_mcp_server, start_connection_manager
 from .tools.base import dispatch
+from .tools.calendar_people import _get_server_status
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def _authorized(headers, api_key: str) -> bool:
     return False
 
 
-async def _send_json(send, status: int, payload: Dict[str, Any]) -> None:
+async def _send_json(send, status: int, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, ensure_ascii=False, default=str).encode()
     await send({"type": "http.response.start", "status": status, "headers": [
         [b"content-type", b"application/json"],
@@ -95,7 +95,7 @@ def _metrics_text(ctx) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _openapi(ctx) -> Dict[str, Any]:
+def _openapi(ctx) -> dict[str, Any]:
     paths = {}
     for name, spec in ctx.registry.items():
         schema = spec.public_schema()
@@ -110,7 +110,7 @@ def _openapi(ctx) -> Dict[str, Any]:
             "paths": paths}
 
 
-async def _read_json_body(receive, send) -> Optional[Any]:
+async def _read_json_body(receive, send) -> Any | None:
     """Drain the request body (bounded) and parse JSON.
 
     Returns the parsed value, or None after having already sent an error
@@ -142,9 +142,17 @@ async def _read_json_body(receive, send) -> Optional[Any]:
         return None
 
 
-def build_app(ctx, settings, streamable: Optional[Any] = None):
-    """ASGI app closure — separated from serve_http so tests can drive it."""
-    api_key = settings.mcp_api_key or ""
+def build_app(ctx, settings, streamable: Any | None = None, *,
+             mount_mcp: bool = True, tools_prefix: str = "/api/tools",
+             api_key: str | None = None):
+    """ASGI app closure — separated from serve_http so tests can drive it.
+
+    ``mount_mcp`` and ``tools_prefix`` let the daemon (ewsd) reuse this same
+    closure without the Streamable HTTP MCP transport and under a `/v1/tools`
+    prefix; ``api_key`` overrides `settings.mcp_api_key` when given (the
+    daemon uses `settings.ewsd_api_key`).
+    """
+    key = (settings.mcp_api_key if api_key is None else api_key) or ""
 
     async def app(scope, receive, send):
         if scope["type"] == "lifespan":
@@ -198,11 +206,14 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
                     "code": "not_found", "message": "not found"}})
             return await _send_json(send, 200, {"ok": True, **out})
 
-        if api_key and not _authorized(scope.get("headers"), api_key):
+        if key and not _authorized(scope.get("headers"), key):
             return await _send_json(send, 401, {"ok": False, "error": {
                 "code": "auth_failed", "message": "missing or invalid bearer token"}})
 
-        if path == "/mcp":
+        if path == "/v1/status" and method == "GET":
+            return await _send_json(send, 200, await _get_server_status(ctx))
+
+        if path == "/mcp" and mount_mcp:
             if streamable is None:
                 return await _send_json(send, 503, {"ok": False, "error": {
                     "code": "upstream_unavailable",
@@ -217,14 +228,15 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
             return await send({"type": "http.response.body", "body": body})
         if path == "/openapi.json" and method == "GET":
             return await _send_json(send, 200, _openapi(ctx))
-        if path == "/api/tools" and method == "GET":
+        if path == tools_prefix and method == "GET":
             return await _send_json(send, 200, {"tools": [
                 {"name": s.name, "class": s.side_effect_class,
-                 "description": s.description[:140]}
+                 "description": s.description[:140],
+                 "inputSchema": s.public_schema()["inputSchema"]}
                 for s in ctx.registry.values()
             ]})
-        if path.startswith("/api/tools/") and method == "POST":
-            name = path.removeprefix("/api/tools/")
+        if path.startswith(tools_prefix + "/") and method == "POST":
+            name = path.removeprefix(tools_prefix + "/")
             spec = ctx.registry.get(name)
             if spec is None:
                 return await _send_json(send, 404, {"ok": False, "error": {
