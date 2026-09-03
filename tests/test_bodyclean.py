@@ -35,24 +35,6 @@ EN_OUTLOOK_KEPT = (
     "before Thursday's meeting."
 )
 
-AR_OUTLOOK = (
-    "وعليكم السلام،\n"
-    "\n"
-    "تم استلام التقرير وسنوافيكم بالملاحظات قبل نهاية الأسبوع.\n"
-    "\n"
-    "من: أحمد المثال <ahmed@example.com>\n"
-    "تاريخ الإرسال: الأحد 31 مايو 2026 2:10 م\n"
-    "إلى: عمر المثال\n"
-    "الموضوع: التقرير الربعي\n"
-    "\n"
-    "نص قديم.\n"
-)
-AR_OUTLOOK_KEPT = (
-    "وعليكم السلام،\n"
-    "\n"
-    "تم استلام التقرير وسنوافيكم بالملاحظات قبل نهاية الأسبوع."
-)
-
 GMAIL_EN = (
     "Sounds good — see you at 10.\n"
     "I will bring the printed deck.\n"
@@ -63,34 +45,6 @@ GMAIL_EN = (
 )
 GMAIL_EN_KEPT = "Sounds good — see you at 10.\nI will bring the printed deck."
 
-GMAIL_AR = (
-    "تمام، أراك غداً إن شاء الله.\n"
-    "سأرسل جدول الأعمال قبل الاجتماع.\n"
-    "\n"
-    "في الأحد، 31 مايو 2026 في 9:14 ص، كتب أحمد المثال <ahmed@example.com>:\n"
-    "النص السابق هنا.\n"
-)
-GMAIL_AR_KEPT = "تمام، أراك غداً إن شاء الله.\nسأرسل جدول الأعمال قبل الاجتماع."
-
-MIXED_AR_EN = (
-    "Dear Ahmed,\n"
-    "\n"
-    "نوافق على المقترح بصيغته الحالية.\n"
-    "We will sign tomorrow.\n"
-    "\n"
-    "-----Original Message-----\n"
-    "From: Procurement <procure@example.com>\n"
-    "Sent: Sunday, May 31, 2026 1:00 PM\n"
-    "\n"
-    "Old content.\n"
-)
-MIXED_AR_EN_KEPT = (
-    "Dear Ahmed,\n"
-    "\n"
-    "نوافق على المقترح بصيغته الحالية.\n"
-    "We will sign tomorrow."
-)
-
 QUOTED_RUN = (
     "Thanks for the update.\n"
     "Looks good to me.\n"
@@ -100,17 +54,6 @@ QUOTED_RUN = (
     "> Rollback plan was not needed.\n"
 )
 QUOTED_RUN_KEPT = "Thanks for the update.\nLooks good to me."
-
-# Quoted Arabic Outlook header with RTL marks (U+200F) — must still cut.
-BIDI_QUOTED = (
-    "شكراً جزيلاً.\n"
-    "سيتم التنفيذ كما تفضلتم.\n"
-    "\n"
-    "> ‏من: سارة <sara@example.com>\n"
-    "> ‏التاريخ: 31 مايو 2026\n"
-    "> الموضوع: العرض\n"
-)
-BIDI_QUOTED_KEPT = "شكراً جزيلاً.\nسيتم التنفيذ كما تفضلتم."
 
 # Body that STARTS with a From:/Sent:-looking pair — must NOT be cut.
 FROM_START = (
@@ -141,25 +84,6 @@ SIG_EN = (
     "Director, Legal\n"
 )
 SIG_EN_KEPT = "The contract is signed and archived.\nFinance has been notified."
-
-SIG_AR = (
-    "تم اعتماد المسودة النهائية.\n"
-    "سيتم الرفع للإدارة غداً صباحاً.\n"
-    "\n"
-    "تحياتي\n"
-    "عمر\n"
-)
-SIG_AR_KEPT = "تم اعتماد المسودة النهائية.\nسيتم الرفع للإدارة غداً صباحاً."
-
-SIG_AR_FORMAL = (
-    "نشكر لكم تعاونكم المستمر.\n"
-    "تم رفع المحضر للاعتماد.\n"
-    "\n"
-    "وتفضلوا بقبول فائق الاحترام والتقدير،\n"
-    "عمر المثال\n"
-    "مدير إدارة البيانات\n"
-)
-SIG_AR_FORMAL_KEPT = "نشكر لكم تعاونكم المستمر.\nتم رفع المحضر للاعتماد."
 
 SIG_DELIM = (
     "Numbers confirmed.\n"
@@ -219,32 +143,12 @@ def test_outlook_en_chain_cut_at_from_sent_pair():
     assert strip_quoted_history(EN_OUTLOOK) == (EN_OUTLOOK_KEPT, 1)
 
 
-def test_outlook_ar_chain_cut_at_arabic_header():
-    assert strip_quoted_history(AR_OUTLOOK) == (AR_OUTLOOK_KEPT, 1)
-
-
 def test_gmail_en_attribution_cut():
     assert strip_quoted_history(GMAIL_EN) == (GMAIL_EN_KEPT, 1)
 
 
-def test_gmail_ar_attribution_cut():
-    assert strip_quoted_history(GMAIL_AR) == (GMAIL_AR_KEPT, 1)
-
-
-def test_mixed_ar_en_original_message_counts_inner_header_too():
-    # "-----Original Message-----" plus the From:/Sent: pair inside the
-    # stripped tail -> 2 markers counted.
-    assert strip_quoted_history(MIXED_AR_EN) == (MIXED_AR_EN_KEPT, 2)
-
-
 def test_quoted_run_of_three_lines_cut_as_one_block():
     assert strip_quoted_history(QUOTED_RUN) == (QUOTED_RUN_KEPT, 1)
-
-
-def test_bidi_marks_and_quote_prefix_tolerated():
-    # The quoted Arabic header is both a '>' run and a من/التاريخ pair —
-    # absorbed into a single counted block.
-    assert strip_quoted_history(BIDI_QUOTED) == (BIDI_QUOTED_KEPT, 1)
 
 
 def test_body_starting_with_from_like_line_survives():
@@ -275,6 +179,25 @@ def test_strip_quoted_history_empty_inputs():
     assert strip_quoted_history(None) == ("", 0)
 
 
+def test_arabic_markers_are_no_longer_special_cased():
+    """Phase 1.5: bodyclean is English-only. An Arabic Outlook header is
+    just text now — the body survives whole."""
+    text = (
+        "شكراً جزيلاً.\n"
+        "\n"
+        "من: سارة <sara@example.com>\n"
+        "التاريخ: 31 مايو 2026\n"
+    )
+    assert strip_quoted_history(text) == (text.rstrip(), 0)
+
+
+def test_english_markers_still_cut_with_bidi_characters_present():
+    """A stray RLM no longer gets scrubbed, so a marker carrying one is
+    simply not a marker. The plain English marker still cuts."""
+    text = "Noted.\n\nFrom: A <a@b.example>\nSent: Monday\n\nOld."
+    assert strip_quoted_history(text) == ("Noted.", 1)
+
+
 # ---------------------------------------------------------------------------
 # strip_signature
 # ---------------------------------------------------------------------------
@@ -283,12 +206,9 @@ def test_signature_en_closer_block_stripped():
     assert strip_signature(SIG_EN) == SIG_EN_KEPT
 
 
-def test_signature_ar_short_closer_stripped():
-    assert strip_signature(SIG_AR) == SIG_AR_KEPT
-
-
-def test_signature_ar_formal_closer_stripped():
-    assert strip_signature(SIG_AR_FORMAL) == SIG_AR_FORMAL_KEPT
+def test_arabic_closer_is_not_a_signature():
+    text = "تم اعتماد المسودة النهائية.\nسيتم الرفع للإدارة غداً صباحاً.\n\nمع التحية\nسارة"
+    assert strip_signature(text) == text
 
 
 def test_signature_dash_dash_delimiter_stripped():
@@ -381,7 +301,7 @@ def test_clean_body_empty_and_none():
 # html_to_text
 # ---------------------------------------------------------------------------
 
-def test_html_to_text_table_links_and_arabic():
+def test_html_to_text_table_links_and_non_latin():
     out = html_to_text(HTML_DOC)
     nonempty = [ln for ln in out.split("\n") if ln]
     assert nonempty == [
