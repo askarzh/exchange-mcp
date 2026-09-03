@@ -1,7 +1,8 @@
-# Design — ews-mcp v5 (release line 4.5.x)
+# Design — ews-mcp v5 (release line 5.0.x)
 
 The architecture the code enforces. Module docstrings cite the sections
-below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Cache).
+below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Store,
+§Processes).
 
 ## The law
 
@@ -9,17 +10,25 @@ below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Cach
    safety gates. Judgment — summaries, briefings, prioritization,
    commitments, voice — belongs to the CALLING assistant. The server never
    makes an LLM call and never ships a "judgment tool". Tool count stays
-   lean (≤ 29) and is generated into the docs, never hand-counted.
-2. **Indexing = SQLite + FTS5 in core.** The optional semantic tier hides
-   behind an adapter (`EWS_SEMANTIC_INDEX=none|pgvector`, default `none`);
-   the public server runs with zero dependencies beyond Exchange
-   credentials.
+   lean and is generated into the docs, never hand-counted.
+2. **Storage = Postgres in core.** One `ews` schema holds the mirror,
+   aliases and (Phase 2) the archive. Full-text search is a generated
+   `tsvector` column over `norm_text`, indexed GIN, queried with Postgres'
+   `simple` text-search config (no stemming, no stopwords); accent/diacritic
+   folding happens in Python (`ewsmcp/normalize.py`, NFKD-decompose + drop
+   combining marks) before the text ever reaches Postgres, so index and
+   query side always agree. No `unaccent` extension, no SQLite, no FTS5.
 3. **Reads are cache-first with provenance** (`source`, `as_of`,
    `fresh:true` escape hatch); **writes go straight to EWS** and then
    write-through to the mirror.
-4. **Safety gates live ONLY in the dispatcher** (`tools/base.py`).
-   Handlers declare `side_effect_class` and `confirm`; they contain no
-   policy.
+4. **Safety gates live ONLY in `ewsd`** (`tools/base.py`'s dispatcher,
+   used exclusively by the daemon process): kill-switch, tier, circuit,
+   recipient guard, two-phase confirm and the send rate cap all run there.
+   `ewsmcp`'s dispatcher (`mcp/dispatch.py`) does alias resolution for its
+   local reads and otherwise forwards verbatim — it applies no gates of
+   its own beyond filtering its tool registry down to the configured tier
+   (an above-tier tool is simply absent, not refused). Handlers declare
+   `side_effect_class` and `confirm`; they contain no policy.
 5. **Never pin `auth_type`.** Only exchangelib auto-negotiation works
    against the target Exchange (verified live). All exchangelib imports
    are module-top; every kwarg-bearing call has a signature pin.
@@ -28,9 +37,40 @@ below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Cach
    tracked file, comment, commit message, or doc. Fixtures use
    example.com and neutral wording.
 
+## §Processes — ewsd + ewsmcp
+
+Two processes share one Postgres database.
+
+- **`ewsd`, the daemon.** One instance, always on. Owns the only Exchange
+  session (gateway, connection manager), the `SyncEngine` that keeps the
+  mirror warm, capability-URL uploads, the hash-chained audit log, and the
+  entire gate chain (§Safety). Exposes an authenticated HTTP API on
+  `EWSD_HOST:EWSD_PORT` (default `127.0.0.1:8790`) behind `EWSD_API_KEY`:
+  `GET /v1/tools`, `POST /v1/tools/<name>`, `GET /v1/status`,
+  `/upload/<token>`, `/livez`, `/readyz`, `/metrics`, `/openapi.json`.
+- **`ewsmcp`, the thin MCP.** Any number of instances. Reads Postgres
+  directly for `list_folders`, `search_messages`, `get_message`,
+  `get_thread`, `get_mailbox_overview`, `list_tasks`, `waiting_on`, and
+  `get_server_status`. Every other tool, and any read called with
+  `fresh=true`, is forwarded to `ewsd` verbatim (`confirm_token` included)
+  over `EWSD_URL`. Serves stdio or Streamable HTTP `/mcp` plus `/livez`,
+  `/readyz`, `/health`, `/version`, behind `MCP_API_KEY` in HTTP mode.
+  Does not import exchangelib.
+- **Why the gate chain lives in one process.** Kill-switch, tier,
+  recipient guard, confirm tokens and the send rate cap all depend on
+  state that must be process-local and singular to mean anything: the
+  in-memory rate-cap window, the HMAC confirm-token secret and its
+  single-use bookkeeping, and the audit chain's hash head all need exactly
+  one writer. Running the chain in `ewsd` — the one process that also
+  owns the Exchange session — means there is one rate window, one set of
+  live confirm tokens, and one unbroken audit chain, no matter how many
+  `ewsmcp` instances are talking to it.
+
 ## §Tools — the surface
 
-Four packs (see the generated table in `docs/API.md`):
+31 tools in the default (`full`-tier) registry; 26 register at `draft`
+tier and 15 at `read` tier (see the generated table in `docs/API.md`).
+Four packs:
 
 - **mail-read** (6): `list_folders`, `search_messages`, `get_message`,
   `get_thread`, `get_attachment`, `get_mailbox_overview`.
@@ -38,22 +78,35 @@ Four packs (see the generated table in `docs/API.md`):
   `check_availability`, `find_people`, `get_contact`, `get_oof_settings`,
   `get_server_status`.
 - **tasks / waiting-on** (3): `list_tasks`, `update_task`, `waiting_on`.
-- **writes** (12): draft lifecycle (`create_draft`, `update_draft`,
-  `delete_draft`, `send_draft`), bulk ops (`update_messages`,
+- **writes** (15): draft lifecycle (`create_draft`, `update_draft`,
+  `delete_draft`, `send_draft`), attachments (`create_upload_link`,
+  `add_attachment`, `delete_attachment`), bulk ops (`update_messages`,
   `move_messages`, `delete_messages`), calendar writes (`create_event`,
   `update_event`, `respond_to_event`, `cancel_event`), `set_oof`.
-- **semantic** (+1, only when enabled): `find_similar`.
+
+`find_similar` and `search_messages`' `mode="semantic"` are Phase 2 work
+(see the design spec) — the tool is unregistered and the mode is a
+validation error until embeddings land.
 
 Every list-shaped result ships exactly the canonical envelope
 `{items, count, total_available, next_offset}` (contract-tested).
 
-## §Safety — one gate chain
+## §Safety — one gate chain, one process
 
 Dispatch order (policy precedes connectivity; nothing irreversible
 without two model decisions):
 
     kill-switch → tier → circuit → cold gate → recipient guard →
     two-phase confirm → send rate cap → alias resolution → handler → audit
+
+This entire chain runs inside `ewsd` and only `ewsd` — every write call
+(`create_draft`, `send_draft`, `delete_messages`, …) that `ewsmcp`
+receives is forwarded to `ewsd`'s `POST /v1/tools/<name>` with the
+arguments (and `confirm_token`, when present) passed through unchanged;
+`ewsmcp` itself makes no policy decision beyond which tools it exposes at
+its configured tier. `ewsmcp` never mints or verifies a confirm token —
+`send_draft`'s phase-1 preview and phase-2 verification both happen in
+`ewsd`.
 
 - **Kill-switch** `SEND_ENABLED=false` (default) refuses every send-class
   call before anything else.
@@ -78,10 +131,14 @@ without two model decisions):
 
 The model never sees a raw EWS id: outputs carry short aliases (`m12`,
 `e3`, `d1`, `t4`, `p2`, `k1`, `f7`), inputs accept aliases or raw ids.
-The SQLite-backed aliaser survives restarts, rebinds on moves, and keeps
-`internet_message_id` as a secondary key. Stale alias → clean re-search
-hint, never an upstream error. Page-sized mints batch into one
-transaction and run off the event loop.
+The Postgres-backed aliaser (`ews.aliases`) survives restarts, rebinds on
+moves, and keeps `internet_message_id` as a secondary key. Stale alias →
+clean re-search hint, never an upstream error. Page-sized mints batch
+into one transaction. Because there is no data migration from the 4.5
+SQLite line, every 5.0 deployment starts with an empty alias table and
+re-mints ids from scratch — old `m12`-style ids from a 4.5 mailbox do not
+resolve; a client hitting one gets the stale-alias hint once, then a
+fresh id from its next search.
 
 ## §DTOs — token economy
 
@@ -91,26 +148,32 @@ signature stripping) + attachment inventory. Raw HTML only on explicit
 `include_html=true`. The measured pathology this kills: one v3 detail
 call shipped 115,457 chars for a ~150-char message.
 
-## §Cache — the mirror (see `cache/`)
+## §Store — the mirror (Postgres, schema `ews`)
 
-- `store.py`: per-mailbox SQLite (WAL, owner-only, absolute non-synced
-  `DATA_DIR`); messages with bodies cleaned ONCE at sync time; FTS5
-  external-content index over a normalized shadow text; events, tasks,
-  folders, sync tokens; per-sender learned-signature table. SINGLE
-  WRITER; tools read via `mode=ro` connections.
-- `normalize.py`: ONE `normalize_ar()` for index and query — diacritics/
-  tatweel stripped, alef/hamza-carrier/teh-marbuta/alef-maqsura folded,
-  bidi marks removed, Arabic-Indic digits folded. This is what makes
-  "الاحاطه" find "تمت الإحاطة".
-- `sync.py`: background engine started on the first warm connection;
+- `db.py` / `migrations/`: one Postgres database, schema `ews`, numbered
+  SQL migrations applied by `ewsd` at startup and version-checked by
+  `ewsmcp` (refuses to start against an older schema than it expects).
+  `messages`, `events`, `tasks`, `folders`, `sync_state`, `aliases`,
+  `sender_sigs` — the durable mirror both processes read.
+- Full-text search: each message row carries `norm_text` (see
+  `normalize.py` below) and a generated, stored `search_tsv` column
+  (`to_tsvector('simple', norm_text)`) with a GIN index
+  (`ix_msg_tsv`). `search_messages` queries it with Postgres' `simple`
+  config — no stemming, no `unaccent` extension.
+- `normalize.py`: ONE `normalize_text()` for both index and query side —
+  NFKD-decompose, drop combining marks (é→e, ё→е), lowercase. This is
+  Python-side accent folding, not a database extension, so index and
+  query always agree without an extra dependency in Postgres itself.
+- **Watermarks decide what is mirrored.** `ewsd`'s `SyncEngine` runs
   resumable `SyncFolderItems` deltas every `EWS_CACHE_SYNC_SECONDS` (45)
-  for `EWS_CACHE_FOLDERS` (inbox,sent); a slow lane every ~10 min
-  refreshes the folder tree (honest unread/total counts), the expanded
-  14-day calendar window and the tasks folder. Failures degrade — reads
-  fall back to live EWS, the server never gates on the mirror.
-- Provenance contract: every read is stamped `source: cache|live`
-  (+ `as_of` for cache); `fresh:true` forces live. `EWS_CACHE_ENABLED=
-  false` = pure EWS reads, fully functional.
+  for `EWS_CACHE_FOLDERS` (inbox,sent), and a slow lane every
+  `EWS_CACHE_HIERARCHY_SECONDS` (600) refreshes the folder tree (honest
+  unread/total counts), the calendar window, and the tasks folder.
+  Failures degrade — `ewsmcp` reads fall back to `ewsd`'s live route
+  (`fresh=true`), the server never gates on the mirror.
+- Provenance contract: every read is stamped `source: cache|live` (+
+  `as_of` for cache); `fresh=true` is forwarded by `ewsmcp` to `ewsd`
+  verbatim, bypassing the mirror.
 
 ## §Errors — a taxonomy, not tracebacks
 
@@ -122,14 +185,18 @@ LLM-directed `hint` and `retry_after_s` where meaningful. Handler
 
 ## §Transports
 
-stdio MCP, Streamable HTTP `/mcp`, a REST shim `/api/tools/<name>`
-(jsonschema-validated against the public tool schema, 1 MiB body cap),
-`/openapi.json`, public health (`/livez`, `/readyz`, `/health`,
-`/version`) and `/metrics` (Prometheus, behind the API key).
-**Never-exit boot**: tools register and transports bind before any
-Exchange contact; a background warmup loop owns connection recovery
-(exponential backoff + jitter, protocol-cache eviction every 3 failures,
-heartbeat re-probe with a REAL network round trip).
+`ewsmcp`: stdio (default) or Streamable HTTP `/mcp`, plus public health
+`/livez`, `/readyz`, `/health`, `/version` (`MCP_API_KEY` guards `/mcp`
+in HTTP mode). `ewsd`: HTTP only — `GET /v1/tools`,
+`POST /v1/tools/<name>` (jsonschema-validated against the public tool
+schema, 1 MiB body cap), `GET /v1/status`, `/upload/<token>`, `/livez`,
+`/readyz`, `/metrics` (Prometheus) and `/openapi.json`, all behind
+`EWSD_API_KEY` except the public health paths.
+**Never-exit boot** (both processes): tools/routes register and
+transports bind before any Exchange contact; in `ewsd` a background
+warmup loop owns connection recovery (exponential backoff + jitter,
+protocol-cache eviction every 3 failures, heartbeat re-probe with a REAL
+network round trip).
 
 ## §Audit
 
@@ -147,4 +214,16 @@ link and catches edits, deletions and truncation.
 - AST sentinel: no exchangelib imports inside function bodies, no
   exemptions.
 - Envelope contract test; north-star budget test (≤2 calls, <2k tokens);
-  Arabic-search gate suite.
+  `test_docs_match_registry.py` fails CI when `docs/API.md` drifts from
+  the registry.
+
+## Phase 2 (not yet built)
+
+A durable, attachment-inclusive mail archive with a safe path to
+deletion (capture → verify → delete workers in `ewsd`), plus
+Gemini-embedding-backed semantic search (`find_similar`,
+`search_messages(mode="semantic")`). Authoritative design:
+`docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`.
+Everything in this document describes what is built now (Phase 1): the
+Postgres store and the two-process split, with the archive tables and
+embedding pipeline not yet present.

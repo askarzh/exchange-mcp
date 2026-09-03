@@ -1,4 +1,4 @@
-# API reference — ews-mcp 4.5
+# API reference — ews-mcp 5.0
 
 The tool table below is **generated from the registry** by
 `scripts/dump_tool_table.py` (`--write` to refresh, `--check` in CI) —
@@ -458,16 +458,23 @@ when they would notify attendees) run in two phases:
 
 ## Cache freshness contract
 
-Reads served by the local mirror carry `source: "cache"` and `as_of`
-(the folder's last sync watermark; delta cadence
-`EWS_CACHE_SYNC_SECONDS`, default 45 s). `fresh: true` forces live.
-`get_server_status.cache` exposes per-folder watermarks, row counts, DB
-size and sync health. `mode: "semantic"` on `search_messages` (and the
-`find_similar` tool) exist only when `EWS_SEMANTIC_INDEX` is enabled.
+Reads answered by `ewsmcp` from the Postgres mirror carry
+`source: "cache"` and `as_of` (the folder's last sync watermark; delta
+cadence `EWS_CACHE_SYNC_SECONDS`, default 45 s). `fresh: true` is
+forwarded to `ewsd`'s live route and forces a fresh Exchange read.
+`get_server_status.cache` exposes per-folder watermarks, row counts and
+sync health. `mode: "semantic"` on `search_messages`, and the
+`find_similar` tool, are Phase 2 work — not registered in this build;
+`mode: "semantic"` returns a `validation` error until embeddings land
+(see `docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`
+at the repo root).
 
-## v3 → 4.5 tool rename map
+## v3 → 5.0 tool rename map
 
-| v3 (67-tool surface) | 4.5 |
+Unchanged from the 4.5 line — the 5.0 rewrite changed storage and
+process model, not tool names.
+
+| v3 (67-tool surface) | 5.0 |
 |---|---|
 | `read_emails` / `search_emails` / `advanced_search` | `search_messages` |
 | `get_email_details` | `get_message` |
@@ -495,9 +502,8 @@ size and sync health. `mode: "semantic"` on `search_messages` (and the
 | `delete_appointment` | `cancel_event` |
 | `get_tasks` | `list_tasks` |
 | `update_task` / `complete_task` | `update_task` |
-| — (new) | `get_mailbox_overview`, `waiting_on`, `find_similar`* |
-
-\* `find_similar` only with the semantic tier.
+| — (new) | `get_mailbox_overview`, `waiting_on` |
+| — (Phase 2, not yet built) | `find_similar` |
 
 ## Intentionally dropped vs v3
 
