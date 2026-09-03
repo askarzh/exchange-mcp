@@ -477,8 +477,8 @@ TOOLS: List[ToolSpec] = [
             },
             "sender": {
                 "type": "string",
-                "description": "Sender substring, matched client-side on the "
-                               "fetched page (email or display name).",
+                "description": "Sender substring, matched in the mirror "
+                               "against the sender's email or display name.",
             },
             "from_": {
                 "type": "string",

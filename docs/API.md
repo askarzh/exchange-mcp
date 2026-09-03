@@ -71,7 +71,7 @@ Search mail across the local mirror of the whole mailbox. `query` is full-text o
 |---|---|---|---|
 | `query` | string | no | Full-text query over subject, sender and cleaned body; combines freely with the structured filters below. |
 | `folder` | string | no | Restrict to one folder: wk alias (f:inbox, f:sent), folder alias (f7), path, or raw id. Omit to search EVERY mirrored folder. |
-| `sender` | string | no | Sender substring, matched client-side on the fetched page (email or display name). |
+| `sender` | string | no | Sender substring, matched in the mirror against the sender's email or display name. |
 | `from_` | string | no | DEPRECATED alias of `sender` — do not combine the two. |
 | `subject` | string | no | Subject substring. |
 | `since` | string | no | Window start: 'today', '+Nd', YYYY-MM-DD, or ISO datetime (server timezone). |
