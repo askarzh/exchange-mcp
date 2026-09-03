@@ -412,8 +412,10 @@ Every list-shaped tool ships exactly:
   listings) and `null` otherwise; `next_offset` is `null` when no further
   page exists (live paths prove it with a one-item lookahead, never a
   `count()` scan).
-- `source` is `cache` (with `as_of`) or `live`; pass `fresh: true` to any
-  cache-first tool to force a live read.
+- `source` is `cache` (with `as_of`) or `live`; `fresh: true` forces a
+  live read, but only on `get_message`, `list_folders` and
+  `get_mailbox_overview` — `search_messages` and `get_thread` are
+  store-only and do not accept it.
 
 ## Ids
 
@@ -461,9 +463,10 @@ when they would notify attendees) run in two phases:
 `search_messages` answers only from the Postgres mirror of the whole
 mailbox — there is no live search — and is stamped `source: "cache"` with
 `as_of` (the oldest watermark among the folders it searched; delta
-cadence `EWS_CACHE_SYNC_SECONDS`, default 45 s). `get_thread` reads the
-mirror and falls back to a live Exchange rebuild when the seed lives
-outside it (`source: "live"`). `fresh: true` is available on `get_message`
+cadence `EWS_CACHE_SYNC_SECONDS`, default 45 s). `get_thread` is
+store-only — mail is fully mirrored, so a message not in the mirror
+(excluded folder, or not yet synced) returns `not_found`; there is no
+live rebuild. `fresh: true` is available on `get_message`
 (attachment inventory, raw HTML), `list_folders` and
 `get_mailbox_overview` (live counts) and forwards to `ewsd`'s live route.
 `get_server_status.cache` exposes per-folder watermarks, row counts and

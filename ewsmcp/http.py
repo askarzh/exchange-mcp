@@ -1,4 +1,6 @@
-"""HTTP serving: Streamable HTTP /mcp + REST shim + health (DESIGN.md §Transports)."""
+"""ewsd's HTTP app: REST tool shim, capability-URL uploads, health and
+status (DESIGN.md §Transports). No /mcp here — that's ewsmcp/mcp/http.py,
+the only module that speaks MCP over Streamable HTTP."""
 
 import hmac
 import json

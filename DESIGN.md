@@ -179,9 +179,10 @@ call shipped 115,457 chars for a ~150-char message.
 
 `validation | auth_failed | tier_blocked | kill_switch |
 recipient_blocked | confirm_invalid | not_found | throttled | rate_capped
-| upstream_unavailable | upstream_error | internal` — each with an
-LLM-directed `hint` and `retry_after_s` where meaningful. Handler
-`TypeError`/`ValueError` map to `validation`, never 502.
+| upstream_unavailable | upstream_error | daemon_unavailable |
+backend_unavailable | internal` — each with an LLM-directed `hint` and
+`retry_after_s` where meaningful. Handler `TypeError`/`ValueError` map to
+`validation`, never 502.
 
 ## §Transports
 
