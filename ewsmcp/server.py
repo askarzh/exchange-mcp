@@ -7,10 +7,12 @@ from mcp.server import Server
 from mcp.types import Tool, ToolAnnotations
 
 from .audit import AuditLog
+from .cache import CacheStore
 from .config import Settings
+from .db import Database
 from .gateway.client import EWSGateway
 from .gateway.connection import ConnectionManager
-from .ids import NullAliaser, get_aliaser
+from .ids import IdAliaser
 from .tools import build_registry
 from .tools.base import Context, dispatch
 
@@ -35,43 +37,25 @@ class _NullAudit:
 
 def build_context(settings: Settings) -> Context:
     gateway = EWSGateway(settings)
-    # Aliaser/audit are quality-of-life layers — their storage failing
-    # (bad volume, permissions) degrades them to pass-through, never
-    # prevents boot: the never-exit contract covers local disks too.
-    try:
-        aliaser = get_aliaser(f"{settings.data_dir}/memory")
-    except Exception as exc:
-        logger.error("aliaser init failed (%s) — running with raw EWS ids", exc)
-        aliaser = NullAliaser()
+    db = Database(settings.database_url)
+    db.migrate()
+    aliaser = IdAliaser(db)
+    # Audit is a quality-of-life layer — its storage failing (bad volume,
+    # permissions) degrades it to pass-through, never prevents boot: the
+    # never-exit contract covers local disks too.
     try:
         audit = AuditLog(settings.data_dir)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - audit is best-effort, never blocks boot
         logger.error("audit init failed (%s) — audit disabled", exc)
         audit = _NullAudit()
-    cache = None
-    if settings.ews_cache_enabled:
-        try:
-            from .cache import CacheStore
-            cache = CacheStore(f"{settings.data_dir}/cache/mirror.db")
-            if settings.ews_cache_purge_on_boot:
-                cache.purge()
-        except Exception as exc:
-            logger.error("cache init failed (%s) — running pure-EWS reads", exc)
-            cache = None
-    semantic = None
-    try:
-        from .semantic import build_semantic_index
-        semantic = build_semantic_index(settings)
-    except Exception as exc:
-        logger.error("semantic index init failed (%s) — keyword-only", exc)
     ctx = Context(
         settings=settings,
         gateway=gateway,
         manager=None,
         aliaser=aliaser,
         audit=audit,
-        cache=cache,
-        semantic=semantic,
+        cache=CacheStore(db),
+        db=db,
     )
     build_registry(ctx)
     return ctx
@@ -92,10 +76,9 @@ async def start_connection_manager(ctx: Context) -> None:
         if ctx.cache is not None and ctx.sync is None:
             try:
                 from .cache import SyncEngine
-                ctx.sync = SyncEngine(ctx.settings, ctx.gateway, ctx.cache,
-                                      semantic=ctx.semantic)
+                ctx.sync = SyncEngine(ctx.settings, ctx.gateway, ctx.cache)
                 await ctx.sync.start()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - sync is best-effort; cache stays stale
                 logger.error("sync engine start failed (%s) — cache stays "
                              "stale; reads fall back to live EWS", exc)
 

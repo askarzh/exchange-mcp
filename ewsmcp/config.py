@@ -17,9 +17,9 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
 
-    # --- Exchange upstream -------------------------------------------------
-    ews_server_url: str
-    ews_email: str
+    # --- Exchange upstream (the daemon needs these; the MCP does not) --------
+    ews_server_url: Optional[str] = None
+    ews_email: str  # both processes: own-domain checks, confirm tokens, audit
     ews_username: Optional[str] = None
     ews_password: Optional[str] = None
     # NEVER pin auth_type against this Exchange: the front door only works
@@ -29,6 +29,21 @@ class Settings(BaseSettings):
     ews_insecure_skip_verify: bool = False
     ews_tz: str = "Asia/Riyadh"
     request_timeout: int = 30
+
+    # --- Storage: Postgres (both processes) -----------------------------------
+    database_url: str  # postgresql://user:pass@host:5432/ews
+
+    # --- Daemon HTTP API (ewsd serves; ewsmcp calls) ---------------------------
+    ewsd_host: str = "127.0.0.1"
+    ewsd_port: int = 8790
+    ewsd_api_key: Optional[str] = None  # bearer the MCP presents; required off-loopback
+    ewsd_url: str = "http://127.0.0.1:8790"
+
+    # --- Mirror sync (daemon) ---------------------------------------------------
+    ews_cache_folders: str = "inbox,sent"
+    ews_cache_sync_seconds: int = 45
+    ews_cache_hierarchy_seconds: int = 600
+    ews_cache_window_days: int = 365
 
     # --- Reliability --------------------------------------------------------
     ews_warmup_max_backoff_seconds: int = 300
@@ -66,20 +81,6 @@ class Settings(BaseSettings):
     shared_dir: str = ""
     data_dir_allow_synced: bool = False  # explicit opt-out of the synced-path guard
 
-    # --- Cache mirror (cache-first reads; false = pure EWS, fully functional)
-    ews_cache_enabled: bool = True
-    ews_cache_folders: str = "inbox,sent"
-    ews_cache_sync_seconds: int = 45
-    ews_cache_hierarchy_seconds: int = 600
-    ews_cache_window_days: int = 365
-    ews_cache_purge_on_boot: bool = False  # admin path: wipe + resync from scratch
-
-    # --- Optional semantic tier (adapter; core stays dependency-free) --------
-    ews_semantic_index: Literal["none", "pgvector"] = "none"
-    ews_semantic_pg_dsn: Optional[str] = None  # from env only, never committed
-    ews_semantic_ollama_url: str = "http://localhost:11434"
-    ews_semantic_model: str = "bge-m3"  # 1024-d, Arabic-capable
-
     # --- Response economy ----------------------------------------------------
     default_page_size: int = Field(default=20, le=50)
     body_max_chars: int = 4000
@@ -101,6 +102,13 @@ class Settings(BaseSettings):
                 )
         self.data_dir = str(resolved)
         return self
+
+    def require_exchange(self) -> None:
+        """ewsd boot guard: the daemon cannot run without an Exchange endpoint."""
+        missing = [n for n in ("ews_server_url", "ews_email", "ews_password")
+                   if not getattr(self, n)]
+        if missing:
+            raise ValueError("ewsd needs " + ", ".join(m.upper() for m in missing))
 
 
 def get_settings() -> Settings:

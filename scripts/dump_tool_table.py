@@ -33,8 +33,6 @@ def _packs():
         ("calendar / people / status", calendar_people.TOOLS),
         ("tasks / waiting-on", tasks.TOOLS),
         ("writes", writes.TOOLS),
-        ("semantic (only when EWS_SEMANTIC_INDEX != none)",
-         mail_read.SEMANTIC_TOOLS),
     ]
 
 
@@ -49,10 +47,9 @@ def _first_sentence(text: str) -> str:
 
 def build_table() -> str:
     packs = _packs()
-    core = sum(len(t) for _n, t in packs[:4])
+    core = sum(len(t) for _n, t in packs)
     lines = [
-        f"**{core} tools** in the default registry "
-        f"(+{len(mail_read.SEMANTIC_TOOLS)} with the semantic tier). "
+        f"**{core} tools** in the default registry. "
         "Capability tiers: read ⊂ draft ⊂ full — a tool is available when "
         "the server tier is at or above its minimum.",
         "",

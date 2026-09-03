@@ -38,3 +38,11 @@ def test_synced_path_escape_hatch(tmp_path):
 def test_confirm_ttl_default_matches_confirm_module():
     from ewsmcp import confirm
     assert make_settings().confirm_ttl_seconds == confirm.DEFAULT_TTL_SECONDS == 600
+
+
+def test_require_exchange_lists_missing():
+    from ewsmcp.config import Settings
+    s = Settings(ews_email="a@b.c", database_url="postgresql://x")
+    with pytest.raises(ValueError) as e:
+        s.require_exchange()
+    assert "EWS_SERVER_URL" in str(e.value) and "EWS_PASSWORD" in str(e.value)

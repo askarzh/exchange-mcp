@@ -92,9 +92,6 @@ def _metrics_text(ctx) -> str:
             lines.append(f"ewsmcp_sync_last_cycle_age_seconds {age}")
         lines.append("# TYPE ewsmcp_sync_degraded gauge")
         lines.append(f"ewsmcp_sync_degraded {1 if status.get('last_error') else 0}")
-    if ctx.semantic is not None:
-        lines.append("# TYPE ewsmcp_semantic_enabled gauge")
-        lines.append("ewsmcp_semantic_enabled 1")
     return "\n".join(lines) + "\n"
 
 

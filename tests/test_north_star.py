@@ -20,11 +20,11 @@ from conftest import make_settings
 
 from ewsmcp.audit import AuditLog
 from ewsmcp.cache.store import CacheStore
-from ewsmcp.ids import get_aliaser
+from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import build_registry
 from ewsmcp.tools.base import Context, dispatch
 
-from test_cache_store import make_row
+from test_pg_store import make_row
 
 RAW_EWS_ID = "AAMkAGI2TG93AAA" + "x" * 120 + "="  # realistically long
 
@@ -41,8 +41,8 @@ class CountingGateway:
         return fn(self.account)
 
 
-def _seed(tmp_path):
-    store = CacheStore(tmp_path / "mirror.db")
+def _seed(db):
+    store = CacheStore(db)
     now = int(time.time())
     store.upsert_messages([
         make_row(RAW_EWS_ID, subject="Q3 budget approval",
@@ -57,7 +57,7 @@ def _seed(tmp_path):
     return store
 
 
-def test_north_star_two_calls_under_two_k_tokens(tmp_path):
+def test_north_star_two_calls_under_two_k_tokens(tmp_path, db):
     # --- the ONE allowed EWS interaction: saving the reply draft ---------
     original = MagicMock(name="original")
     original.subject = "Q3 budget approval"
@@ -76,9 +76,9 @@ def test_north_star_two_calls_under_two_k_tokens(tmp_path):
         settings=make_settings(),
         gateway=gateway,
         manager=None,
-        aliaser=get_aliaser(str(tmp_path / "alias")),
+        aliaser=IdAliaser(db),
         audit=AuditLog(str(tmp_path / "audit")),
-        cache=_seed(tmp_path),
+        cache=_seed(db),
     )
     build_registry(ctx)
     outputs = []
@@ -116,16 +116,16 @@ def test_north_star_two_calls_under_two_k_tokens(tmp_path):
     assert total_chars < 2000 * 4, f"tool output too fat: {total_chars} chars"
 
 
-def test_north_star_search_is_fast_warm(tmp_path):
+def test_north_star_search_is_fast_warm(tmp_path, db):
     """<100ms warm is a production claim; in CI we only pin the shape of
     the guarantee — a pure-SQLite read with no EWS round trip."""
     ctx = Context(
         settings=make_settings(),
         gateway=CountingGateway(MagicMock()),
         manager=None,
-        aliaser=get_aliaser(str(tmp_path / "alias")),
+        aliaser=IdAliaser(db),
         audit=AuditLog(str(tmp_path / "audit")),
-        cache=_seed(tmp_path),
+        cache=_seed(db),
     )
     build_registry(ctx)
     start = time.perf_counter()

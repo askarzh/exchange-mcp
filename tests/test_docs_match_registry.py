@@ -18,11 +18,11 @@ def test_tool_table_matches_registry():
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_version_is_45_line():
+def test_version_is_50_line():
     spec = importlib.util.spec_from_file_location(
         "_v5_init", V5_ROOT / "ewsmcp" / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.__version__.startswith("4.5."), mod.__version__
+    assert mod.__version__.startswith("5.0."), mod.__version__
     pyproject = (V5_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert f'version = "{mod.__version__}"' in pyproject

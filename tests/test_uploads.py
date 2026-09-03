@@ -71,11 +71,11 @@ def test_mint_sanitises_the_filename(tmp_path):
 
 # --- the MCP tool + the HTTP route -------------------------------------------
 
-def test_create_upload_link_tool_returns_absolute_url(tmp_path, monkeypatch):
+def test_create_upload_link_tool_returns_absolute_url(tmp_path, db, monkeypatch):
     import sys; sys.path.insert(0, "tests")
     from test_writes import make_account, make_ctx, call
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     ctx.settings.external_url = "https://ews.example.com"
     res = call(ctx, "create_upload_link", {"name": "report.pdf", "ttl_minutes": 5})
     assert res["ok"] is True

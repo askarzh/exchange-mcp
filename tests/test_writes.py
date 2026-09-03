@@ -24,7 +24,7 @@ from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 
 from conftest import make_settings
 from ewsmcp.audit import AuditLog
-from ewsmcp.ids import get_aliaser
+from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import writes
 from ewsmcp.tools.base import Context, dispatch
 
@@ -67,12 +67,12 @@ def make_account():
     return account
 
 
-def make_ctx(tmp_path, account, **overrides) -> Context:
+def make_ctx(tmp_path, db, account, **overrides) -> Context:
     return Context(
         settings=make_settings(**overrides),
         gateway=FakeGateway(account),
         manager=None,
-        aliaser=get_aliaser(str(tmp_path / "aliases")),
+        aliaser=IdAliaser(db),
         audit=AuditLog(str(tmp_path / "audit")),
     )
 
@@ -81,8 +81,8 @@ def call(ctx: Context, name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     return asyncio.run(dispatch(ctx, SPEC[name], dict(kwargs)))
 
 
-def full_ctx(tmp_path, account, **overrides) -> Context:
-    return make_ctx(tmp_path, account, send_enabled=True,
+def full_ctx(tmp_path, db, account, **overrides) -> Context:
+    return make_ctx(tmp_path, db, account, send_enabled=True,
                     ews_capability_tier="full", **overrides)
 
 
@@ -162,9 +162,9 @@ def test_pack_surface_classes_and_confirm_declarations():
 # --- create_draft ---------------------------------------------------------------
 
 
-def test_create_draft_new_saves_into_drafts(tmp_path, monkeypatch):
+def test_create_draft_new_saves_into_drafts(tmp_path, db, monkeypatch):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     monkeypatch.setattr(writes, "Message", FakeDraftMessage)
     res = call(ctx, "create_draft",
                {"to": ["a@x.com"], "subject": "Hi", "body": "Hello\n\nWorld"})
@@ -182,9 +182,9 @@ def test_create_draft_new_saves_into_drafts(tmp_path, monkeypatch):
     assert res["preview"]["body_snippet"].startswith("Hello")
 
 
-def test_create_draft_reply_calls_create_reply_and_saves_to_drafts(tmp_path):
+def test_create_draft_reply_calls_create_reply_and_saves_to_drafts(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     original = MagicMock()
     original.subject = "Budget"
     reply_item = MagicMock()
@@ -206,8 +206,8 @@ def test_create_draft_reply_calls_create_reply_and_saves_to_drafts(tmp_path):
     assert res["preview"]["subject"] == "Re: Budget"
 
 
-def test_create_draft_validation(tmp_path):
-    ctx = make_ctx(tmp_path, make_account())
+def test_create_draft_validation(tmp_path, db):
+    ctx = make_ctx(tmp_path, db, make_account())
     res = call(ctx, "create_draft", {"mode": "reply", "body": "x"})
     assert res["ok"] is False and res["error"]["code"] == "validation"
     res = call(ctx, "create_draft", {"mode": "forward", "reply_to": "RAW-Z", "body": "x"})
@@ -217,9 +217,9 @@ def test_create_draft_validation(tmp_path):
 # --- update_draft / delete_draft -----------------------------------------------
 
 
-def test_update_draft_saves_with_recipient_field_names(tmp_path):
+def test_update_draft_saves_with_recipient_field_names(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     draft = MagicMock()
     draft.cc_recipients = None
     account._by_id["RAW-D1"] = draft
@@ -233,9 +233,9 @@ def test_update_draft_saves_with_recipient_field_names(tmp_path):
     assert res["preview"]["subject"] == "S2"
 
 
-def test_delete_draft_refuses_items_outside_drafts(tmp_path):
+def test_delete_draft_refuses_items_outside_drafts(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     stranger = MagicMock()
     stranger.parent_folder_id = SimpleNamespace(id="FOLDER-INBOX")
     account._by_id["RAW-M9"] = stranger
@@ -255,9 +255,9 @@ def test_delete_draft_refuses_items_outside_drafts(tmp_path):
 # --- update_messages / move_messages -------------------------------------------
 
 
-def test_update_messages_isolates_per_item_failures(tmp_path):
+def test_update_messages_isolates_per_item_failures(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     good1, bad, good2 = MagicMock(), MagicMock(), MagicMock()
     bad.save.side_effect = RuntimeError("boom")
     account._by_id.update({"RAW-1": good1, "RAW-2": bad, "RAW-3": good2})
@@ -271,16 +271,16 @@ def test_update_messages_isolates_per_item_failures(tmp_path):
     good2.save.assert_called_once_with(update_fields=["is_read"])
 
 
-def test_update_messages_rejects_set_flag(tmp_path):
-    ctx = make_ctx(tmp_path, make_account())
+def test_update_messages_rejects_set_flag(tmp_path, db):
+    ctx = make_ctx(tmp_path, db, make_account())
     res = call(ctx, "update_messages", {"ids": ["RAW-1"], "set_flag": "flagged"})
     assert res["error"]["code"] == "validation"
     assert "set_flag" in res["error"]["message"]
 
 
-def test_move_messages_rebinds_alias_to_new_raw_id(tmp_path):
+def test_move_messages_rebinds_alias_to_new_raw_id(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
 
     class MovableItem:
         def __init__(self, raw):
@@ -310,9 +310,9 @@ def test_move_messages_rebinds_alias_to_new_raw_id(tmp_path):
 # --- send_draft: two-phase, idempotency, kill-switch, tier ----------------------
 
 
-def test_send_draft_two_phase_through_dispatcher(tmp_path):
+def test_send_draft_two_phase_through_dispatcher(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     draft = make_sendable_draft()
     account._by_id["RAW-D5"] = draft
 
@@ -327,9 +327,9 @@ def test_send_draft_two_phase_through_dispatcher(tmp_path):
     draft.send.assert_called_once_with(save_copy=True)
 
 
-def test_send_draft_idempotency_replay_and_key_reuse(tmp_path):
+def test_send_draft_idempotency_replay_and_key_reuse(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     draft = make_sendable_draft()
     account._by_id["RAW-D5"] = draft
     kwargs = {"draft_id": "RAW-D5", "idempotency_key": "K1"}
@@ -351,16 +351,16 @@ def test_send_draft_idempotency_replay_and_key_reuse(tmp_path):
     other.send.assert_not_called()
 
 
-def test_send_draft_kill_switch_refuses_at_phase_one(tmp_path):
-    ctx = make_ctx(tmp_path, make_account(),
+def test_send_draft_kill_switch_refuses_at_phase_one(tmp_path, db):
+    ctx = make_ctx(tmp_path, db, make_account(),
                    send_enabled=False, ews_capability_tier="full")
     res = call(ctx, "send_draft", {"draft_id": "RAW-D5"})
     assert res["ok"] is False and res["error"]["code"] == "kill_switch"
     assert "confirm_token" not in res  # not even a preview token is minted
 
 
-def test_send_draft_tier_blocked_on_draft_tier(tmp_path):
-    ctx = make_ctx(tmp_path, make_account(),
+def test_send_draft_tier_blocked_on_draft_tier(tmp_path, db):
+    ctx = make_ctx(tmp_path, db, make_account(),
                    send_enabled=True, ews_capability_tier="draft")
     res = call(ctx, "send_draft", {"draft_id": "RAW-D5"})
     assert res["error"]["code"] == "tier_blocked"
@@ -384,9 +384,9 @@ def make_content_draft(subject="Q3 numbers", to=("board@corp.example",),
     return draft
 
 
-def test_send_draft_phase1_previews_the_drafts_real_content(tmp_path):
+def test_send_draft_phase1_previews_the_drafts_real_content(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     account._by_id["RAW-D7"] = make_content_draft(
         to=("board@corp.example", "cfo@external.example"))
     p1 = call(ctx, "send_draft", {"draft_id": "RAW-D7"})
@@ -398,11 +398,11 @@ def test_send_draft_phase1_previews_the_drafts_real_content(tmp_path):
     assert any("cfo@external.example" in w for w in p1["warnings"])
 
 
-def test_send_draft_toctou_edit_invalidates_token(tmp_path):
+def test_send_draft_toctou_edit_invalidates_token(tmp_path, db):
     """update_draft between preview and confirm must kill the token —
     the exact redirect attack the old draft_id-only hash allowed."""
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     draft = make_content_draft()
     account._by_id["RAW-D8"] = draft
     token = call(ctx, "send_draft", {"draft_id": "RAW-D8"})["confirm_token"]
@@ -413,9 +413,9 @@ def test_send_draft_toctou_edit_invalidates_token(tmp_path):
     draft.send.assert_not_called()
 
 
-def test_send_draft_body_edit_also_invalidates_token(tmp_path):
+def test_send_draft_body_edit_also_invalidates_token(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     draft = make_content_draft()
     account._by_id["RAW-D9"] = draft
     token = call(ctx, "send_draft", {"draft_id": "RAW-D9"})["confirm_token"]
@@ -425,10 +425,10 @@ def test_send_draft_body_edit_also_invalidates_token(tmp_path):
     draft.send.assert_not_called()
 
 
-def test_send_draft_guard_blocks_denylisted_draft_recipient(tmp_path):
+def test_send_draft_guard_blocks_denylisted_draft_recipient(tmp_path, db):
     """kwargs carry no recipients — the guard must fire on the DRAFT's."""
     account = make_account()
-    ctx = full_ctx(tmp_path, account,
+    ctx = full_ctx(tmp_path, db, account,
                    ews_recipient_denylist="*@competitor.example")
     account._by_id["RAW-DA"] = make_content_draft(to=("ceo@competitor.example",))
     p1 = call(ctx, "send_draft", {"draft_id": "RAW-DA"})
@@ -436,18 +436,18 @@ def test_send_draft_guard_blocks_denylisted_draft_recipient(tmp_path):
     assert "confirm_token" not in p1
 
 
-def test_send_draft_allowlist_enforced_on_resolved_recipients(tmp_path):
+def test_send_draft_allowlist_enforced_on_resolved_recipients(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account,
+    ctx = full_ctx(tmp_path, db, account,
                    ews_recipient_allowlist="*@corp.example")
     account._by_id["RAW-DB"] = make_content_draft(to=("out@other.example",))
     p1 = call(ctx, "send_draft", {"draft_id": "RAW-DB"})
     assert p1["error"]["code"] == "recipient_blocked"
 
 
-def test_send_draft_token_single_use_without_idempotency_key(tmp_path):
+def test_send_draft_token_single_use_without_idempotency_key(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     draft = make_content_draft()
     account._by_id["RAW-DC"] = draft
     token = call(ctx, "send_draft", {"draft_id": "RAW-DC"})["confirm_token"]
@@ -473,10 +473,10 @@ def test_idempotency_store_ttl_and_cap(monkeypatch):
     assert writes._idempotency_get("k3") is not None
 
 
-def test_create_draft_recipients_are_guarded(tmp_path, monkeypatch):
+def test_create_draft_recipients_are_guarded(tmp_path, db, monkeypatch):
     """Write-class argument-borne recipients hit the guard (old dead code)."""
     account = make_account()
-    ctx = make_ctx(tmp_path, account,
+    ctx = make_ctx(tmp_path, db, account,
                    ews_recipient_denylist="*@competitor.example")
     monkeypatch.setattr(writes, "Message", FakeDraftMessage)
     res = call(ctx, "create_draft",
@@ -487,9 +487,9 @@ def test_create_draft_recipients_are_guarded(tmp_path, monkeypatch):
 # --- create_event / update_event ------------------------------------------------
 
 
-def test_create_event_default_saves_without_invites_no_confirm(tmp_path, monkeypatch):
+def test_create_event_default_saves_without_invites_no_confirm(tmp_path, db, monkeypatch):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)  # draft tier suffices for write class
+    ctx = make_ctx(tmp_path, db, account)  # draft tier suffices for write class
     monkeypatch.setattr(writes, "CalendarItem", FakeCalendarItem)
     res = call(ctx, "create_event",
                {"subject": "Sync", "start": "2026-07-01", "end": "2026-07-01T01:00"})
@@ -507,9 +507,9 @@ def test_create_event_default_saves_without_invites_no_confirm(tmp_path, monkeyp
 
 
 def test_create_event_with_invites_blocked_by_kill_switch_at_phase_two(
-        tmp_path, monkeypatch):
+        tmp_path, db, monkeypatch):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)  # send_enabled defaults to False
+    ctx = make_ctx(tmp_path, db, account)  # send_enabled defaults to False
     monkeypatch.setattr(writes, "CalendarItem", FakeCalendarItem)
     FakeCalendarItem.last = None
     kwargs = {"subject": "Board", "start": "2026-07-01T10:00",
@@ -522,9 +522,9 @@ def test_create_event_with_invites_blocked_by_kill_switch_at_phase_two(
     assert FakeCalendarItem.last is None  # nothing was built or saved
 
 
-def test_create_event_with_invites_sends_when_enabled(tmp_path, monkeypatch):
+def test_create_event_with_invites_sends_when_enabled(tmp_path, db, monkeypatch):
     account = make_account()
-    ctx = make_ctx(tmp_path, account, send_enabled=True)
+    ctx = make_ctx(tmp_path, db, account, send_enabled=True)
     monkeypatch.setattr(writes, "CalendarItem", FakeCalendarItem)
     kwargs = {"subject": "Board", "start": "2026-07-01T10:00",
               "end": "2026-07-01T11:00", "attendees": ["x@corp.example"],
@@ -537,9 +537,9 @@ def test_create_event_with_invites_sends_when_enabled(tmp_path, monkeypatch):
     assert ev.kwargs["start"].tzinfo is not None
 
 
-def test_update_event_silent_edit_uses_send_to_none(tmp_path):
+def test_update_event_silent_edit_uses_send_to_none(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     ev = MagicMock()
     account._by_id["RAW-E2"] = ev
     res = call(ctx, "update_event", {"event_id": "RAW-E2", "subject": "New title"})
@@ -549,9 +549,9 @@ def test_update_event_silent_edit_uses_send_to_none(tmp_path):
                                     send_meeting_invitations=SEND_TO_NONE)
 
 
-def test_update_event_notify_blocked_by_kill_switch(tmp_path):
+def test_update_event_notify_blocked_by_kill_switch(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)  # send_enabled False
+    ctx = make_ctx(tmp_path, db, account)  # send_enabled False
     ev = MagicMock()
     account._by_id["RAW-E2"] = ev
     kwargs = {"event_id": "RAW-E2", "subject": "Moved", "notify_attendees": True}
@@ -565,9 +565,9 @@ def test_update_event_notify_blocked_by_kill_switch(tmp_path):
 # --- respond_to_event / cancel_event --------------------------------------------
 
 
-def test_respond_to_event_accept_two_phase(tmp_path):
+def test_respond_to_event_accept_two_phase(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     ev = MagicMock()
     account._by_id["RAW-E1"] = ev
     kwargs = {"event_id": "RAW-E1", "response": "accept", "message": "see you"}
@@ -579,9 +579,9 @@ def test_respond_to_event_accept_two_phase(tmp_path):
     ev.accept.assert_called_once_with(body="see you")
 
 
-def test_cancel_event_two_phase(tmp_path):
+def test_cancel_event_two_phase(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     ev = MagicMock()
     account._by_id["RAW-E3"] = ev
     kwargs = {"event_id": "RAW-E3", "message": "postponed"}
@@ -596,9 +596,9 @@ def test_cancel_event_two_phase(tmp_path):
 # --- delete_messages / set_oof ----------------------------------------------------
 
 
-def test_delete_messages_trash_executes_without_confirm(tmp_path):
+def test_delete_messages_trash_executes_without_confirm(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     msg = MagicMock()
     account._by_id["RAW-T1"] = msg
     res = call(ctx, "delete_messages", {"ids": ["RAW-T1"]})
@@ -608,9 +608,9 @@ def test_delete_messages_trash_executes_without_confirm(tmp_path):
     msg.delete.assert_not_called()
 
 
-def test_delete_messages_permanent_requires_confirm_token(tmp_path):
+def test_delete_messages_permanent_requires_confirm_token(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     msg = MagicMock()
     account._by_id["RAW-P1"] = msg
     kwargs = {"ids": ["RAW-P1"], "disposition": "permanent"}
@@ -623,9 +623,9 @@ def test_delete_messages_permanent_requires_confirm_token(tmp_path):
     msg.move_to_trash.assert_not_called()
 
 
-def test_set_oof_phase_one_preview_then_plain_string_replies(tmp_path):
+def test_set_oof_phase_one_preview_then_plain_string_replies(tmp_path, db):
     account = make_account()
-    ctx = full_ctx(tmp_path, account)
+    ctx = full_ctx(tmp_path, db, account)
     kwargs = {"state": "enabled", "internal_reply": "I am away"}
     p1 = call(ctx, "set_oof", kwargs)
     assert p1["requires_confirmation"] is True
@@ -645,10 +645,10 @@ def test_set_oof_phase_one_preview_then_plain_string_replies(tmp_path):
 # Default stays plain-text-escaped (v4 parity was plain only); body_format="html"
 # passes author-supplied markup through so drafts can carry real formatting.
 
-def test_create_draft_defaults_to_escaped_plain_text(tmp_path, monkeypatch):
+def test_create_draft_defaults_to_escaped_plain_text(tmp_path, db, monkeypatch):
     """Regression guard: without body_format, markup must still be ESCAPED."""
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     monkeypatch.setattr(writes, "Message", FakeDraftMessage)
     call(ctx, "create_draft",
          {"to": ["a@x.com"], "subject": "S", "body": "<b>hi</b>"})
@@ -657,9 +657,9 @@ def test_create_draft_defaults_to_escaped_plain_text(tmp_path, monkeypatch):
     assert "<b>hi</b>" not in body
 
 
-def test_create_draft_html_passes_markup_through(tmp_path, monkeypatch):
+def test_create_draft_html_passes_markup_through(tmp_path, db, monkeypatch):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     monkeypatch.setattr(writes, "Message", FakeDraftMessage)
     res = call(ctx, "create_draft",
                {"to": ["a@x.com"], "subject": "S",
@@ -671,9 +671,9 @@ def test_create_draft_html_passes_markup_through(tmp_path, monkeypatch):
     assert body.startswith("<html>")       # wrapped into a document
 
 
-def test_create_draft_html_does_not_double_wrap_full_document(tmp_path, monkeypatch):
+def test_create_draft_html_does_not_double_wrap_full_document(tmp_path, db, monkeypatch):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     monkeypatch.setattr(writes, "Message", FakeDraftMessage)
     call(ctx, "create_draft",
          {"to": ["a@x.com"], "body": "<html><body><p>x</p></body></html>",
@@ -682,10 +682,10 @@ def test_create_draft_html_does_not_double_wrap_full_document(tmp_path, monkeypa
     assert body.count("<html>") == 1
 
 
-def test_create_draft_html_preview_snippet_is_plain_text(tmp_path, monkeypatch):
+def test_create_draft_html_preview_snippet_is_plain_text(tmp_path, db, monkeypatch):
     """The confirm preview must show readable text, not raw tags."""
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     monkeypatch.setattr(writes, "Message", FakeDraftMessage)
     res = call(ctx, "create_draft",
                {"to": ["a@x.com"], "body": "<p>Hello <b>there</b></p>",
@@ -694,9 +694,9 @@ def test_create_draft_html_preview_snippet_is_plain_text(tmp_path, monkeypatch):
     assert "Hello there" in res["preview"]["body_snippet"]
 
 
-def test_update_draft_supports_html(tmp_path):
+def test_update_draft_supports_html(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     draft = MagicMock()
     draft.folder = account.drafts
     account._by_id["RAW-D"] = draft
@@ -722,9 +722,9 @@ def _draft_with_attachments(account, ctx, atts=None):
     return draft, ctx.aliaser.alias_for("RAW-D", "d")
 
 
-def test_add_attachment_from_data_dir_path(tmp_path, monkeypatch):
+def test_add_attachment_from_data_dir_path(tmp_path, db, monkeypatch):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     draft, alias = _draft_with_attachments(account, ctx)
     src = Path(ctx.settings.data_dir) / "attachments"
     src.mkdir(parents=True, exist_ok=True)
@@ -741,10 +741,10 @@ def test_add_attachment_from_data_dir_path(tmp_path, monkeypatch):
     assert att.content == b"hello bytes"
 
 
-def test_add_attachment_rejects_path_outside_data_dir(tmp_path):
+def test_add_attachment_rejects_path_outside_data_dir(tmp_path, db):
     """Path traversal guard: only files under DATA_DIR may be attached."""
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     _draft, alias = _draft_with_attachments(account, ctx)
     outside = tmp_path / "secret.txt"
     outside.write_bytes(b"nope")
@@ -753,9 +753,9 @@ def test_add_attachment_rejects_path_outside_data_dir(tmp_path):
     assert res["error"]["code"] == "validation"
 
 
-def test_add_attachment_from_base64(tmp_path):
+def test_add_attachment_from_base64(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     draft, alias = _draft_with_attachments(account, ctx)
     import base64
     res = call(ctx, "add_attachment", {
@@ -767,9 +767,9 @@ def test_add_attachment_from_base64(tmp_path):
     assert att.name == "note.txt"
 
 
-def test_add_attachment_base64_requires_name(tmp_path):
+def test_add_attachment_base64_requires_name(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     _d, alias = _draft_with_attachments(account, ctx)
     import base64
     res = call(ctx, "add_attachment", {
@@ -778,9 +778,9 @@ def test_add_attachment_base64_requires_name(tmp_path):
     assert res["error"]["code"] == "validation"
 
 
-def test_add_attachment_refuses_non_draft(tmp_path):
+def test_add_attachment_refuses_non_draft(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     msg = MagicMock()
     msg.parent_folder_id = SimpleNamespace(id="FOLDER-INBOX")
     msg.folder = SimpleNamespace(id="OTHER", name="Inbox")
@@ -792,9 +792,9 @@ def test_add_attachment_refuses_non_draft(tmp_path):
     assert res["ok"] is False
 
 
-def test_delete_attachment_by_name(tmp_path):
+def test_delete_attachment_by_name(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     a1 = SimpleNamespace(name="keep.txt")
     a2 = SimpleNamespace(name="drop.txt")
     draft, alias = _draft_with_attachments(account, ctx, [a1, a2])
@@ -804,19 +804,19 @@ def test_delete_attachment_by_name(tmp_path):
     draft.detach.assert_called_once_with(a2)
 
 
-def test_delete_attachment_unknown_name_errors(tmp_path):
+def test_delete_attachment_unknown_name_errors(tmp_path, db):
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     draft, alias = _draft_with_attachments(account, ctx, [SimpleNamespace(name="a.txt")])
     res = call(ctx, "delete_attachment", {"draft_id": alias, "attachment": "nope.txt"})
     assert res["ok"] is False
     draft.detach.assert_not_called()
 
 
-def test_attachment_tools_return_aliases_not_raw_ids(tmp_path):
+def test_attachment_tools_return_aliases_not_raw_ids(tmp_path, db):
     """Raw EWS ids are ~150 chars and the surface is alias-only by design."""
     account = make_account()
-    ctx = make_ctx(tmp_path, account)
+    ctx = make_ctx(tmp_path, db, account)
     draft, alias = _draft_with_attachments(account, ctx, [SimpleNamespace(name="a.txt")])
     src = Path(ctx.settings.data_dir) / "attachments"; src.mkdir(parents=True, exist_ok=True)
     f = src / "b.txt"; f.write_bytes(b"x")

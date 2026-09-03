@@ -89,7 +89,8 @@ class Context:
     audit: Any
     cache: Any = None  # CacheStore | None (None = cache disabled/broken)
     sync: Any = None  # SyncEngine | None
-    semantic: Any = None  # SemanticIndex adapter | None
+    db: Any = None  # Database | None
+    daemon: Any = None  # daemon client | None
     registry: Dict[str, ToolSpec] = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     counters: Dict[str, int] = field(default_factory=dict)
@@ -262,7 +263,7 @@ async def mint_token(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any]) -> st
     )["confirm_token"]
 
 
-def _resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+def resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(kwargs)
     try:
         for key, value in kwargs.items():
@@ -274,6 +275,9 @@ def _resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     except KeyError as e:
         raise ToolError("validation", str(e.args[0] if e.args else e))
     return out
+
+
+_resolve_ids = resolve_ids
 
 
 async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
@@ -335,7 +339,7 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
         if spec.side_effect_class == "send":
             _rate_guard(ctx)
         # Alias → raw ids
-        kwargs = _resolve_ids(ctx, kwargs)
+        kwargs = resolve_ids(ctx, kwargs)
         result = await spec.handler(ctx, **kwargs)
         ctx._circuit_failures = 0
         if isinstance(result, dict):

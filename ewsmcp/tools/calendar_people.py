@@ -443,10 +443,7 @@ async def _get_oof_settings(ctx: Context) -> Dict[str, Any]:
 
 async def _get_server_status(ctx: Context) -> Dict[str, Any]:
     # requires_ews=False: answers even while Exchange is cold. No network.
-    cache_block: Dict[str, Any] = {
-        "enabled": bool(getattr(ctx.settings, "ews_cache_enabled", False)),
-        "ready": ctx.cache is not None,
-    }
+    cache_block: Dict[str, Any] = {"enabled": True, "ready": ctx.cache is not None}
     if ctx.cache is not None:
         try:
             cache_block.update(ctx.cache.stats())

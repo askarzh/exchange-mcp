@@ -12,11 +12,11 @@ from conftest import make_settings
 
 from ewsmcp.audit import AuditLog
 from ewsmcp.cache.store import CacheStore
-from ewsmcp.ids import get_aliaser
+from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import build_registry
 from ewsmcp.tools.base import Context, dispatch
 
-from test_cache_store import make_row
+from test_pg_store import make_row
 
 
 class NoTouchGateway:
@@ -39,8 +39,8 @@ class RecordingGateway:
         return fn(self.account)
 
 
-def seeded_store(tmp_path):
-    store = CacheStore(tmp_path / "mirror.db")
+def seeded_store(db):
+    store = CacheStore(db)
     now = int(time.time())
     store.upsert_messages([
         make_row("RAW-1", subject="Budget review", sender_email="a@corp.example",
@@ -69,14 +69,14 @@ def seeded_store(tmp_path):
     return store
 
 
-def _ctx(tmp_path, gateway, **overrides) -> Context:
+def _ctx(tmp_path, db, gateway, **overrides) -> Context:
     ctx = Context(
         settings=make_settings(**overrides),
         gateway=gateway,
         manager=None,
-        aliaser=get_aliaser(str(tmp_path / "alias")),
+        aliaser=IdAliaser(db),
         audit=AuditLog(str(tmp_path / "audit")),
-        cache=seeded_store(tmp_path),
+        cache=seeded_store(db),
     )
     build_registry(ctx)
     return ctx
@@ -86,8 +86,8 @@ def _run(ctx, name, **kwargs):
     return asyncio.run(dispatch(ctx, ctx.registry[name], dict(kwargs)))
 
 
-def test_search_served_from_mirror_with_provenance(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_search_served_from_mirror_with_provenance(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "search_messages", query="budget")
     assert res["source"] == "cache" and res["as_of"]
     assert res["count"] == 1
@@ -96,24 +96,24 @@ def test_search_served_from_mirror_with_provenance(tmp_path):
     assert res["items"][0]["id"].startswith("m")  # alias, never a raw id
 
 
-def test_search_sender_filter_from_mirror(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_search_sender_filter_from_mirror(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "search_messages", sender="a@corp", limit=1)
     assert res["source"] == "cache"
     assert res["count"] == 1
     assert res["items"][0]["unread"] is True
 
 
-def test_get_message_from_mirror(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_get_message_from_mirror(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "get_message", id="RAW-1")
     assert res["source"] == "cache"
     assert res["message"]["body"].startswith("please review")
     assert res["message"]["subject"] == "Budget review"
 
 
-def test_get_thread_local_conversation_join(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_get_thread_local_conversation_join(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "get_thread", id="RAW-1")
     assert res["source"] == "cache"
     assert res["count"] == 2  # inbox + sent halves of C1
@@ -121,8 +121,8 @@ def test_get_thread_local_conversation_join(tmp_path):
                                                  "exec@corp.example"]
 
 
-def test_overview_pure_mirror(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_overview_pure_mirror(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "get_mailbox_overview")
     assert res["source"] == "cache" and res["as_of"]
     assert res["unread_total"] == 1
@@ -130,29 +130,29 @@ def test_overview_pure_mirror(tmp_path):
     assert res["today_events"][0]["subject"] == "Standup"
 
 
-def test_list_folders_from_mirror(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_list_folders_from_mirror(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "list_folders")
     assert res["source"] == "cache"
     assert res["items"][0]["wk"] == "f:inbox"
     assert res["items"][0]["unread"] == 1
 
 
-def test_fresh_true_forces_live(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_fresh_true_forces_live(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "get_message", id="RAW-1", fresh=True)
     # NoTouchGateway raises AssertionError → mapped upstream error — which
     # is exactly the proof that fresh=true went to Exchange.
     assert res["ok"] is False
 
 
-def test_uncached_folder_goes_live(tmp_path):
-    ctx = _ctx(tmp_path, NoTouchGateway())
+def test_uncached_folder_goes_live(tmp_path, db):
+    ctx = _ctx(tmp_path, db, NoTouchGateway())
     res = _run(ctx, "search_messages", folder="f:junk")
     assert res["ok"] is False  # gateway raised → live path was chosen
 
 
-def test_cache_error_falls_back_to_live(tmp_path):
+def test_cache_error_falls_back_to_live(tmp_path, db):
     account = None
     gateway = RecordingGateway()
 
@@ -176,8 +176,7 @@ def test_cache_error_falls_back_to_live(tmp_path):
     account.inbox = _Query()
     gateway.account = account
     gateway.resolve_folder = lambda acc, ref, aliaser: account.inbox
-    ctx = _ctx(tmp_path, gateway)
-    ctx.cache.close()
+    ctx = _ctx(tmp_path, db, gateway)
 
     def boom(**kwargs):
         raise RuntimeError("mirror unavailable")
@@ -189,7 +188,7 @@ def test_cache_error_falls_back_to_live(tmp_path):
     assert gateway.calls == 1
 
 
-def test_write_through_update_and_delete(tmp_path):
+def test_write_through_update_and_delete(tmp_path, db):
     from types import SimpleNamespace
 
     class Item:
@@ -208,7 +207,7 @@ def test_write_through_update_and_delete(tmp_path):
     account = SimpleNamespace()
     account.fetch = lambda pairs, only_fields=None: [items[i] for i, _ in pairs]
     gateway = RecordingGateway(account)
-    ctx = _ctx(tmp_path, gateway, ews_capability_tier="full")
+    ctx = _ctx(tmp_path, db, gateway, ews_capability_tier="full")
 
     res = _run(ctx, "update_messages", ids=["RAW-1"], set_read=True)
     assert res["updated"] == 1

@@ -87,14 +87,14 @@ def test_publish_sanitises_the_name(tmp_path):
 # --- wired into get_attachment ----------------------------------------------
 
 
-def test_save_publishes_to_shared(tmp_path):
+def test_save_publishes_to_shared(tmp_path, db):
     shared = tmp_path / "shared"
     shared.mkdir()
     item = _msg("RAW-A=", attachments=[_att("contract.pdf", b"%PDF-junk",
                                             "application/pdf")])
     account = _account()
     account.fetch = MagicMock(return_value=[item])
-    ctx = _ctx(tmp_path, account, shared_dir=str(shared))
+    ctx = _ctx(tmp_path, db, account, shared_dir=str(shared))
 
     res = _run(ctx, "get_attachment", message_id="RAW-A=", mode="save")
 
@@ -105,12 +105,12 @@ def test_save_publishes_to_shared(tmp_path):
     assert Path(res["saved_path"]).read_bytes() == b"%PDF-junk"
 
 
-def test_save_without_shared_dir_omits_shared_name(tmp_path):
+def test_save_without_shared_dir_omits_shared_name(tmp_path, db):
     item = _msg("RAW-A=", attachments=[_att("contract.pdf", b"%PDF-junk",
                                             "application/pdf")])
     account = _account()
     account.fetch = MagicMock(return_value=[item])
-    ctx = _ctx(tmp_path, account)  # no shared_dir configured
+    ctx = _ctx(tmp_path, db, account)  # no shared_dir configured
 
     res = _run(ctx, "get_attachment", message_id="RAW-A=", mode="save")
 
@@ -119,7 +119,7 @@ def test_save_without_shared_dir_omits_shared_name(tmp_path):
     assert Path(res["saved_path"]).exists()
 
 
-def test_publish_failure_does_not_fail_the_save(tmp_path):
+def test_publish_failure_does_not_fail_the_save(tmp_path, db):
     """The attachment is already safely on disk — publishing is a convenience."""
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -127,7 +127,7 @@ def test_publish_failure_does_not_fail_the_save(tmp_path):
                                             "application/pdf")])
     account = _account()
     account.fetch = MagicMock(return_value=[item])
-    ctx = _ctx(tmp_path, account, shared_dir=str(shared))
+    ctx = _ctx(tmp_path, db, account, shared_dir=str(shared))
 
     def boom(*a, **kw):
         raise OSError("disk full")

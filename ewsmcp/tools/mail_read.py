@@ -315,37 +315,6 @@ async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int =
 # --------------------------------------------------------------------------
 
 
-async def _search_semantic(ctx: Context, query: str, folder_key: str,
-                           limit: int) -> Dict[str, Any]:
-    """Hybrid retrieval: FTS rank + vector rank fused with RRF. Vector-tier
-    outages degrade to keyword-only with a `degraded` note — never an error."""
-    from ..semantic import rrf_merge
-    fts_rows, _total = await asyncio.to_thread(
-        ctx.cache.search_messages, folders=[folder_key], text=query,
-        offset=0, limit=max(20, limit))
-    fts_ids = [r["ews_id"] for r in fts_rows]
-    degraded: Optional[str] = None
-    sem_ids: List[str] = []
-    try:
-        hits = await asyncio.to_thread(ctx.semantic.query, query, 20)
-        sem_ids = [ews_id for ews_id, _score in hits]
-    except Exception as exc:
-        degraded = f"semantic tier unavailable ({type(exc).__name__}) — keyword-only"
-    ranked = rrf_merge(fts_ids, sem_ids) if sem_ids else fts_ids
-    rows_by_id = {r["ews_id"]: r for r in fts_rows}
-    cards: List[Dict[str, Any]] = []
-    for ews_id in ranked[:limit]:
-        row = rows_by_id.get(ews_id)
-        if row is None:
-            row = await asyncio.to_thread(ctx.cache.get_message, ews_id)
-        if row is not None:
-            cards.append(_row_card(ctx, row))
-    out = envelope(cards, total_available=None, offset=0, next_offset=None)
-    if degraded:
-        out["degraded"] = degraded
-    return _stamp(out, "cache", _cache_watermark(ctx, folder_key))
-
-
 async def _search_messages(ctx: Context, query: Optional[str] = None,
                            folder: str = "f:inbox", sender: Optional[str] = None,
                            from_: Optional[str] = None,
@@ -358,22 +327,9 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 50))
     if mode == "semantic":
-        if not query:
-            raise ToolError("validation", "mode='semantic' requires `query`.")
-        if ctx.semantic is None:
-            raise ToolError(
-                "validation",
-                "semantic search is not enabled on this server "
-                "(EWS_SEMANTIC_INDEX=none)",
-                hint="Use mode='keyword' — the FTS index handles Arabic and "
-                     "English orthographic variants.",
-            )
-        folder_key = _cache_folder_key(ctx, folder)
-        if not folder_key or not _cache_watermark(ctx, folder_key):
-            raise ToolError("upstream_unavailable",
-                            "semantic search needs the local mirror, which "
-                            "has not finished its first sync yet.")
-        return await _search_semantic(ctx, query, folder_key, limit)
+        raise ToolError("validation",
+                        "semantic search is not available in this build (it returns "
+                        "with the archive tier).", hint="Use mode='keyword'.")
     if sender and from_:
         raise ToolError("validation",
                         "pass `sender` only — `from_` is its deprecated alias.")
@@ -802,39 +758,6 @@ async def _get_mailbox_overview(ctx: Context, horizon_days: int = 1,
 
 
 # --------------------------------------------------------------------------
-# 7. find_similar (registered ONLY when the semantic tier is enabled)
-# --------------------------------------------------------------------------
-
-
-async def _find_similar(ctx: Context, id: str, top_k: int = 5) -> Dict[str, Any]:
-    top_k = max(1, min(int(top_k), 20))
-    raw_id = id
-    if ctx.semantic is None:  # defensive; the tool is unregistered when off
-        raise ToolError("validation", "semantic tier is disabled")
-    if ctx.cache is None:
-        raise ToolError("upstream_unavailable",
-                        "find_similar needs the local mirror")
-    try:
-        hits = await asyncio.to_thread(ctx.semantic.query_similar, raw_id, top_k)
-    except Exception as exc:
-        raise ToolError("upstream_unavailable",
-                        f"semantic tier unavailable: {type(exc).__name__}",
-                        hint="Retry later or use search_messages mode='keyword'.")
-    cards: List[Dict[str, Any]] = []
-    for ews_id, score in hits:
-        row = await asyncio.to_thread(ctx.cache.get_message, ews_id)
-        if row is not None:
-            card = _row_card(ctx, row)
-            card["similarity"] = round(float(score), 3)
-            cards.append(card)
-    out = envelope(cards, total_available=len(cards), offset=0)
-    return _stamp(out, "cache")
-
-
-SEMANTIC_TOOLS: List["ToolSpec"] = []  # populated below, after _schema is defined
-
-
-# --------------------------------------------------------------------------
 # Specs
 # --------------------------------------------------------------------------
 
@@ -931,9 +854,7 @@ TOOLS: List[ToolSpec] = [
             "mode": {
                 "type": "string", "enum": ["keyword", "semantic"],
                 "default": "keyword",
-                "description": "semantic = hybrid FTS + vector retrieval "
-                               "(only when the semantic tier is enabled; "
-                               "requires `query`; other filters ignored).",
+                "description": "semantic is reserved; keyword only in this build.",
             },
             "fresh": dict(_FRESH_PROPERTY),
         }),
@@ -1039,23 +960,3 @@ TOOLS: List[ToolSpec] = [
         handler=_get_mailbox_overview,
     ),
 ]
-
-# Registered by build_registry ONLY when EWS_SEMANTIC_INDEX != none — the
-# default public surface never carries a tool that cannot work.
-SEMANTIC_TOOLS.append(ToolSpec(
-    name="find_similar",
-    description=(
-        "Find messages semantically similar to a given one (vector "
-        "similarity over cleaned bodies; Arabic + English). Returns compact "
-        "cards with a `similarity` score. Only available when the optional "
-        "semantic tier is enabled."
-    ),
-    side_effect_class="read",
-    requires_ews=False,  # answers from the mirror + vector index
-    input_schema=_schema({
-        "id": {"type": "string",
-               "description": "Message id (m-alias or raw) to compare against."},
-        "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
-    }, required=["id"]),
-    handler=_find_similar,
-))

@@ -15,6 +15,8 @@ HTTP_BY_CODE = {
     "rate_capped": 429,
     "upstream_unavailable": 503,
     "upstream_error": 502,
+    "daemon_unavailable": 503,
+    "backend_unavailable": 503,
     "internal": 500,
 }
 

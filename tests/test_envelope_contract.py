@@ -17,7 +17,7 @@ import pytest
 from conftest import make_settings
 
 from ewsmcp.audit import AuditLog
-from ewsmcp.ids import get_aliaser
+from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import build_registry
 from ewsmcp.tools.base import Context, dispatch
 
@@ -84,12 +84,12 @@ def _account():
     return account
 
 
-def _ctx(tmp_path) -> Context:
+def _ctx(tmp_path, db) -> Context:
     ctx = Context(
         settings=make_settings(),
         gateway=_FakeGateway(_account()),
         manager=None,
-        aliaser=get_aliaser(str(tmp_path / "alias")),
+        aliaser=IdAliaser(db),
         audit=AuditLog(str(tmp_path / "audit")),
     )
     build_registry(ctx)
@@ -105,8 +105,8 @@ _ARGS = {
 
 
 @pytest.mark.parametrize("name", LIST_TOOLS)
-def test_list_tool_ships_canonical_envelope(tmp_path, name):
-    ctx = _ctx(tmp_path)
+def test_list_tool_ships_canonical_envelope(tmp_path, db, name):
+    ctx = _ctx(tmp_path, db)
     result = asyncio.run(dispatch(ctx, ctx.registry[name], dict(_ARGS[name])))
     assert result["ok"] is True, result
     assert ENVELOPE_KEYS.issubset(result.keys()), (
@@ -121,6 +121,6 @@ def test_list_tool_ships_canonical_envelope(tmp_path, name):
 
 
 @pytest.mark.parametrize("name", LIST_TOOLS)
-def test_registry_declares_list_tools_read_class(tmp_path, name):
-    ctx = _ctx(tmp_path)
+def test_registry_declares_list_tools_read_class(tmp_path, db, name):
+    ctx = _ctx(tmp_path, db)
     assert ctx.registry[name].side_effect_class == "read"

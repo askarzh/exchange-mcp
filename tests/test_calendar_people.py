@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from conftest import make_settings
 from ewsmcp import __version__
 from ewsmcp.audit import AuditLog
-from ewsmcp.ids import get_aliaser
+from ewsmcp.ids import IdAliaser
 from ewsmcp.tools import calendar_people
 from ewsmcp.tools.base import Context, dispatch
 from ewsmcp.tools.calendar_people import merge_busy_and_find_slots
@@ -32,12 +32,12 @@ class _FakeGateway:
         return fn(self.account)
 
 
-def _ctx(tmp_path, account, **settings_overrides) -> Context:
+def _ctx(tmp_path, db, account, **settings_overrides) -> Context:
     return Context(
         settings=make_settings(**settings_overrides),
         gateway=_FakeGateway(account),
         manager=None,
-        aliaser=get_aliaser(str(tmp_path / "mem")),
+        aliaser=IdAliaser(db),
         audit=AuditLog(str(tmp_path / "data")),
     )
 
@@ -78,10 +78,10 @@ def test_pack_exports_seven_read_specs():
 # --- list_events --------------------------------------------------------------
 
 
-def test_list_events_uses_view_not_filter(tmp_path):
+def test_list_events_uses_view_not_filter(tmp_path, db):
     account = MagicMock()
     account.calendar.view.return_value = [_event("RAW-1"), _event("RAW-2", "Review")]
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "list_events", {"start": "2026-06-15", "end": "2026-06-16"})
     assert res["ok"] is True
     account.calendar.view.assert_called_once()
@@ -98,7 +98,7 @@ def test_list_events_uses_view_not_filter(tmp_path):
     assert res["items"][1]["id"] == "e2"
 
 
-def test_list_events_pagination_caps_the_view_server_side(tmp_path):
+def test_list_events_pagination_caps_the_view_server_side(tmp_path, db):
     """The window expansion is capped via view(max_items=offset+limit+1) —
     a year of recurrences is never materialized to render one page. A
     truncated view means the exact total is unknown (None) but the
@@ -107,7 +107,7 @@ def test_list_events_pagination_caps_the_view_server_side(tmp_path):
     account = MagicMock()
     account.calendar.view.side_effect = (
         lambda *, start, end, max_items=None: events[:max_items])
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "list_events",
                {"start": "2026-06-15", "end": "2026-06-22", "offset": 1, "limit": 2})
     assert account.calendar.view.call_args.kwargs["max_items"] == 4  # 1+2+1
@@ -122,19 +122,19 @@ def test_list_events_pagination_caps_the_view_server_side(tmp_path):
     assert res2["next_offset"] is None
 
 
-def test_list_events_rejects_absurd_windows(tmp_path):
+def test_list_events_rejects_absurd_windows(tmp_path, db):
     account = MagicMock()
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "list_events", {"start": "today", "end": "+9999d"})
     assert res["error"]["code"] == "validation"
     assert "narrow" in res["error"]["message"]
     account.calendar.view.assert_not_called()
 
 
-def test_list_events_relative_dates_today_plus_7d(tmp_path):
+def test_list_events_relative_dates_today_plus_7d(tmp_path, db):
     account = MagicMock()
     account.calendar.view.return_value = []
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     before = datetime.now(TZ)
     res = _run(ctx, "list_events", {})  # defaults: start="today", end="+7d"
     after = datetime.now(TZ)
@@ -147,9 +147,9 @@ def test_list_events_relative_dates_today_plus_7d(tmp_path):
     assert kwargs["end"] - start == timedelta(days=7)
 
 
-def test_list_events_bad_date_is_validation_error(tmp_path):
+def test_list_events_bad_date_is_validation_error(tmp_path, db):
     account = MagicMock()
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "list_events", {"start": "next tuesday"})
     assert res["ok"] is False and res["error"]["code"] == "validation"
     account.calendar.view.assert_not_called()
@@ -158,7 +158,7 @@ def test_list_events_bad_date_is_validation_error(tmp_path):
 # --- get_event ----------------------------------------------------------------
 
 
-def test_get_event_attendees_body_and_flags(tmp_path):
+def test_get_event_attendees_body_and_flags(tmp_path, db):
     raw = "RAW-EVENT-FULL"
     ev = _event(raw, subject="Budget review")
     ev.required_attendees = [SimpleNamespace(
@@ -173,7 +173,7 @@ def test_get_event_attendees_body_and_flags(tmp_path):
     ev.is_recurring = True
     account = MagicMock()
     account.fetch.return_value = iter([ev])
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     alias = ctx.aliaser.alias_for(raw, "e")  # dispatcher will resolve alias→raw
     res = _run(ctx, "get_event", {"id": alias})
     assert res["ok"] is True
@@ -190,13 +190,13 @@ def test_get_event_attendees_body_and_flags(tmp_path):
     assert event["my_response"] == "Organizer"
 
 
-def test_get_event_per_item_exception_maps_to_not_found(tmp_path):
+def test_get_event_per_item_exception_maps_to_not_found(tmp_path, db):
     class ErrorItemNotFound(Exception):
         pass
 
     account = MagicMock()
     account.fetch.return_value = iter([ErrorItemNotFound("object not found")])
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     alias = ctx.aliaser.alias_for("RAW-GONE", "e")
     res = _run(ctx, "get_event", {"id": alias})
     assert res["ok"] is False
@@ -242,7 +242,7 @@ def test_slots_long_duration_and_touching_edges_are_free():
 # --- check_availability ----------------------------------------------------------
 
 
-def test_check_availability_end_to_end(tmp_path):
+def test_check_availability_end_to_end(tmp_path, db):
     busy_view = SimpleNamespace(calendar_events=[
         SimpleNamespace(start=_dt(9), end=_dt(10), busy_type="Busy"),
         SimpleNamespace(start=_dt(13), end=_dt(14), busy_type="Free"),
@@ -250,7 +250,7 @@ def test_check_availability_end_to_end(tmp_path):
     free_view = SimpleNamespace(calendar_events=[])
     account = MagicMock()
     account.protocol.get_free_busy_info.return_value = iter([busy_view, free_view])
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "check_availability", {
         "attendees": ["a@corp.example", "b@corp.example"],
         "start": "2026-06-15T09:00", "end": "2026-06-15T11:00",
@@ -270,7 +270,7 @@ def test_check_availability_end_to_end(tmp_path):
     assert per["b@corp.example"] == []
 
 
-def test_check_availability_degrades_per_attendee(tmp_path):
+def test_check_availability_degrades_per_attendee(tmp_path, db):
     """One unresolvable attendee (external address, hidden calendar) gets an
     {'error': ...} entry and a warning; the call itself succeeds and slots
     are computed from the attendees that DID resolve."""
@@ -284,7 +284,7 @@ def test_check_availability_degrades_per_attendee(tmp_path):
     account.protocol.get_free_busy_info.return_value = iter([
         good_view, ErrorMailRecipientNotFound("no such mailbox"),
     ])
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "check_availability", {
         "attendees": ["a@corp.example", "ghost@external.example"],
         "start": "2026-06-15T09:00", "end": "2026-06-15T11:00",
@@ -297,12 +297,12 @@ def test_check_availability_degrades_per_attendee(tmp_path):
     assert any("ghost@external.example" in w for w in res["warnings"])
 
 
-def test_check_availability_all_attendees_failing_is_an_error(tmp_path):
+def test_check_availability_all_attendees_failing_is_an_error(tmp_path, db):
     account = MagicMock()
     account.protocol.get_free_busy_info.return_value = iter([
         RuntimeError("boom"),
     ])
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "check_availability", {
         "attendees": ["ghost@external.example"],
         "start": "2026-06-15T09:00", "end": "2026-06-15T11:00",
@@ -323,7 +323,7 @@ def _contact(raw_id, name, email, title=None, company=None, phone=None):
     )
 
 
-def test_find_people_auto_merges_and_gal_wins_duplicates(tmp_path):
+def test_find_people_auto_merges_and_gal_wins_duplicates(tmp_path, db):
     gal_entry = (
         SimpleNamespace(name="Ahmed Al-X", email_address="ahmed@corp.example"),
         SimpleNamespace(display_name="Ahmed Al-X", job_title="Director",
@@ -338,7 +338,7 @@ def test_find_people_auto_merges_and_gal_wins_duplicates(tmp_path):
                  title="Analyst", company="Elsewhere", phone="+966500000002"),
         _contact("C-RAW-3", "Sara", "sara@x.example"),  # no query match
     ]
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "find_people", {"query": "ahmed"})
     assert res["ok"] is True
     account.protocol.resolve_names.assert_called_once_with(
@@ -358,7 +358,7 @@ def test_find_people_auto_merges_and_gal_wins_duplicates(tmp_path):
     assert res["count"] == 2 and res["total_available"] == 2
 
 
-def test_find_people_gal_no_results_exception_is_skipped(tmp_path):
+def test_find_people_gal_no_results_exception_is_skipped(tmp_path, db):
     class ErrorNameResolutionNoResults(Exception):
         pass
 
@@ -367,17 +367,17 @@ def test_find_people_gal_no_results_exception_is_skipped(tmp_path):
         ErrorNameResolutionNoResults("no results")]
     account.contacts.all.return_value = [
         _contact("C-RAW-9", "Ahmed Junior", "junior@else.example")]
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "find_people", {"query": "junior"})
     assert res["ok"] is True
     assert [p["source"] for p in res["items"]] == ["contacts"]
 
 
-def test_find_people_source_contacts_never_hits_gal(tmp_path):
+def test_find_people_source_contacts_never_hits_gal(tmp_path, db):
     account = MagicMock()
     account.contacts.all.return_value = [
         _contact("C-RAW-5", "Ahmed Junior", "junior@else.example")]
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "find_people", {"query": "ahmed", "source": "contacts"})
     assert [p["email"] for p in res["items"]] == ["junior@else.example"]
     account.protocol.resolve_names.assert_not_called()
@@ -386,7 +386,7 @@ def test_find_people_source_contacts_never_hits_gal(tmp_path):
 # --- get_oof_settings ----------------------------------------------------------
 
 
-def test_get_oof_settings_html_stripped_and_capped(tmp_path):
+def test_get_oof_settings_html_stripped_and_capped(tmp_path, db):
     account = MagicMock()
     account.oof_settings = SimpleNamespace(
         state="Scheduled",
@@ -395,7 +395,7 @@ def test_get_oof_settings_html_stripped_and_capped(tmp_path):
         internal_reply="<p>سأكون خارج المكتب <b>حتى الخميس</b></p>",
         external_reply="<div>" + "external reply word " * 60 + "</div>",
     )
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "get_oof_settings", {})
     assert res["ok"] is True
     assert res["state"] == "scheduled"
@@ -409,9 +409,9 @@ def test_get_oof_settings_html_stripped_and_capped(tmp_path):
 # --- get_server_status -----------------------------------------------------------
 
 
-def test_get_server_status_with_manager_none(tmp_path):
+def test_get_server_status_with_manager_none(tmp_path, db):
     account = MagicMock()
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     ctx.registry = dict(SPEC)
     ctx.counters["tool.list_events"] = 3
     ctx.aliaser.alias_for("RAW-X", "m")
@@ -429,7 +429,7 @@ def test_get_server_status_with_manager_none(tmp_path):
     assert res["cache"]["ready"] is False  # no CacheStore in this ctx
 
 
-def test_get_server_status_not_cold_gated_while_connecting(tmp_path):
+def test_get_server_status_not_cold_gated_while_connecting(tmp_path, db):
     class _ColdManager:
         state = "connecting"
 
@@ -439,7 +439,7 @@ def test_get_server_status_not_cold_gated_while_connecting(tmp_path):
                     "next_retry_in_s": 30, "last_success_age_s": None}
 
     account = MagicMock()
-    ctx = _ctx(tmp_path, account)
+    ctx = _ctx(tmp_path, db, account)
     ctx.manager = _ColdManager()
     ctx.registry = dict(SPEC)
     res = _run(ctx, "get_server_status", {})

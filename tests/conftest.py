@@ -98,3 +98,18 @@ def make_settings(**overrides):
     )
     base.update(overrides)
     return Settings(**base)
+
+
+def make_context(db, gateway=None, cache=True, **overrides):
+    """A Context wired to the test database (aliases + mirror), no audit disk,
+    registry built. `cache=False` leaves ctx.cache None (pure-EWS reads)."""
+    from ewsmcp.cache.store import CacheStore
+    from ewsmcp.ids import IdAliaser
+    from ewsmcp.server import _NullAudit
+    from ewsmcp.tools import build_registry
+    from ewsmcp.tools.base import Context
+    ctx = Context(settings=make_settings(**overrides), gateway=gateway, manager=None,
+                  aliaser=IdAliaser(db), audit=_NullAudit(),
+                  cache=CacheStore(db) if cache else None, db=db)
+    build_registry(ctx)
+    return ctx
