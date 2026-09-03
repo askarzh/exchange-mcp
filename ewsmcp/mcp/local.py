@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import psycopg
@@ -82,93 +83,93 @@ async def _forward_after(ctx: Context, name: str, kwargs: dict[str, Any],
         raise
 
 
-async def list_folders(ctx: Context, **kw) -> dict[str, Any]:
+CacheCall = Callable[[], Awaitable[dict[str, Any] | None]]
+
+
+async def _cache_then_forward(ctx: Context, name: str, kw: dict[str, Any],
+                               cache_call: CacheCall | None,
+                               post: Callable[[dict[str, Any]], None] | None = None,
+                               ) -> dict[str, Any]:
+    """Shared skeleton for every cache-backed handler: try the mirror (when
+    `cache_call` is not None — the caller has already evaluated its guard,
+    e.g. `fresh`), apply `post` to a hit (only `get_mailbox_overview` needs
+    this, to stamp `connection`), else forward to ewsd — turning a bare
+    `daemon_unavailable` into `backend_unavailable` when the mirror was
+    unreachable too."""
     mirror_error = None
-    if not kw.get("fresh") and kw.get("parent") is None:
+    if cache_call is not None:
         try:
-            hit = await _try(ctx, lambda: cache_reads.list_folders(
-                ctx, int(kw.get("depth", 2)), bool(kw.get("include_empty", True))))
+            hit = await _try(ctx, cache_call)
         except _MirrorDown as down:
             hit, mirror_error = None, str(down)
         if hit is not None:
+            if post is not None:
+                post(hit)
             return hit
-    return await _forward_after(ctx, "list_folders", kw, mirror_error)
+    return await _forward_after(ctx, name, kw, mirror_error)
+
+
+async def list_folders(ctx: Context, **kw) -> dict[str, Any]:
+    cache_call = None
+    if not kw.get("fresh") and kw.get("parent") is None:
+        cache_call = lambda: cache_reads.list_folders(
+            ctx, int(kw.get("depth", 2)), bool(kw.get("include_empty", True)))
+    return await _cache_then_forward(ctx, "list_folders", kw, cache_call)
 
 
 async def search_messages(ctx: Context, **kw) -> dict[str, Any]:
     if kw.get("mode", "keyword") == "semantic":
         raise ToolError("validation", "semantic search is not available in this build "
                          "(it returns with the archive tier).", hint="Use mode='keyword'.")
-    mirror_error = None
+    cache_call = None
     if not kw.get("fresh"):
         sender = cache_reads.validate_search_args(
             kw.get("sender"), kw.get("from_"), kw.get("subject"), kw.get("since"),
             kw.get("until"), kw.get("is_unread"), kw.get("has_attachments"), kw.get("query"))
-        try:
-            hit = await _try(ctx, lambda: cache_reads.search_messages(
-                ctx, folder=kw.get("folder", "f:inbox"), query=kw.get("query"), sender=sender,
-                subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),
-                is_unread=kw.get("is_unread"), has_attachments=kw.get("has_attachments"),
-                offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20))))
-        except _MirrorDown as down:
-            hit, mirror_error = None, str(down)
-        if hit is not None:
-            return hit
-    return await _forward_after(ctx, "search_messages", kw, mirror_error)
+        cache_call = lambda: cache_reads.search_messages(
+            ctx, folder=kw.get("folder", "f:inbox"), query=kw.get("query"), sender=sender,
+            subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),
+            is_unread=kw.get("is_unread"), has_attachments=kw.get("has_attachments"),
+            offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20)))
+    return await _cache_then_forward(ctx, "search_messages", kw, cache_call)
 
 
 async def get_message(ctx: Context, **kw) -> dict[str, Any]:
-    mirror_error = None
+    cache_call = None
     if not kw.get("fresh") and not kw.get("include_html"):
-        try:
-            hit = await _try(ctx, lambda: cache_reads.get_message(
-                ctx, kw["id"], kw.get("format", "full")))
-        except _MirrorDown as down:
-            hit, mirror_error = None, str(down)
-        if hit is not None:
-            return hit
-    return await _forward_after(ctx, "get_message", kw, mirror_error)
+        cache_call = lambda: cache_reads.get_message(
+            ctx, kw["id"], kw.get("format", "full"))
+    return await _cache_then_forward(ctx, "get_message", kw, cache_call)
 
 
 async def get_thread(ctx: Context, **kw) -> dict[str, Any]:
-    mirror_error = None
+    cache_call = None
     if not kw.get("fresh"):
-        try:
-            hit = await _try(ctx, lambda: cache_reads.get_thread(
-                ctx, kw["id"], int(kw.get("limit", 20)), int(kw.get("offset", 0))))
-        except _MirrorDown as down:
-            hit, mirror_error = None, str(down)
-        if hit is not None:
-            return hit
-    return await _forward_after(ctx, "get_thread", kw, mirror_error)
+        cache_call = lambda: cache_reads.get_thread(
+            ctx, kw["id"], int(kw.get("limit", 20)), int(kw.get("offset", 0)))
+    return await _cache_then_forward(ctx, "get_thread", kw, cache_call)
 
 
 async def get_mailbox_overview(ctx: Context, **kw) -> dict[str, Any]:
-    mirror_error = None
+    cache_call = None
     if not kw.get("fresh"):
-        try:
-            hit = await _try(ctx, lambda: cache_reads.overview(
-                ctx, int(kw.get("horizon_days", 1))))
-        except _MirrorDown as down:
-            hit, mirror_error = None, str(down)
-        if hit is not None:
-            hit["connection"] = "via-ewsd"
-            return hit
-    return await _forward_after(ctx, "get_mailbox_overview", kw, mirror_error)
+        cache_call = lambda: cache_reads.overview(
+            ctx, int(kw.get("horizon_days", 1)))
+
+    def _mark_via_ewsd(hit: dict[str, Any]) -> None:
+        hit["connection"] = "via-ewsd"
+
+    return await _cache_then_forward(ctx, "get_mailbox_overview", kw, cache_call,
+                                     post=_mark_via_ewsd)
 
 
 async def list_tasks(ctx: Context, **kw) -> dict[str, Any]:
-    mirror_error = None
+    cache_call = None
     if not kw.get("fresh"):
-        try:
-            hit = await _try(ctx, lambda: cache_reads.list_tasks(
-                ctx, bool(kw.get("include_completed", False)), int(kw.get("offset", 0)),
-                int(kw.get("limit", 25))))
-        except _MirrorDown as down:
-            hit, mirror_error = None, str(down)
-        if hit is not None:
-            return hit
-    return await _forward_after(ctx, "list_tasks", kw, mirror_error)
+        cache_call = lambda: cache_reads.list_tasks(
+            ctx, bool(kw.get("include_completed", False)), int(kw.get("offset", 0)),
+            int(kw.get("limit", 25)))
+    return await _cache_then_forward(ctx, "list_tasks", kw, cache_call)
 
 
 async def waiting_on(ctx: Context, **kw) -> dict[str, Any]:
