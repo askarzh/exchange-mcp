@@ -151,6 +151,19 @@ def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
     }
 
 
+@pytest.fixture
+def store_with_message(db):
+    """A CacheStore holding exactly one live inbox message, plus its ews_id."""
+    from ewsmcp.cache.store import CacheStore
+    store = CacheStore(db)
+    store.replace_folders([
+        {"ews_id": "FID-INBOX", "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
+         "total": 1, "unread": 0, "children": 0},
+    ])
+    store.upsert_messages([make_row("RAW-1")])
+    return store, "RAW-1"
+
+
 def make_context(db, gateway=None, cache=True, audit_dir=None, **overrides):
     """A Context wired to the test database (aliases + mirror), registry built.
 
