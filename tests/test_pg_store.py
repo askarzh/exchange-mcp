@@ -230,6 +230,38 @@ def test_search_folds_cyrillic_yo_to_ye(store):
     assert total == 1 and rows[0]["ews_id"] == "M1"
 
 
+def test_search_ands_across_tokens_not_just_ors_within_one(store):
+    """Each per-token OR group (the lexemes one input token folds/splits
+    into) must be parenthesised: tsquery binds "&" tighter than "|", so an
+    unparenthesised "'1':* | 'budget':* & 'review':*" parses as
+    "1 | (budget & review)" and would wrongly match a document that only
+    has "1"."""
+    store.upsert_messages([
+        make_row("ONE", subject="1 apples", body=""),
+        make_row("BOTH", subject="budget review", body=""),
+    ])
+    # "⑴budget" folds/re-lexes to the group ('1':* | 'budget':*); ANDed with
+    # 'review':* it must require BOTH "review" and (1 or budget) — ONE (just
+    # "1") must NOT match.
+    rows, total = store.search_messages(text="⑴budget review")
+    assert total == 1 and rows[0]["ews_id"] == "BOTH"
+    # plain multi-token search is unaffected by the parenthesisation.
+    rows, total = store.search_messages(text="budget review")
+    assert total == 1 and rows[0]["ews_id"] == "BOTH"
+
+
+def test_search_underscore_token_group_stays_anded_with_the_next_token(store):
+    """An ordinary token with an underscore (e.g. "report_v2") splits into
+    more than one lexeme too ('report', 'v2') — its OR group must not leak
+    into the AND with the following token."""
+    store.upsert_messages([
+        make_row("REPORT_ONLY", subject="report status update", body=""),
+        make_row("BOTH", subject="report v2 budget numbers", body=""),
+    ])
+    rows, total = store.search_messages(text="report_v2 budget")
+    assert total == 1 and rows[0]["ews_id"] == "BOTH"
+
+
 def test_prefix_tsquery_builds_an_and_of_prefixes():
     from ewsmcp.cache.store import prefix_tsquery
     assert prefix_tsquery("Budget Review") == "budget:* & review:*"

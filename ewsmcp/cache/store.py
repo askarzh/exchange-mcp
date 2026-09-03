@@ -47,13 +47,17 @@ _SENT_ID = "(SELECT ews_id FROM ews.folders WHERE wk = 'f:sent' LIMIT 1)"
 # post-folding; a token that splits into more than one lexeme (e.g. the
 # circled digit example, "(1)budget" -> '1','budget') ORs its lexemes
 # together — either could be "the word" the user meant — and distinct
-# original tokens AND together, same as plain prefix search. A token that
-# folds to nothing (pure punctuation) drops out; if every token does,
-# string_agg returns NULL and to_tsquery(NULL) is NULL (matches nothing,
-# never raises).
+# original tokens AND together, same as plain prefix search. Each per-token
+# OR group is wrapped in parens: tsquery binds "&" tighter than "|", so an
+# unparenthesised "'1':* | 'budget':* & 'review':*" parses as
+# "1 | (budget & review)" and would match a document containing only "1" —
+# ("1":* | "budget":*) & "review":* is what "and across tokens" actually
+# requires. A token that folds to nothing (pure punctuation) drops out; if
+# every token does, string_agg returns NULL and to_tsquery(NULL) is NULL
+# (matches nothing, never raises).
 _TSQUERY = """
 (SELECT to_tsquery('simple', string_agg(grp, ' & '))
-   FROM (SELECT string_agg(lex || ':*', ' | ') AS grp
+   FROM (SELECT '(' || string_agg(lex || ':*', ' | ') || ')' AS grp
            FROM unnest(%s::text[]) WITH ORDINALITY AS tok(word, ord)
            CROSS JOIN LATERAL unnest(tsvector_to_array(to_tsvector(
                'simple', ews.immutable_unaccent(lower(tok.word))))) AS lex
@@ -69,11 +73,15 @@ def _tokens(query: str | None) -> list[str]:
 
 
 def prefix_tsquery(query: str) -> str:
-    """Preview of the prefix expression ``_TSQUERY`` builds server-side:
-    every word becomes a prefix term, terms are ANDed. This Python-only
-    rendering does NOT fold accents (that happens in SQL) — it exists for
-    callers that just need to know whether `query` is searchable at all.
-    Returns "" when nothing is searchable."""
+    """Rough, Python-only PREVIEW of the shape ``_TSQUERY`` builds
+    server-side — every word becomes a prefix term, terms are ANDed. It does
+    NOT fold accents and does NOT re-lex a token that unaccent might split
+    into more than one lexeme (both happen only in SQL, in ``_TSQUERY`` —
+    see its docstring); it is not what actually runs against Postgres, and
+    its output must never be interpolated into a real query. `search_messages`
+    does not call it — it exists as a small, stable interface for a caller
+    that just wants to know whether `query` is searchable at all (a
+    non-empty result). Returns "" when nothing is searchable."""
     return " & ".join(f"{t}:*" for t in _tokens(query))
 
 
