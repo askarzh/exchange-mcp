@@ -86,6 +86,34 @@ class Settings(BaseSettings):
     default_page_size: int = Field(default=20, le=50)
     body_max_chars: int = 4000
 
+    # --- Embeddings (daemon only; the MCP must never hold this key) ----------
+    gemini_api_key: str | None = None
+    embed_dims: int = 768  # fixed by migration 003's vector(768) column
+
+    # --- Archive pipeline (daemon only) --------------------------------------
+    archive_folders: str = "inbox,sent"        # well-known keys, never calendar/contacts/tasks
+    archive_after_days: int = 180
+    archive_exclude_categories: str = ""
+    archive_grace_days: int = 7
+    archive_delete_enabled: bool = False       # rail 1 of 3: deletion is OFF by default
+    archive_max_delete_per_run: int = 200
+    archive_min_free_gb: float = 2.0
+    archive_cycle_seconds: int = 300
+
+    @model_validator(mode="after")
+    def _check_embed_dims(self) -> "Settings":
+        if self.embed_dims != 768:
+            raise ValueError(
+                f"EMBED_DIMS must be 768 (got {self.embed_dims}): migration 003 "
+                "declares chunks.embedding as vector(768). Changing the width "
+                "needs a new migration that rebuilds the column and its index."
+            )
+        return self
+
+    def semantic_enabled(self) -> bool:
+        """Semantic search needs a remote embedder; without a key we stay keyword-only."""
+        return bool(self.gemini_api_key)
+
     @model_validator(mode="after")
     def _resolve_data_dir(self) -> "Settings":
         raw = self.data_dir or str(Path.home() / ".ewsmcp")

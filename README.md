@@ -165,6 +165,16 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `EWS_CACHE_SYNC_SECONDS` | `45` | Delta cadence |
 | `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence. The folder walk clears exchangelib's cached tree and re-fetches it this often (not every cycle), so a new or deleted folder and fresh unread counts show up within this window while mail keeps syncing every `EWS_CACHE_SYNC_SECONDS`. |
 | `EWS_TZ` | `Asia/Riyadh` | Server timezone for date grammar + display |
+| `GEMINI_API_KEY` | — | Daemon-only; `ewsmcp` must never hold it. Semantic search stays keyword-only (`semantic_enabled()` is `False`) until this is set |
+| `EMBED_DIMS` | `768` | Fixed by migration 003's `vector(768)` column; any other value fails to boot |
+| `ARCHIVE_FOLDERS` | `inbox,sent` | Well-known folder keys the archive pipeline captures; never calendar/contacts/tasks |
+| `ARCHIVE_AFTER_DAYS` | `180` | Age cutoff (days) before a message becomes eligible for archival |
+| `ARCHIVE_EXCLUDE_CATEGORIES` | — | Comma-separated categories excluded from archival |
+| `ARCHIVE_GRACE_DAYS` | `7` | Extra days past the cutoff a `verified` row must age before it is eligible for deletion |
+| `ARCHIVE_DELETE_ENABLED` | `false` | Deletion rail 1 of 3 — OFF by default; deletion also needs tier `full` and the per-run cap |
+| `ARCHIVE_MAX_DELETE_PER_RUN` | `200` | Deletion rail 2 of 3 — per-run cap |
+| `ARCHIVE_MIN_FREE_GB` | `2.0` | Minimum free disk space required before each archive batch |
+| `ARCHIVE_CYCLE_SECONDS` | `300` | Archive pipeline run cadence |
 
 ## The send flow (two-phase, content-bound)
 
