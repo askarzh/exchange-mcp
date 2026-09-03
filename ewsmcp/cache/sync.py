@@ -50,8 +50,8 @@ def _ts(dt: Any) -> int | None:
         return None
 
 
-def row_from_message(item: Any, folder_key: str, tz: str) -> dict[str, Any]:
-    """Message item → mirror row. Body cleaned HERE (the 700× paid once)."""
+def row_from_message(item: Any, folder_id: str, tz: str) -> dict[str, Any]:
+    """Message item → mirror row. The body is cleaned HERE, once, at sync time."""
     sender = getattr(item, "sender", None)
     sender_email = getattr(sender, "email_address", None) or ""
     sender_name = getattr(sender, "name", None) or ""
@@ -74,7 +74,7 @@ def row_from_message(item: Any, folder_key: str, tz: str) -> dict[str, Any]:
     return {
         "ews_id": str(item.id),
         "changekey": getattr(item, "changekey", None),
-        "folder": folder_key,
+        "folder_id": folder_id,
         "conversation_id": getattr(conv, "id", None),
         "sender_name": sender_name,
         "sender_email": sender_email,
@@ -89,8 +89,6 @@ def row_from_message(item: Any, folder_key: str, tz: str) -> dict[str, Any]:
                                       ensure_ascii=False),
         "body_clean": body_clean,
         "internet_message_id": imid if isinstance(imid, str) else None,
-        "norm_text": CacheStore.norm_for_row(subject, sender_name,
-                                             sender_email, body_clean),
     }
 
 
@@ -203,7 +201,10 @@ class SyncEngine:
             folder = getattr(account, key, None)
             if folder is None:
                 continue
-            token = self.store.get_sync_state(f"item:{key}")
+            folder_id = str(getattr(folder, "id", "") or "")
+            if not folder_id:
+                continue
+            token = self.store.get_sync_state(f"item:{folder_id}")
             upserts: list[dict[str, Any]] = []
             deletes: list[str] = []
             read_flags: list[tuple] = []
@@ -215,7 +216,7 @@ class SyncEngine:
                     if received is not None and received < window_floor:
                         continue  # outside the mirror window — skip storing
                     if getattr(payload, "id", None):
-                        upserts.append(row_from_message(payload, key, tz))
+                        upserts.append(row_from_message(payload, folder_id, tz))
                 elif change_type == "delete":
                     deletes.append(str(payload.id))
                 elif change_type == "read_flag_change":
@@ -225,7 +226,7 @@ class SyncEngine:
             self.store.delete_messages_by_id(deletes)
             for ews_id, is_read in read_flags:
                 self.store.set_read_flag([ews_id], is_read)
-            self.store.set_sync_state(f"item:{key}", folder.item_sync_state,
+            self.store.set_sync_state(f"item:{folder_id}", folder.item_sync_state,
                                       time.time())
 
     def _sync_slow_lane(self, account: Any) -> None:

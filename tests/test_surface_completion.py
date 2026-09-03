@@ -1,14 +1,22 @@
 """Phase F surface: tasks pack, get_contact, waiting_on, semantic mode
-(reserved/unavailable), /metrics, learned-signature stripping."""
+(reserved/unavailable), /metrics."""
 
 import asyncio
 import time
 from datetime import date
 from types import SimpleNamespace
 
-from conftest import FakeGateway, make_context, make_row, make_settings
+from conftest import (
+    INBOX_ID,
+    SENT_ID,
+    FakeGateway,
+    make_context,
+    make_row,
+    make_settings,
+    seed_folders,
+)
 
-from ewsmcp.cache.store import SIG_MIN_HITS, CacheStore
+from ewsmcp.cache.store import CacheStore
 from ewsmcp.tools.base import dispatch
 
 
@@ -109,12 +117,13 @@ def test_update_task_complete_and_due(tmp_path, db):
 
 def test_waiting_on_from_mirror(tmp_path, db):
     store = CacheStore(db)
+    seed_folders(store)
     now = int(time.time())
     store.upsert_messages([
-        make_row("S1", conv="CW", folder="sent", date_ts=now - 6 * 86400,
+        make_row("S1", conv="CW", folder_id=SENT_ID, date_ts=now - 6 * 86400,
                  subject="Pending decision", to=["boss@corp.example"]),
     ])
-    store.set_sync_state("item:sent", "TOK", now)
+    store.set_sync_state(f"item:{SENT_ID}", "TOK", now)
     ctx = _ctx(tmp_path, db, cache=store)
     res = _run(ctx, "waiting_on", days=5)
     assert res["source"] == "cache"
@@ -170,6 +179,7 @@ def test_get_contact_mirror_fallback_when_gal_down(tmp_path, db):
 
 def _sem_store(db):
     store = CacheStore(db)
+    seed_folders(store)
     now = int(time.time())
     store.upsert_messages([
         make_row("K1", subject="Vendor contract", body="terms agreed",
@@ -179,7 +189,7 @@ def _sem_store(db):
         make_row("K3", subject="Weekly report", body="numbers inside",
                  date_ts=now - 100),
     ])
-    store.set_sync_state("item:inbox", "TOK", now)
+    store.set_sync_state(f"item:{INBOX_ID}", "TOK", now)
     return store
 
 
@@ -188,26 +198,6 @@ def test_semantic_mode_is_a_clear_validation_error(tmp_path, db):
     res = _run(ctx, "search_messages", query="vendor", mode="semantic")
     assert res["error"]["code"] == "validation"
     assert "keyword" in res["error"]["hint"]
-
-
-# --- learned signature stripping -----------------------------------------------
-
-
-def test_signature_learned_after_min_hits(tmp_path, db):
-    store = CacheStore(db)
-    sig = "Best regards\nBoss Person\nDirector, Acme"
-    for i in range(SIG_MIN_HITS):
-        store.upsert_messages([make_row(
-            f"S{i}", sender_email="boss@corp.example",
-            body=f"Message number {i} content.\n\n{sig}")])
-    body = f"Fresh content here.\n\n{sig}"
-    stripped = store.strip_learned_signature("boss@corp.example", body)
-    assert stripped == "Fresh content here."
-    # A different sender with the same block is NOT affected.
-    assert store.strip_learned_signature("other@corp.example", body) == body
-    # One-off trailing content is never stripped.
-    once = "Some text.\n\nUnique closing line"
-    assert store.strip_learned_signature("boss@corp.example", once) == once
 
 
 # --- /metrics --------------------------------------------------------------------

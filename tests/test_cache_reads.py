@@ -3,34 +3,34 @@
 import asyncio
 import time
 
-from conftest import make_context, make_row
+from conftest import INBOX_ID, make_context, make_row, seed_folders
 
 from ewsmcp.tools import cache_reads
 
 
 def _seed(ctx):
+    seed_folders(ctx.cache)
     now = int(time.time())
     ctx.cache.upsert_messages([make_row("RAW-1", subject="Budget", date_ts=now - 10)])
-    ctx.cache.set_sync_state("item:inbox", "TOK", now)
+    ctx.cache.set_sync_state(f"item:{INBOX_ID}", "TOK", now)
 
 
-def test_folder_key_uses_watermarks_not_settings(db):
-    ctx = make_context(db)
-    assert cache_reads.folder_key(ctx, "f:inbox") is None  # nothing synced yet
-    _seed(ctx)
-    assert cache_reads.folder_key(ctx, "f:inbox") == "inbox"
-    assert cache_reads.folder_key(ctx, "inbox") == "inbox"
-    assert cache_reads.folder_key(ctx, "f:sent") is None
-    assert cache_reads.folder_key(ctx, None) == "inbox"
-
-
-def test_search_returns_none_for_unmirrored_folder(db):
+def test_search_of_an_unsynced_folder_is_empty_not_an_error(db):
     ctx = make_context(db)
     _seed(ctx)
     out = asyncio.run(cache_reads.search_messages(
-        ctx, folder="f:junk", query=None, sender=None, subject=None, since=None,
+        ctx, folder="f:sent", query=None, sender=None, subject=None, since=None,
         until=None, is_unread=None, has_attachments=None, offset=0, limit=10))
-    assert out is None
+    assert out["ok"] is True and out["count"] == 0
+
+
+def test_resolve_folder_id_uses_the_folders_table(db):
+    ctx = make_context(db)
+    seed_folders(ctx.cache)
+    assert cache_reads.resolve_folder_id(ctx, "f:inbox") == INBOX_ID
+    assert cache_reads.resolve_folder_id(ctx, "inbox") == INBOX_ID
+    assert cache_reads.resolve_folder_id(ctx, INBOX_ID) == INBOX_ID
+    assert cache_reads.resolve_folder_id(ctx, "Inbox") == INBOX_ID  # path
 
 
 def test_search_hit_is_stamped(db):

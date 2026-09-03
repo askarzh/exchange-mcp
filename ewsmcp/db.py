@@ -22,7 +22,7 @@ from psycopg_pool import ConnectionPool
 logger = logging.getLogger(__name__)
 
 SCHEMA = "ews"
-SCHEMA_VERSION = 1  # bump together with the newest migrations/NNN_*.sql
+SCHEMA_VERSION = 2  # bump together with the newest migrations/NNN_*.sql
 _MIGRATION_RE = re.compile(r"^(\d{3})_[a-z0-9_]+\.sql$")
 _MIGRATE_LOCK_KEY = 7355608  # arbitrary, stable advisory-lock id
 

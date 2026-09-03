@@ -134,12 +134,13 @@ def test_search_envelope_alias_ids_and_clean_snippet(tmp_path, db):
     assert "OLD QUOTED" not in res["items"][0]["snippet"]
 
 
-def test_search_engine_conflict_is_validation_error(tmp_path, db):
+def test_search_query_and_structured_filters_no_longer_conflict(tmp_path, db):
+    """Phase 1.5 removed the AQS-exclusivity rule: `query` combines freely
+    with structured filters (the mirror path ANDs them; the live-fallback
+    path here still passes the AQS string straight through)."""
     ctx = _ctx(tmp_path, db, _account())
     res = _run(ctx, "search_messages", query="from:ahmed", subject="rfp")
-    assert res["ok"] is False
-    assert res["error"]["code"] == "validation"
-    assert "hint" in res["error"]
+    assert res["ok"] is True
 
 
 def test_search_aqs_passes_query_string_to_filter(tmp_path, db):

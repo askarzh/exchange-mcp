@@ -20,6 +20,7 @@ class FakeFolder:
 
     def __init__(self, name):
         self.name = name
+        self.id = f"F-{name.upper()}"
         self.batches = []
         self.item_sync_state = None
         self.seen_tokens = []
@@ -73,7 +74,7 @@ def test_cycle_applies_creates_updates_deletes_and_read_flags(db):
     engine, store = _engine(db, account)
     asyncio.run(engine._cycle())
     assert store.get_message("M1")["subject"] == "First"
-    assert store.get_sync_state("item:inbox") == "TOK-1"
+    assert store.get_sync_state("item:F-INBOX") == "TOK-1"
 
     account.inbox.queue([
         ("update", _msg("M1", subject="First (edited)")),
@@ -85,7 +86,7 @@ def test_cycle_applies_creates_updates_deletes_and_read_flags(db):
     assert row["subject"] == "First (edited)"
     assert row["is_read"] == 1
     assert store.get_message("M2") is None
-    assert store.get_sync_state("item:inbox") == "TOK-2"
+    assert store.get_sync_state("item:F-INBOX") == "TOK-2"
     # the second sync resumed FROM the first token
     assert account.inbox.seen_tokens[-1] == "TOK-1"
 
@@ -122,10 +123,10 @@ def test_cycle_failure_degrades_not_dies(db):
 def test_row_from_message_cleans_body_once(tmp_path):
     quoted = ("Latest reply only.\n\nFrom: Someone <s@corp.example>\n"
               "Sent: Monday\nTo: Exec\nSubject: Re: X\n\nOLD QUOTED TEXT")
-    row = row_from_message(_msg("M1", body=quoted), "inbox", "Asia/Riyadh")
+    row = row_from_message(_msg("M1", body=quoted), "F-INBOX", "Asia/Riyadh")
     assert "OLD QUOTED" not in row["body_clean"]
     assert row["body_clean"].startswith("Latest reply only.")
-    assert row["norm_text"]  # normalized shadow present for FTS
+    assert row["folder_id"] == "F-INBOX"
     assert row["internet_message_id"] == "<M1@corp.example>"
 
 

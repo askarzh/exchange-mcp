@@ -123,9 +123,7 @@ async def search_messages(ctx: Context, **kw) -> dict[str, Any]:
                          "(it returns with the archive tier).", hint="Use mode='keyword'.")
     cache_call = None
     if not kw.get("fresh"):
-        sender = cache_reads.validate_search_args(
-            kw.get("sender"), kw.get("from_"), kw.get("subject"), kw.get("since"),
-            kw.get("until"), kw.get("is_unread"), kw.get("has_attachments"), kw.get("query"))
+        sender = cache_reads.validate_search_args(kw.get("sender"), kw.get("from_"))
         cache_call = lambda: cache_reads.search_messages(
             ctx, folder=kw.get("folder", "f:inbox"), query=kw.get("query"), sender=sender,
             subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),

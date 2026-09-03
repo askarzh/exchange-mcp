@@ -16,7 +16,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from conftest import FakeGateway, make_context, make_row
+from conftest import INBOX_ID, SENT_ID, FakeGateway, make_context, make_row, seed_folders
 
 from ewsmcp.cache.store import CacheStore
 from ewsmcp.tools.base import dispatch
@@ -26,6 +26,7 @@ RAW_EWS_ID = "AAMkAGI2TG93AAA" + "x" * 120 + "="  # realistically long
 
 def _seed(db):
     store = CacheStore(db)
+    seed_folders(store)
     now = int(time.time())
     store.upsert_messages([
         make_row(RAW_EWS_ID, subject="Q3 budget approval",
@@ -35,8 +36,8 @@ def _seed(db):
         make_row("OTHER-1", subject="Unrelated", sender_email="x@example.com",
                  body="noise", date_ts=now - 60, conv="CONV-X"),
     ])
-    store.set_sync_state("item:inbox", "TOK", now)
-    store.set_sync_state("item:sent", "TOK", now)
+    store.set_sync_state(f"item:{INBOX_ID}", "TOK", now)
+    store.set_sync_state(f"item:{SENT_ID}", "TOK", now)
     return store
 
 

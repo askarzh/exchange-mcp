@@ -8,7 +8,7 @@ read never touches Exchange.
 import asyncio
 import time
 
-from conftest import FakeGateway, make_context, make_row
+from conftest import INBOX_ID, SENT_ID, FakeGateway, make_context, make_row, seed_folders
 
 from ewsmcp.cache.store import CacheStore
 from ewsmcp.tools.base import Context, dispatch
@@ -16,19 +16,20 @@ from ewsmcp.tools.base import Context, dispatch
 
 def seeded_store(db):
     store = CacheStore(db)
+    seed_folders(store)
     now = int(time.time())
     store.upsert_messages([
         make_row("RAW-1", subject="Budget review", sender_email="a@corp.example",
                  body="please review the numbers", date_ts=now - 300,
                  conv="C1", is_read=0),
-        make_row("RAW-2", subject="Re: Budget review", folder="sent",
+        make_row("RAW-2", subject="Re: Budget review", folder_id=SENT_ID,
                  sender_email="exec@corp.example", body="looks good",
                  date_ts=now - 200, conv="C1"),
         make_row("RAW-3", subject="Lunch", sender_email="b@corp.example",
                  body="see you at noon", date_ts=now - 100, conv="C2"),
     ])
-    store.set_sync_state("item:inbox", "TOK", now)
-    store.set_sync_state("item:sent", "TOK", now)
+    store.set_sync_state(f"item:{INBOX_ID}", "TOK", now)
+    store.set_sync_state(f"item:{SENT_ID}", "TOK", now)
     store.set_sync_state("events", None, now)
     store.replace_events([{
         "ews_id": "EV1", "changekey": None, "subject": "Standup",
@@ -37,10 +38,12 @@ def seeded_store(db):
         "location": None, "organizer": None, "is_recurring": 0,
         "my_response": None,
     }])
-    store.replace_folders([{
-        "ews_id": "F-IN", "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
-        "total": 3, "unread": 1, "children": 0,
-    }])
+    # seed_folders already wrote the inbox row; layer in the counts
+    # test_list_folders_from_mirror and test_overview_pure_mirror assert on.
+    store.replace_folders([
+        {"ews_id": INBOX_ID, "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
+         "total": 3, "unread": 1, "children": 0},
+    ])
     return store
 
 
@@ -103,8 +106,8 @@ def test_list_folders_from_mirror(tmp_path, db):
     ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "list_folders")
     assert res["source"] == "cache"
-    assert res["items"][0]["wk"] == "f:inbox"
-    assert res["items"][0]["unread"] == 1
+    inbox = next(r for r in res["items"] if r["wk"] == "f:inbox")
+    assert inbox["unread"] == 1
 
 
 def test_fresh_true_forces_live(tmp_path, db):
@@ -115,43 +118,41 @@ def test_fresh_true_forces_live(tmp_path, db):
     assert res["ok"] is False
 
 
-def test_uncached_folder_goes_live(tmp_path, db):
+def test_unmirrored_folder_is_a_validation_error(tmp_path, db):
+    """f:junk isn't in ews.folders (only f:inbox is, after the seed above),
+    so resolve_folder_id raises before the gateway is ever touched."""
     ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "search_messages", folder="f:junk")
-    assert res["ok"] is False  # gateway raised → live path was chosen
+    assert res["ok"] is False
 
 
 def test_cache_error_falls_back_to_live(tmp_path, db):
-    account = None
-    gateway = FakeGateway()
+    """search_messages now answers store-only (Task 4/6): a mirror error there
+    propagates rather than falling back. get_message still falls back — its
+    cache_reads helper keeps its own try/except — so it carries this test."""
+    from types import SimpleNamespace
 
-    class _Query(list):
-        total_count = 0
+    class Item:
+        id = "RAW-1"
+        subject = "Live subject"
+        sender = SimpleNamespace(email_address="a@corp.example", name="A")
+        datetime_received = None
+        is_read = True
+        has_attachments = False
+        conversation_id = None
+        to_recipients = []
+        text_body = "live body"
+        message_id = None
 
-        def filter(self, *a, **k):
-            return self
-
-        def only(self, *a):
-            return self
-
-        def order_by(self, *a):
-            return self
-
-        def refresh(self):
-            pass
-
-    from unittest.mock import MagicMock
-    account = MagicMock()
-    account.inbox = _Query()
-    gateway.account = account
-    gateway.folders = {"f:inbox": account.inbox, None: account.inbox}
+    account = SimpleNamespace(fetch=lambda ids, only_fields=None: [Item()])
+    gateway = FakeGateway(account)
     ctx = _ctx(tmp_path, db, gateway)
 
-    def boom(**kwargs):
+    def boom(raw_id):
         raise RuntimeError("mirror unavailable")
 
-    ctx.cache.search_messages = boom
-    res = _run(ctx, "search_messages")
+    ctx.cache.get_message = boom
+    res = _run(ctx, "get_message", id="RAW-1", format="concise")
     assert res["ok"] is True
     assert res["source"] == "live"
     assert gateway.calls == 1

@@ -5,7 +5,7 @@ import asyncio
 import time
 
 import httpx
-from conftest import make_context, make_row, make_settings
+from conftest import INBOX_ID, SENT_ID, make_context, make_row, make_settings, seed_folders
 
 from ewsmcp.daemon import build_daemon_app
 from ewsmcp.mcp.client import DaemonClient
@@ -48,15 +48,16 @@ def _mcp_ctx(db, daemon, **overrides):
 
 
 def _seed(ctx):
+    seed_folders(ctx.cache)
     now = int(time.time())
     ctx.cache.upsert_messages([
         make_row("RAW-1", subject="Budget review", body="please review", conv="C1",
                  is_read=0, date_ts=now - 300),
-        make_row("RAW-2", subject="Re: Budget review", folder="sent", conv="C1",
+        make_row("RAW-2", subject="Re: Budget review", folder_id=SENT_ID, conv="C1",
                  sender_email="exec@corp.example", body="looks good", date_ts=now - 200),
     ])
-    ctx.cache.set_sync_state("item:inbox", "T", now)
-    ctx.cache.set_sync_state("item:sent", "T", now)
+    ctx.cache.set_sync_state(f"item:{INBOX_ID}", "T", now)
+    ctx.cache.set_sync_state(f"item:{SENT_ID}", "T", now)
     ctx.cache.set_sync_state("events", None, now)
 
 
@@ -96,15 +97,36 @@ def test_fresh_and_misses_fall_through_to_daemon(db):
     ctx = _mcp_ctx(db, daemon)
     _seed(ctx)
     _run(ctx, "get_message", id="RAW-1", fresh=True)
-    _run(ctx, "search_messages", folder="f:junk")
     _run(ctx, "get_message", id="UNKNOWN-RAW")
-    assert [c[0] for c in daemon.calls] == ["get_message", "search_messages", "get_message"]
+    assert [c[0] for c in daemon.calls] == ["get_message", "get_message"]
     assert daemon.calls[0][1]["fresh"] is True
+
+
+def test_unmirrored_folder_is_a_validation_error_without_touching_the_daemon(db):
+    """search_messages now resolves the folder against ews.folders and raises
+    ToolError before ever reaching the mirror or the daemon (Task 4/6)."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    res = _run(ctx, "search_messages", folder="f:doesnotexist")
+    assert res["ok"] is False and res["error"]["code"] == "not_found"
+    assert daemon.calls == []
+
+
+def test_search_of_a_mirrored_but_unsynced_folder_is_empty(db):
+    """f:junk is known (seed_folders wrote it) but never synced — an empty
+    cache-served result, not a fall-through to the daemon."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    res = _run(ctx, "search_messages", folder="f:junk")
+    assert res["ok"] is True and res["source"] == "cache" and res["count"] == 0
+    assert daemon.calls == []
 
 
 def test_daemon_down_on_miss_is_daemon_unavailable(db):
     ctx = _mcp_ctx(db, DeadDaemon())
-    res = _run(ctx, "search_messages", folder="f:junk")
+    res = _run(ctx, "get_message", id="UNKNOWN-RAW")
     assert res["ok"] is False and res["error"]["code"] == "daemon_unavailable"
 
 

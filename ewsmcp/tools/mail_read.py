@@ -220,8 +220,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
         raise ToolError("validation",
                         "semantic search is not available in this build (it returns "
                         "with the archive tier).", hint="Use mode='keyword'.")
-    sender = cache_reads.validate_search_args(
-        sender, from_, subject, since, until, is_unread, has_attachments, query)
+    sender = cache_reads.validate_search_args(sender, from_)
     tz = ctx.settings.ews_tz
 
     # ---- cache-first: local FTS + SQL filters, exact COUNT(*) total -------

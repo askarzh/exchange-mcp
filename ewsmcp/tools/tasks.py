@@ -133,7 +133,7 @@ async def _waiting_on(ctx: Context, days: int = 5,
                       limit: int = 25) -> Dict[str, Any]:
     days = max(1, min(int(days), 90))
     limit = max(1, min(int(limit), 50))
-    if ctx.cache is None or not ctx.cache.watermark("item:sent"):
+    if ctx.cache is None or not cache_reads.wk_watermark(ctx, "f:sent"):
         raise ToolError(
             "upstream_unavailable",
             "waiting_on needs the local mirror (sent folder not synced yet)",

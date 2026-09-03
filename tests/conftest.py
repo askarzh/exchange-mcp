@@ -101,16 +101,34 @@ class FakeGateway:
         return getattr(self.account, "inbox", None)
 
 
-def make_row(ews_id, *, folder="inbox", subject="Budget review",
+INBOX_ID = "F-INBOX"
+SENT_ID = "F-SENT"
+JUNK_ID = "F-JUNK"
+
+_FOLDER_ROWS = [
+    {"ews_id": INBOX_ID, "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
+     "total": 0, "unread": 0, "children": 0},
+    {"ews_id": SENT_ID, "name": "Sent Items", "path": "Sent Items", "wk": "f:sent",
+     "total": 0, "unread": 0, "children": 0},
+    {"ews_id": JUNK_ID, "name": "Junk Email", "path": "Junk Email", "wk": "f:junk",
+     "total": 0, "unread": 0, "children": 0},
+]
+
+
+def seed_folders(store):
+    """The hierarchy rows every folder-id lookup resolves against."""
+    store.replace_folders([dict(r) for r in _FOLDER_ROWS])
+
+
+def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
              sender_email="a@corp.example", sender_name="Ahmed",
              body="please review the numbers", date_ts=None, is_read=1,
              has_attachments=0, conv="CONV-1", imid=None, to=None):
     """One `CacheStore.upsert_messages` row."""
-    from ewsmcp.cache.store import CacheStore
     return {
         "ews_id": ews_id,
         "changekey": "CK",
-        "folder": folder,
+        "folder_id": folder_id,
         "conversation_id": conv,
         "sender_name": sender_name,
         "sender_email": sender_email,
@@ -124,8 +142,6 @@ def make_row(ews_id, *, folder="inbox", subject="Budget review",
         "categories_json": "[]",
         "body_clean": body,
         "internet_message_id": imid or f"<{ews_id}@corp.example>",
-        "norm_text": CacheStore.norm_for_row(subject, sender_name,
-                                             sender_email, body),
     }
 
 

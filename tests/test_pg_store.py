@@ -5,14 +5,23 @@ import json
 import time
 
 import pytest
-from conftest import make_row
+from conftest import INBOX_ID, SENT_ID, make_row, seed_folders
 
 from ewsmcp.cache.store import CacheStore
 
 
 @pytest.fixture
 def store(db):
-    return CacheStore(db)
+    s = CacheStore(db)
+    seed_folders(s)
+    return s
+
+
+@pytest.fixture
+def seeded_folders(store):
+    from conftest import seed_folders
+    seed_folders(store)
+    return store
 
 
 def test_upsert_and_fts_search(store):
@@ -40,9 +49,9 @@ def test_structured_filters_and_exact_total(store):
         make_row("M2", sender_email="b@x.example", is_read=1, date_ts=now - 50,
                  has_attachments=1),
         make_row("M3", sender_email="a@x.example", is_read=1, date_ts=now,
-                 folder="sent"),
+                 folder_id=SENT_ID),
     ])
-    rows, total = store.search_messages(folders=["inbox"])
+    rows, total = store.search_messages(folder_ids=[INBOX_ID])
     assert total == 2
     rows, total = store.search_messages(sender="a@x")
     assert total == 2
@@ -62,7 +71,7 @@ def test_structured_filters_and_exact_total(store):
 def test_thread_join_and_get_message(store):
     store.upsert_messages([
         make_row("M1", conv="C9", date_ts=100),
-        make_row("M2", conv="C9", date_ts=200, folder="sent"),
+        make_row("M2", conv="C9", date_ts=200, folder_id=SENT_ID),
         make_row("M3", conv="OTHER", date_ts=300),
     ])
     rows = store.thread("C9")
@@ -94,19 +103,19 @@ def test_unread_page_and_watermarks(store):
     total, rows = store.unread_page(limit=1)
     assert total == 2
     assert rows[0]["ews_id"] == "M2"  # newest unread first
-    store.set_sync_state("item:inbox", "TOKEN-1", 1234.0)
-    assert store.get_sync_state("item:inbox") == "TOKEN-1"
-    assert store.watermark("item:inbox") == 1234
-    assert "item:inbox" in store.watermarks()
+    store.set_sync_state(f"item:{INBOX_ID}", "TOKEN-1", 1234.0)
+    assert store.get_sync_state(f"item:{INBOX_ID}") == "TOKEN-1"
+    assert store.watermark(f"item:{INBOX_ID}") == 1234
+    assert f"item:{INBOX_ID}" in store.watermarks()
 
 
 def test_stats(store):
     store.upsert_messages([make_row("M1")])
-    store.set_sync_state("item:inbox", "T", time.time())
+    store.set_sync_state(f"item:{INBOX_ID}", "T", time.time())
     stats = store.stats()
     assert stats["rows"]["messages"] == 1
     assert stats["db_mb"] >= 0
-    assert stats["watermarks"]["item:inbox"] > 0
+    assert stats["watermarks"][f"item:{INBOX_ID}"] > 0
 
 
 def test_contact_stats_and_senders(store):
@@ -116,7 +125,7 @@ def test_contact_stats_and_senders(store):
                  date_ts=now - 500),
         make_row("M2", sender_email="boss@corp.example", sender_name="Boss",
                  date_ts=now - 100),
-        make_row("M3", folder="sent", sender_email="exec@corp.example",
+        make_row("M3", folder_id=SENT_ID, sender_email="exec@corp.example",
                  to=["boss@corp.example"], date_ts=now - 50),
     ])
     stats = store.contact_stats("boss@corp.example")
@@ -132,13 +141,13 @@ def test_sent_without_reply(store):
     old = now - 6 * 86400
     store.upsert_messages([
         # thread A: we sent last, no reply for 6 days → waiting_on
-        make_row("A1", conv="CA", folder="sent", date_ts=old,
+        make_row("A1", conv="CA", folder_id=SENT_ID, date_ts=old,
                  subject="Waiting thread"),
         # thread B: we sent, then they replied → NOT waiting
-        make_row("B1", conv="CB", folder="sent", date_ts=old),
-        make_row("B2", conv="CB", folder="inbox", date_ts=old + 3600),
+        make_row("B1", conv="CB", folder_id=SENT_ID, date_ts=old),
+        make_row("B2", conv="CB", folder_id=INBOX_ID, date_ts=old + 3600),
         # thread C: we sent recently (inside the window) → NOT waiting yet
-        make_row("C1", conv="CC", folder="sent", date_ts=now - 3600),
+        make_row("C1", conv="CC", folder_id=SENT_ID, date_ts=now - 3600),
     ])
     rows = store.sent_without_reply(days=5)
     assert [r["ews_id"] for r in rows] == ["A1"]
@@ -162,17 +171,85 @@ def test_task_rows(store):
     assert total == 1
 
 
-def test_prefix_and_accent_folded_search(store):
+def test_schema_is_v2_with_folder_id_and_no_dead_columns(db):
+    with db.conn() as c:
+        cols = {r["column_name"] for r in c.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'ews' AND table_name = 'messages'")}
+        tables = {r["table_name"] for r in c.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'ews'")}
+    assert "folder_id" in cols and "folder" not in cols
+    assert "norm_text" not in cols
+    assert "search_tsv" in cols
+    assert "sender_sigs" not in tables
+    from ewsmcp.db import SCHEMA_VERSION
+    assert SCHEMA_VERSION == 2
+    assert db.schema_version() == 2
+
+
+def test_search_folds_accents_in_the_database(store):
+    """No norm_text shadow: the generated column and the query both go
+    through ews.immutable_unaccent."""
     store.upsert_messages([
         make_row("M1", subject="Résumé review", body="café numbers"),
         make_row("M2", subject="Отчёт за квартал", body="цифры во вложении"),
     ])
     rows, total = store.search_messages(text="resume")
     assert total == 1 and rows[0]["ews_id"] == "M1"
-    rows, total = store.search_messages(text="отч")  # prefix, Cyrillic
+    rows, total = store.search_messages(text="отч")     # Cyrillic prefix
     assert total == 1 and rows[0]["ews_id"] == "M2"
     rows, total = store.search_messages(text="cafe numb")  # AND of prefixes
     assert total == 1
+
+
+def test_prefix_tsquery_builds_an_and_of_prefixes():
+    from ewsmcp.cache.store import prefix_tsquery
+    assert prefix_tsquery("Budget Review") == "budget:* & review:*"
+    assert prefix_tsquery("  ") == ""
+    assert prefix_tsquery(None) == ""
+
+
+def test_text_query_combines_with_structured_filters(store, seeded_folders):
+    now = int(time.time())
+    store.upsert_messages([
+        make_row("M1", subject="Budget review", is_read=0, date_ts=now - 100),
+        make_row("M2", subject="Budget review", is_read=1, date_ts=now - 50),
+        make_row("M3", subject="Budget review", folder_id=SENT_ID, is_read=1,
+                 date_ts=now),
+    ])
+    # the AQS-exclusivity rule is gone: text AND filters, together
+    rows, total = store.search_messages(text="budget", is_unread=True)
+    assert total == 1 and rows[0]["ews_id"] == "M1"
+    rows, total = store.search_messages(text="budget", folder_ids=[SENT_ID])
+    assert total == 1 and rows[0]["ews_id"] == "M3"
+    rows, total = store.search_messages(text="budget")
+    assert total == 3  # folder_ids=None means every mirrored folder
+
+
+def test_inbox_and_sent_resolve_through_folders_wk(store, seeded_folders):
+    now = int(time.time())
+    store.upsert_messages([
+        make_row("M1", is_read=0, date_ts=now),
+        make_row("M2", folder_id=SENT_ID, sender_email="exec@corp.example",
+                 to=["boss@corp.example"], date_ts=now),
+    ])
+    total, rows = store.unread_page()
+    assert total == 1 and rows[0]["ews_id"] == "M1"
+    assert store.folder_id_for_wk("f:sent") == SENT_ID
+    assert store.folder_id_for_wk("f:nonexistent") is None
+    stats = store.contact_stats("boss@corp.example")
+    assert stats["sent_count"] == 1
+
+
+def test_folder_disappearance_helpers(store, seeded_folders):
+    store.upsert_messages([make_row("M1"), make_row("M2", folder_id=SENT_ID)])
+    store.set_sync_state(f"item:{INBOX_ID}", "TOK", time.time())
+    assert store.delete_live_messages_in_folder(INBOX_ID) == 1
+    assert store.get_message("M1") is None
+    assert store.get_message("M2") is not None
+    store.drop_sync_state(f"item:{INBOX_ID}")
+    assert store.get_sync_state(f"item:{INBOX_ID}") is None
 
 
 def test_text_search_ranks_by_relevance_then_date(store):

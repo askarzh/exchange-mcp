@@ -20,8 +20,9 @@ def test_migrate_creates_schema_and_is_idempotent(pg_dsn):
                 "SELECT table_name FROM information_schema.tables "
                 "WHERE table_schema='ews'")}
         assert {"messages", "events", "tasks", "folders", "sync_state",
-                "sender_sigs", "aliases", "alias_counters", "meta",
+                "aliases", "alias_counters", "meta",
                 "schema_migrations"} <= tables
+        assert "sender_sigs" not in tables
     finally:
         d.close()
 
@@ -43,7 +44,7 @@ def test_conn_rolls_back_on_exception(db):
 
 def test_generated_tsvector_and_gin_index(db):
     with db.conn() as c:
-        c.execute("INSERT INTO ews.messages(ews_id, folder, norm_text) "
+        c.execute("INSERT INTO ews.messages(ews_id, folder_id, subject) "
                   "VALUES ('M1', 'inbox', 'budget review numbers')")
         hit = c.execute(
             "SELECT ews_id FROM ews.messages WHERE search_tsv @@ "
@@ -53,5 +54,5 @@ def test_generated_tsvector_and_gin_index(db):
                         "AND tablename='messages' AND indexname='ix_msg_tsv'").fetchone()
         assert idx is not None
     with pytest.raises(psycopg.errors.CheckViolation), db.conn() as c:
-        c.execute("INSERT INTO ews.messages(ews_id, folder, archive_state) "
+        c.execute("INSERT INTO ews.messages(ews_id, folder_id, archive_state) "
                   "VALUES ('M2', 'inbox', 'bogus')")
