@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     archive_exclude_categories: str = ""
     archive_grace_days: int = 7
     archive_delete_enabled: bool = False       # rail 1 of 3: deletion is OFF by default
+    # Even with ARCHIVE_DELETE_ENABLED=true, the BACKGROUND cycle does not
+    # delete unless this is also true: deletion stays a deliberate,
+    # confirm-gated `archive_run(kind="delete", dry_run=false)` call until an
+    # operator opts the loop in.
+    archive_delete_auto: bool = False
     archive_max_delete_per_run: int = 200
     archive_min_free_gb: float = 2.0
     archive_cycle_seconds: int = 300

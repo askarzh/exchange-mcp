@@ -8,6 +8,7 @@ from conftest import FakeEmbedder, make_row, make_settings
 from test_archive_capture import FakeAccount, FakeGatewayFor, FakeItem
 from test_archive_verify_delete import DeletableItem, RecordingAudit
 
+from ewsmcp.archive import runner as runner_module
 from ewsmcp.archive.capture import Capturer
 from ewsmcp.archive.runner import KINDS, ArchiveRunner
 from ewsmcp.cache.store import CacheStore
@@ -224,3 +225,92 @@ def test_disk_stats_reports_this_process_own_data_dir_and_is_cached(tmp_path, db
         files.blob_store_bytes = orig
     assert second == first
     assert calls["n"] == 0  # served from the 60s cache, not recomputed
+
+
+# --- ARCHIVE_DELETE_AUTO: the loop never deletes by default --------------------
+
+
+class _RecordingDeleter:
+    """Stands in for the real Deleter so the test observes whether the lane
+    ran at all, not what it would have done."""
+
+    calls: list = []
+
+    def __init__(self, *a, **kw):
+        pass
+
+    async def run(self, *, dry_run=True, run_id=None):
+        _RecordingDeleter.calls.append(dry_run)
+        return {"eligible": 0, "deleted": 0, "failed": 0, "remaining": 0,
+                "unmarked": 0, "deleted_unrecorded": [], "reasons": [],
+                "blocked": None, "error": None, "sample": []}
+
+
+def _drive_one_cycle(runner):
+    async def drive():
+        await runner.start()
+        for _ in range(200):
+            if runner.cycles:
+                break
+            await asyncio.sleep(0.05)
+        await runner.stop()
+
+    asyncio.run(drive())
+
+
+def test_the_background_loop_never_deletes_unless_delete_auto(tmp_path, db, monkeypatch):
+    """ARCHIVE_DELETE_ENABLED alone is not enough for the BACKGROUND cycle:
+    unattended deletion needs ARCHIVE_DELETE_AUTO on top of it."""
+    monkeypatch.setattr(runner_module, "Deleter", _RecordingDeleter)
+    _RecordingDeleter.calls = []
+    runner, _store_ = _runner(db, tmp_path, account=FakeAccount({"OLD-1": FakeItem("OLD-1")}),
+                              archive_cycle_seconds=1,
+                              archive_delete_enabled=True,
+                              archive_delete_auto=False)
+    _drive_one_cycle(runner)
+    assert runner.cycles >= 1
+    assert _RecordingDeleter.calls == []
+
+
+def test_delete_auto_lets_the_background_loop_run_the_delete_lane(
+        tmp_path, db, monkeypatch):
+    monkeypatch.setattr(runner_module, "Deleter", _RecordingDeleter)
+    _RecordingDeleter.calls = []
+    runner, _store_ = _runner(db, tmp_path, account=FakeAccount({"OLD-1": FakeItem("OLD-1")}),
+                              archive_cycle_seconds=1,
+                              archive_delete_enabled=True,
+                              archive_delete_auto=True)
+    _drive_one_cycle(runner)
+    assert _RecordingDeleter.calls and _RecordingDeleter.calls[0] is False
+
+
+def test_the_loop_says_why_it_skipped_the_delete_lane(tmp_path, db, monkeypatch):
+    monkeypatch.setattr(runner_module, "Deleter", _RecordingDeleter)
+    _RecordingDeleter.calls = []
+    runner, _store_ = _runner(db, tmp_path, account=FakeAccount({"OLD-1": FakeItem("OLD-1")}),
+                              archive_delete_enabled=True,
+                              archive_delete_auto=False)
+    out = asyncio.run(runner._run_once_locked(
+        kind="all", dry_run=False, before=None, folders=None,
+        allow_delete=False))
+    assert "ARCHIVE_DELETE_AUTO" in out["blocked"]
+    assert _RecordingDeleter.calls == []
+
+
+def test_a_manual_run_still_deletes_while_delete_auto_is_off(tmp_path, db, monkeypatch):
+    """The manual, confirm-gated path is exactly what ARCHIVE_DELETE_AUTO=false
+    leaves you with — archive_run(kind='delete', dry_run=false) must still work."""
+    monkeypatch.setattr(runner_module, "Deleter", _RecordingDeleter)
+    _RecordingDeleter.calls = []
+    runner, _store_ = _runner(db, tmp_path, account=FakeAccount({"OLD-1": FakeItem("OLD-1")}),
+                              archive_delete_enabled=True,
+                              archive_delete_auto=False)
+    out = asyncio.run(runner.run_once(kind="delete", dry_run=False))
+    assert _RecordingDeleter.calls == [False]
+    assert out["blocked"] is None
+
+
+def test_delete_auto_defaults_off_and_shows_in_status(tmp_path, db):
+    runner, _store_ = _runner(db, tmp_path)
+    assert runner.settings.archive_delete_auto is False
+    assert runner.status()["delete_auto"] is False

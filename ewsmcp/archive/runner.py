@@ -6,6 +6,13 @@ the rails allow — deletes. Every pass writes an ``ews.archive_runs`` row so
 ``archive_status`` and ``GET /v1/archive/runs/<id>`` can say exactly what
 happened to the mailbox and when.
 
+The background loop runs the DELETE lane only when ``ARCHIVE_DELETE_AUTO``
+is true (on top of ``ARCHIVE_DELETE_ENABLED``, which gates every deletion
+including tool-driven ones). By default deletion is therefore MANUAL: an
+operator calls ``archive_run(kind="delete", dry_run=false)``, which is
+confirm-gated. Turning ARCHIVE_DELETE_AUTO on means the loop hard-deletes up
+to ARCHIVE_MAX_DELETE_PER_RUN messages every ARCHIVE_CYCLE_SECONDS.
+
 ``run_once`` and the background loop share one asyncio.Lock so a manual
 ``archive_run`` call and a mid-cycle background pass never run concurrently
 against the same mailbox. ``run_once`` bounds its wait on that lock
@@ -79,7 +86,8 @@ class ArchiveRunner:
 
     async def _run_once_locked(self, *, kind: str, dry_run: bool,
                                before: str | None,
-                               folders: list[str] | None) -> dict[str, Any]:
+                               folders: list[str] | None,
+                               allow_delete: bool = True) -> dict[str, Any]:
         policy = ArchivePolicy.from_settings(self.settings).with_overrides(
             before=before, folders=folders, tz=self.settings.ews_tz)
         # start_run/finish_run are blocking DB calls — run them off the
@@ -115,7 +123,12 @@ class ArchiveRunner:
                     out["embedded"] = res["embedded"]
                     if res["error"]:
                         out["error"] = res["error"]
-                if kind in ("delete", "all"):
+                if kind in ("delete", "all") and not allow_delete:
+                    out["blocked"] = (
+                        "ARCHIVE_DELETE_AUTO=false — the background cycle never "
+                        "deletes. Run archive_run(kind='delete', dry_run=false) "
+                        "to delete deliberately.")
+                elif kind in ("delete", "all"):
                     res = await Deleter(self.settings, self.gateway, self.store,
                                         policy, self.audit).run(dry_run=dry_run,
                                                                 run_id=run_id)
@@ -147,9 +160,11 @@ class ArchiveRunner:
         if self._task is None:
             self._stopped = False
             self._task = asyncio.create_task(self._loop(), name="archive")
-            logger.info("archive runner started (every %ss, delete_enabled=%s)",
+            logger.info("archive runner started (every %ss, delete_enabled=%s, "
+                        "delete_auto=%s)",
                         self.settings.archive_cycle_seconds,
-                        self.settings.archive_delete_enabled)
+                        self.settings.archive_delete_enabled,
+                        self.settings.archive_delete_auto)
 
     async def stop(self) -> None:
         self._stopped = True
@@ -168,7 +183,8 @@ class ArchiveRunner:
             try:
                 async with self._lock:
                     result = await self._run_once_locked(
-                        kind="all", dry_run=False, before=None, folders=None)
+                        kind="all", dry_run=False, before=None, folders=None,
+                        allow_delete=bool(self.settings.archive_delete_auto))
                 self.last_error = result.get("error")
             except asyncio.CancelledError:
                 raise
@@ -190,6 +206,7 @@ class ArchiveRunner:
             "last_run_id": self.last_run_id,
             "last_error": self.last_error,
             "delete_enabled": bool(self.settings.archive_delete_enabled),
+            "delete_auto": bool(self.settings.archive_delete_auto),
         }
 
     _DISK_STATS_TTL_S = 60
