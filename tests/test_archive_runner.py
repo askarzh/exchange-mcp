@@ -8,6 +8,7 @@ from conftest import FakeEmbedder, make_row, make_settings
 from test_archive_capture import FakeAccount, FakeGatewayFor, FakeItem
 from test_archive_verify_delete import DeletableItem, RecordingAudit
 
+from ewsmcp.archive.capture import Capturer
 from ewsmcp.archive.runner import KINDS, ArchiveRunner
 from ewsmcp.cache.store import CacheStore
 from ewsmcp.semantic import SemanticIndex
@@ -125,3 +126,72 @@ def test_the_background_loop_runs_a_cycle_and_can_be_stopped(tmp_path, db):
     asyncio.run(drive())
     assert runner.cycles >= 1
     assert store.get_message("OLD-1")["archive_state"] in ("captured", "verified")
+
+
+def test_run_once_returns_blocked_instead_of_hanging_on_a_held_lock(tmp_path, db):
+    runner, store = _runner(db, tmp_path)
+    called = False
+
+    async def hold_and_call():
+        nonlocal called
+
+        async def hold():
+            async with runner._lock:
+                await asyncio.sleep(0.5)
+
+        holder = asyncio.create_task(hold())
+        await asyncio.sleep(0.05)  # let the holder actually grab the lock
+        out = await runner.run_once(kind="capture", dry_run=True,
+                                    wait_seconds=0.1)
+        holder.cancel()
+        try:
+            await holder
+        except asyncio.CancelledError:
+            pass
+        return out
+
+    orig_run = Capturer.run
+
+    async def spy_run(self, *a, **kw):
+        nonlocal called
+        called = True
+        return await orig_run(self, *a, **kw)
+
+    Capturer.run = spy_run
+    try:
+        out = asyncio.run(hold_and_call())
+    finally:
+        Capturer.run = orig_run
+    assert out["ok"] is False
+    assert out["blocked"] == "cycle in progress"
+    assert "retry_after_s" in out
+    assert called is False
+
+
+def test_start_run_failure_does_not_kill_the_background_loop(tmp_path, db):
+    account = FakeAccount({"OLD-1": FakeItem("OLD-1")})
+    runner, store = _runner(db, tmp_path, account=account,
+                            archive_cycle_seconds=1)
+
+    orig_start_run = store.start_run
+    calls = {"n": 0}
+
+    def boom(*a, **kw):
+        calls["n"] += 1
+        raise RuntimeError("db is on fire")
+
+    store.start_run = boom
+
+    async def drive():
+        await runner.start()
+        for _ in range(100):
+            if runner.cycles:
+                break
+            await asyncio.sleep(0.05)
+        await runner.stop()
+
+    asyncio.run(drive())
+    store.start_run = orig_start_run
+    assert calls["n"] >= 1
+    assert runner.cycles >= 1
+    assert runner.last_error is not None and "db is on fire" in runner.last_error
