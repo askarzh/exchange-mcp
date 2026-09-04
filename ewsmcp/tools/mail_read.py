@@ -526,7 +526,13 @@ TOOLS: List[ToolSpec] = [
                                "= hybrid (full-text + embedding similarity, "
                                "RRF-fused). semantic falls back to keyword "
                                "with meta.degraded=true when embeddings are "
-                               "unavailable.",
+                               "unavailable. The embedding half reads a "
+                               "capped candidate set (limit*4 chunks, at most "
+                               "400) BEFORE archived/date/sender filters are "
+                               "applied, so a highly selective filter can come "
+                               "back with fewer than `limit` hits — widen the "
+                               "filter or raise `limit` rather than reading "
+                               "the short page as 'no such mail'.",
             },
         }),
         handler=_search_messages,

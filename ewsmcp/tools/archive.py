@@ -213,6 +213,20 @@ async def _get_raw_message(ctx: Context, *, id: str,
         # content-addressed (harmless — this does NOT capture the message;
         # archive_state and mime_sha256 on the row are left untouched, so
         # this fetch never races the capture worker).
+        #
+        # The spec is requires_ews=False so an ARCHIVED message is served
+        # from disk while Exchange is cold — that is exactly when the
+        # archive earns its keep. Only this branch needs Exchange, so the
+        # cold gate the dispatcher would have applied is re-applied here,
+        # with the same code and message.
+        if ctx.manager is not None and ctx.manager.state == "connecting":
+            st = ctx.manager.status()
+            raise ToolError(
+                "upstream_unavailable",
+                f"Exchange connection still warming up (attempt {st['attempts']}; "
+                f"last error: {st['last_error'] or 'none yet'})",
+                hint="Check /readyz or call get_server_status.",
+                retry_after_s=st.get("next_retry_in_s"))
         mime = await ctx.gateway.call(
             lambda account: _fetch_live_mime(account, row["ews_id"]))
         sha256, path = await asyncio.to_thread(
@@ -371,12 +385,15 @@ TOOLS: list[ToolSpec] = [
             "Get the original RFC822 message as a single-use download URL "
             "(the bytes never travel through the conversation). Works for "
             "any message: captured/verified/deleted mail is served from the "
-            "on-disk archive; live mail is fetched fresh through Exchange and "
-            "cached, without changing its archive state. The link expires and "
-            "is spent by the first successful download."
+            "on-disk archive — including while Exchange is unreachable — and "
+            "live mail is fetched fresh through Exchange and cached, without "
+            "changing its archive state. The link expires and is spent by "
+            "the first successful download."
         ),
         side_effect_class="read",
-        requires_ews=True,
+        # False on purpose: archived mail needs no Exchange at all. The live
+        # branch of the handler re-applies the cold gate for itself.
+        requires_ews=False,
         input_schema=_schema({
             "id": {"type": "string", "description": "Message id (m-alias or raw)."},
             "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440,
@@ -391,8 +408,13 @@ TOOLS: list[ToolSpec] = [
             "pass `id` to find messages like that one, or `text` to describe "
             "what you are looking for. Ranked by embedding similarity over "
             "live and archived mail alike; each card carries `similarity` "
-            "(1.0 is identical). Use search_messages for exact terms, names "
-            "and dates."
+            "(1.0 is identical). Candidates are capped before filtering "
+            "(limit*4 chunks, at most 400), so archived='only'/'exclude' can "
+            "return fewer than `limit` — raise `limit` rather than reading a "
+            "short page as 'no such mail'. Needs GEMINI_API_KEY on ewsd: "
+            "without it this tool is a validation error, it never silently "
+            "falls back (search_messages does). Use search_messages for exact "
+            "terms, names and dates."
         ),
         side_effect_class="read",
         requires_ews=False,

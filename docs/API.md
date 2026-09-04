@@ -85,7 +85,7 @@ Search mail across the local mirror of the whole mailbox. `query` is full-text o
 | `offset` | integer | no | (default `0`) |
 | `limit` | integer | no | (default `20`) |
 | `archived` | string | no | any (default) searches live and archived mail; only restricts to archived; exclude to live. (one of: `any`, `only`, `exclude`; default `any`) |
-| `mode` | string | no | keyword = full-text over the mirror; semantic = hybrid (full-text + embedding similarity, RRF-fused). semantic falls back to keyword with meta.degraded=true when embeddings are unavailable. (one of: `keyword`, `semantic`; default `keyword`) |
+| `mode` | string | no | keyword = full-text over the mirror; semantic = hybrid (full-text + embedding similarity, RRF-fused). semantic falls back to keyword with meta.degraded=true when embeddings are unavailable. The embedding half reads a capped candidate set (limit*4 chunks, at most 400) BEFORE archived/date/sender filters are applied, so a highly selective filter can come back with fewer than `limit` hits — widen the filter or raise `limit` rather than reading the short page as 'no such mail'. (one of: `keyword`, `semantic`; default `keyword`) |
 
 #### `get_message` — read (min tier: read)
 
@@ -425,7 +425,7 @@ _No parameters._
 
 #### `get_raw_message` — read (min tier: read)
 
-Get the original RFC822 message as a single-use download URL (the bytes never travel through the conversation). Works for any message: captured/verified/deleted mail is served from the on-disk archive; live mail is fetched fresh through Exchange and cached, without changing its archive state. The link expires and is spent by the first successful download.
+Get the original RFC822 message as a single-use download URL (the bytes never travel through the conversation). Works for any message: captured/verified/deleted mail is served from the on-disk archive — including while Exchange is unreachable — and live mail is fetched fresh through Exchange and cached, without changing its archive state. The link expires and is spent by the first successful download.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -434,7 +434,7 @@ Get the original RFC822 message as a single-use download URL (the bytes never tr
 
 #### `find_similar` — read (min tier: read)
 
-Find mail that MEANS the same thing, not mail that shares words: pass `id` to find messages like that one, or `text` to describe what you are looking for. Ranked by embedding similarity over live and archived mail alike; each card carries `similarity` (1.0 is identical). Use search_messages for exact terms, names and dates.
+Find mail that MEANS the same thing, not mail that shares words: pass `id` to find messages like that one, or `text` to describe what you are looking for. Ranked by embedding similarity over live and archived mail alike; each card carries `similarity` (1.0 is identical). Candidates are capped before filtering (limit*4 chunks, at most 400), so archived='only'/'exclude' can return fewer than `limit` — raise `limit` rather than reading a short page as 'no such mail'. Needs GEMINI_API_KEY on ewsd: without it this tool is a validation error, it never silently falls back (search_messages does). Use search_messages for exact terms, names and dates.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -524,11 +524,24 @@ carries `archive_state` — but only when it is not `live`, to keep the
 common all-live case at its old token cost.
 `mode="semantic"` (and the separate `find_similar` tool) never runs on
 `ewsmcp` directly: the MCP process never holds `GEMINI_API_KEY`, so both
-are forwarded to `ewsd` unconditionally. If `GEMINI_API_KEY` is unset on
-`ewsd`, or the embedding/vector call fails, the answer degrades to
-keyword ranking instead of erroring — `meta.degraded: true` and
-`meta.reason` explain why, so a mailbox search never goes dark because a
-remote API is unavailable. See
+are forwarded to `ewsd` unconditionally. The two then behave DIFFERENTLY
+when no embedder is available, and deliberately so:
+
+- `search_messages(mode="semantic")` degrades. If `GEMINI_API_KEY` is
+  unset on `ewsd`, or the embedding/vector call fails, it answers with
+  keyword ranking instead of erroring — `meta.degraded: true` and
+  `meta.reason` explain why, so a mailbox search never goes dark because
+  a remote API is unavailable.
+- `find_similar` does NOT degrade: keyword ranking is not an answer to
+  "find mail that means this", so with no embedder configured it returns
+  a `validation` error naming `GEMINI_API_KEY` and pointing at
+  `search_messages`. A silent keyword fallback there would look like a
+  semantic answer and be trusted as one.
+
+Both read a CAPPED vector candidate set (`limit * 4` chunks, at most 400)
+before the `archived` and structured filters are applied, so a highly
+selective filter can return fewer than `limit` hits. Raise `limit` rather
+than reading a short page as "no such mail". See
 `docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md` for
 the full archive + semantic design, and `DESIGN.md` §Archive/§Semantic
 for what is actually built.

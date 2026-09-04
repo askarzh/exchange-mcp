@@ -265,3 +265,52 @@ def test_find_similar_without_a_key_is_a_clear_error(db):
     res = _run(ctx, "find_similar", text="budget")
     assert res["ok"] is False and res["error"]["code"] == "validation"
     assert "GEMINI_API_KEY" in res["error"]["hint"]
+
+
+# --- get_raw_message and a cold Exchange --------------------------------------
+
+
+class _ColdManager:
+    """Exchange still warming up — what the dispatcher's cold gate sees."""
+
+    state = "connecting"
+
+    def status(self):
+        return {"state": "connecting", "attempts": 4,
+                "last_error": "TransportError: Failed to get auth type",
+                "next_retry_in_s": 30, "last_success_age_s": None}
+
+
+def test_archived_mail_is_served_while_exchange_is_cold(db, tmp_path):
+    """The archive earns its keep exactly when Exchange is unreachable, so
+    get_raw_message is requires_ews=False and an archived row still mints a
+    link during warm-up."""
+    ctx = _ctx(db, data_dir=str(tmp_path / "data"))
+    ctx.manager = _ColdManager()
+    ctx.cache.upsert_messages([make_row("A1", subject="Contract")])
+    sha, path = files.store_mime(ctx.settings.data_dir, b"RAW-MIME")
+    ctx.cache.mark_captured("A1", mime_sha256=sha, mime_path=str(path))
+    ctx.cache.mark_verified("A1")
+
+    res = _run(ctx, "get_raw_message", id="A1")
+    assert res["ok"] is True
+    assert res["archive_state"] == "verified"
+    assert res["download_url"].startswith("/download/")
+
+
+def test_live_mail_still_gets_the_cold_gate(db, tmp_path):
+    """The live branch needs Exchange, so it re-applies by hand the gate the
+    dispatcher no longer applies for this tool — same code, same message."""
+    ctx = _ctx(db, data_dir=str(tmp_path / "data"))
+    ctx.manager = _ColdManager()
+    ctx.cache.upsert_messages([make_row("A1")])
+    res = _run(ctx, "get_raw_message", id="A1")
+    assert res["ok"] is False
+    assert res["error"]["code"] == "upstream_unavailable"
+    assert "auth type" in res["error"]["message"]
+
+
+def test_get_raw_message_is_not_ews_gated_in_the_registry(db):
+    from ewsmcp.tools import archive as archive_tools
+    spec = {s.name: s for s in archive_tools.TOOLS}["get_raw_message"]
+    assert spec.requires_ews is False
