@@ -369,3 +369,76 @@ def test_slow_lane_syncs_calendar_and_tasks(db):
     _rows, total = store.task_rows()
     assert total == 1
     assert store.get_sync_state("item:tasks") == "TT-1"
+
+
+# --- archive interaction (spec §3) -------------------------------------------
+
+
+def test_a_server_delete_of_a_live_row_still_drops_it(db):
+    account = _account()
+    engine, store = _engine(db, account)
+    account.inbox.queue([("create", _msg("M1"))], "TOK-1")
+    asyncio.run(engine._cycle())
+    account.inbox.queue([("delete", SimpleNamespace(id="M1"))], "TOK-2")
+    asyncio.run(engine._cycle())
+    assert store.get_message("M1") is None
+
+
+def test_a_server_delete_of_a_captured_row_keeps_it_and_marks_deleted(db):
+    account = _account()
+    engine, store = _engine(db, account)
+    account.inbox.queue([("create", _msg("M1", subject="Contract"))], "TOK-1")
+    asyncio.run(engine._cycle())
+    store.mark_captured("M1", mime_sha256="a" * 64, mime_path="/x.eml")
+
+    account.inbox.queue([("delete", SimpleNamespace(id="M1"))], "TOK-2")
+    asyncio.run(engine._cycle())
+
+    row = store.get_message("M1")
+    assert row is not None                    # the archive copy is ours now
+    assert row["archive_state"] == "deleted"
+    assert row["deleted_at"] is not None
+    assert row["subject"] == "Contract"       # still searchable
+
+
+def test_a_server_delete_of_a_verified_row_keeps_it(db):
+    account = _account()
+    engine, store = _engine(db, account)
+    account.inbox.queue([("create", _msg("M1"))], "TOK-1")
+    asyncio.run(engine._cycle())
+    store.mark_captured("M1", mime_sha256="a" * 64, mime_path="/x.eml")
+    store.mark_verified("M1")
+    account.inbox.queue([("delete", SimpleNamespace(id="M1"))], "TOK-2")
+    asyncio.run(engine._cycle())
+    assert store.get_message("M1")["archive_state"] == "deleted"
+
+
+def test_our_own_archive_deletion_is_ignored_when_it_echoes_back(db):
+    """The deleter already marked the row; the sync event must not disturb it."""
+    account = _account()
+    engine, store = _engine(db, account)
+    account.inbox.queue([("create", _msg("M1"))], "TOK-1")
+    asyncio.run(engine._cycle())
+    store.mark_captured("M1", mime_sha256="a" * 64, mime_path="/x.eml")
+    store.mark_verified("M1")
+    store.mark_deleted(["M1"])
+    before = store.get_message("M1")["deleted_at"]
+
+    account.inbox.queue([("delete", SimpleNamespace(id="M1"))], "TOK-2")
+    asyncio.run(engine._cycle())
+
+    row = store.get_message("M1")
+    assert row["archive_state"] == "deleted" and row["deleted_at"] == before
+
+
+def test_status_reports_what_the_deletes_did(db):
+    account = _account()
+    engine, store = _engine(db, account)
+    account.inbox.queue([("create", _msg("M1")), ("create", _msg("M2"))], "TOK-1")
+    asyncio.run(engine._cycle())
+    store.mark_captured("M2", mime_sha256="a" * 64, mime_path="/x.eml")
+    account.inbox.queue([("delete", SimpleNamespace(id="M1")),
+                         ("delete", SimpleNamespace(id="M2"))], "TOK-2")
+    asyncio.run(engine._cycle())
+    st = engine.status()
+    assert st["dropped"] == 1 and st["tombstoned"] == 1

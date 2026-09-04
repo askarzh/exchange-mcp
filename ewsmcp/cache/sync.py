@@ -200,6 +200,8 @@ class SyncEngine:
         self._last_slow_ts = 0.0
         self._last_hierarchy_ts = 0.0
         self._folders: dict[str, Any] = {}  # {ews id: Folder} to item-sync
+        self.dropped_rows = 0
+        self.tombstoned_rows = 0
 
     # ------------------------------------------------------------ lifecycle
 
@@ -224,6 +226,8 @@ class SyncEngine:
             "last_cycle_age_s": (int(time.time() - self.last_cycle_ts)
                                  if self.last_cycle_ts else None),
             "last_error": self.last_error,
+            "dropped": self.dropped_rows,
+            "tombstoned": self.tombstoned_rows,
         }
 
     async def _loop(self) -> None:
@@ -377,7 +381,13 @@ class SyncEngine:
                 self.store.upsert_messages(upserts)
                 upserts.clear()
             if deletes:
-                self.store.delete_messages_by_id(deletes)
+                # Spec §3: an archived row that disappears upstream (our own
+                # deleter, or a hand-delete in Outlook) is KEPT and marked
+                # deleted — we hold the only copy now. Only live rows are
+                # dropped.
+                dropped, tombstoned = self.store.apply_server_deletes(deletes)
+                self.dropped_rows += dropped
+                self.tombstoned_rows += tombstoned
                 deletes.clear()
             for ews_id, is_read in read_flags:
                 self.store.set_read_flag([ews_id], is_read)
