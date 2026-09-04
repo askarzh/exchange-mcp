@@ -58,7 +58,7 @@ regenerate with `python scripts/dump_tool_table.py --write`.
 
 #### `list_folders` — read (min tier: read)
 
-List mail folders as a depth-limited tree walk. Each row is {id, name, path, total, unread, children}; `id` is a short folder alias (f7) reusable as a `folder`/`parent` argument anywhere. Well-known folders also carry `wk` (e.g. 'f:inbox') — prefer passing that stable alias. Set include_empty=false to hide folders with zero items.
+List mail folders as a depth-limited tree walk. Each row is {id, name, path, total, unread, children}; `id` is a short folder alias (f7) reusable as a `folder`/`parent` argument anywhere. Well-known folders also carry `wk` (e.g. 'f:inbox') — prefer passing that stable alias. Set include_empty=false to hide folders with zero items. Each row also carries archived: how many of that folder's messages now live only in the archive.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -84,7 +84,8 @@ Search mail across the local mirror of the whole mailbox. `query` is full-text o
 | `has_attachments` | boolean | no |  |
 | `offset` | integer | no | (default `0`) |
 | `limit` | integer | no | (default `20`) |
-| `mode` | string | no | semantic is reserved; keyword only in this build. (one of: `keyword`, `semantic`; default `keyword`) |
+| `archived` | string | no | any (default) searches live and archived mail; only restricts to archived; exclude to live. (one of: `any`, `only`, `exclude`; default `any`) |
+| `mode` | string | no | keyword = full-text over the mirror; semantic = hybrid (full-text + embedding similarity, RRF-fused). semantic falls back to keyword with meta.degraded=true when embeddings are unavailable. (one of: `keyword`, `semantic`; default `keyword`) |
 
 #### `get_message` — read (min tier: read)
 
@@ -109,7 +110,7 @@ Rebuild the conversation containing the given message id from the local mirror: 
 
 #### `get_attachment` — read (min tier: read)
 
-Read one attachment of a message. mode='info' → metadata only; 'text' → decoded UTF-8 text (capped at 20000 chars, `truncated` flagged) for text-like attachments (text/* content type or .txt/.csv/.md/.log/.json name); 'save' → write the bytes under the server data dir and return saved_path, plus shared_name when a shared space is configured (that copy is the one other services — file servers, model uploads — can read); 'auto' (default) → text when text-like, otherwise info plus a hint. When the message has several attachments you MUST pick one via `attachment` (a name, or a zero-based index as a string).
+Read one attachment of a message. mode='info' → metadata only; 'text' → decoded UTF-8 text (capped at 20000 chars, `truncated` flagged) for text-like attachments (text/* content type or .txt/.csv/.md/.log/.json name); 'save' → write the bytes under the server data dir and return saved_path, plus shared_name when a shared space is configured (that copy is the one other services — file servers, model uploads — can read); 'auto' (default) → text when text-like, otherwise info plus a hint. When the message has several attachments you MUST pick one via `attachment` (a name, or a zero-based index as a string). Attachments of archived mail are served from the server's blob store (stamped source='archive'); Exchange is not contacted.
 
 | parameter | type | required | description |
 |---|---|---|---|

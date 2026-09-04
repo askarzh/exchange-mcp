@@ -209,15 +209,14 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                            until: Optional[str] = None, is_unread: Optional[bool] = None,
                            has_attachments: Optional[bool] = None,
                            offset: int = 0, limit: int = 20,
+                           archived: str = "any",
                            mode: str = "keyword") -> Dict[str, Any]:
     """Store-only search. There is no live Exchange search path: the whole
-    mailbox is mirrored, so the mirror IS the search index."""
+    mailbox is mirrored, so the mirror IS the search index. mode='semantic'
+    runs the hybrid (keyword + embedding) search on ``ctx.semantic`` and
+    degrades to keyword with `meta.degraded` when it is unavailable."""
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 50))
-    if mode == "semantic":
-        raise ToolError("validation",
-                        "semantic search is not available in this build (it returns "
-                        "with the archive tier).", hint="Use mode='keyword'.")
     sender = cache_reads.validate_search_args(sender, from_)
     if ctx.cache is None:
         raise ToolError("backend_unavailable", "the mirror is not configured",
@@ -226,7 +225,8 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
         return await cache_reads.search_messages(
             ctx, folder=folder, query=query, sender=sender, subject=subject,
             since=since, until=until, is_unread=is_unread,
-            has_attachments=has_attachments, offset=offset, limit=limit)
+            has_attachments=has_attachments, offset=offset, limit=limit,
+            archived=archived, mode=mode)
     except (psycopg.Error, RuntimeError) as exc:  # psycopg_pool.PoolClosed is RuntimeError
         raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
                         hint="Check DATABASE_URL; ewsd repairs the mirror on its own.",
@@ -301,6 +301,11 @@ async def _get_attachment(ctx: Context, message_id: str,
                           attachment: Optional[str] = None,
                           mode: str = "auto") -> Dict[str, Any]:
     raw_id = message_id
+    # Archived mail has no server copy to fetch — its bytes are ours, on disk.
+    from_archive = await cache_reads.attachment_from_archive(
+        ctx, raw_id, attachment, mode)
+    if from_archive is not None:
+        return from_archive
 
     def work(account: Any) -> Dict[str, Any]:
         item = _fetch_one(account, raw_id, only=["attachments"])
@@ -435,7 +440,8 @@ TOOLS: List[ToolSpec] = [
             "alias (f7) reusable as a `folder`/`parent` argument anywhere. "
             "Well-known folders also carry `wk` (e.g. 'f:inbox') — prefer "
             "passing that stable alias. Set include_empty=false to hide "
-            "folders with zero items."
+            "folders with zero items. Each row also carries archived: how "
+            "many of that folder's messages now live only in the archive."
         ),
         side_effect_class="read",
         requires_ews=True,
@@ -507,10 +513,20 @@ TOOLS: List[ToolSpec] = [
             "has_attachments": {"type": "boolean"},
             "offset": {"type": "integer", "minimum": 0, "default": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "archived": {
+                "type": "string", "enum": ["any", "only", "exclude"],
+                "default": "any",
+                "description": "any (default) searches live and archived mail; "
+                               "only restricts to archived; exclude to live.",
+            },
             "mode": {
                 "type": "string", "enum": ["keyword", "semantic"],
                 "default": "keyword",
-                "description": "semantic is reserved; keyword only in this build.",
+                "description": "keyword = full-text over the mirror; semantic "
+                               "= hybrid (full-text + embedding similarity, "
+                               "RRF-fused). semantic falls back to keyword "
+                               "with meta.degraded=true when embeddings are "
+                               "unavailable.",
             },
         }),
         handler=_search_messages,
@@ -579,7 +595,9 @@ TOOLS: List[ToolSpec] = [
             "file servers, model uploads — can read); 'auto' (default) → "
             "text when text-like, otherwise info plus a hint. When the message "
             "has several attachments you MUST pick one via `attachment` (a "
-            "name, or a zero-based index as a string)."
+            "name, or a zero-based index as a string). Attachments of "
+            "archived mail are served from the server's blob store (stamped "
+            "source='archive'); Exchange is not contacted."
         ),
         side_effect_class="read",
         requires_ews=True,

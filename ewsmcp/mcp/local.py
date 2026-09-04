@@ -125,18 +125,20 @@ async def list_folders(ctx: Context, **kw) -> dict[str, Any]:
 
 
 async def search_messages(ctx: Context, **kw) -> dict[str, Any]:
-    """Store-only, never forwarded: the mirror is the whole mailbox and ewsd
-    has no live search path to fall back to."""
+    """Store-only for keyword mode — never forwarded: the mirror is the whole
+    mailbox and ewsd has no live keyword search path to fall back to.
+    mode='semantic' is forwarded to ewsd: the MCP never holds the Gemini key
+    (``ctx.semantic`` is daemon-only), so it cannot run the hybrid itself."""
     if kw.get("mode", "keyword") == "semantic":
-        raise ToolError("validation", "semantic search is not available in this build "
-                         "(it returns with the archive tier).", hint="Use mode='keyword'.")
+        return await _forward(ctx, "search_messages", kw)
     sender = cache_reads.validate_search_args(kw.get("sender"), kw.get("from_"))
     try:
         return await cache_reads.search_messages(
             ctx, folder=kw.get("folder"), query=kw.get("query"), sender=sender,
             subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),
             is_unread=kw.get("is_unread"), has_attachments=kw.get("has_attachments"),
-            offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20)))
+            offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20)),
+            archived=kw.get("archived", "any"))
     except (psycopg.Error, RuntimeError) as exc:
         raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
                          hint="Check DATABASE_URL.", retry_after_s=15) from exc

@@ -189,12 +189,21 @@ def test_unknown_alias_is_validation_error_locally(db):
     assert res["ok"] is False and res["error"]["code"] == "validation"
 
 
-def test_semantic_search_is_validation_error_on_mcp_side(db):
-    """mode='semantic' is rejected locally (mcp/local.py) before ever reaching
-    the daemon or Exchange -- it is reserved, not implemented in this build."""
+def test_semantic_search_is_forwarded_to_the_daemon(db):
+    """mode='semantic' never runs locally -- the MCP never holds the Gemini
+    key -- it is forwarded to ewsd verbatim."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    res = _run(ctx, "search_messages", query="budget", mode="semantic")
+    assert res["ok"] is True and res["proxied"] == "search_messages"
+    assert daemon.calls[0] == ("search_messages",
+                               {"query": "budget", "mode": "semantic"})
+
+
+def test_semantic_search_reports_daemon_unavailable_when_ewsd_is_down(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     res = _run(ctx, "search_messages", query="budget", mode="semantic")
-    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert res["ok"] is False and res["error"]["code"] == "daemon_unavailable"
 
 
 def test_get_thread_with_a_dead_mirror_is_backend_unavailable(db):

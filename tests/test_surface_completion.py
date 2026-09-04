@@ -193,11 +193,14 @@ def _sem_store(db):
     return store
 
 
-def test_semantic_mode_is_a_clear_validation_error(tmp_path, db):
+def test_semantic_mode_degrades_to_keyword_without_an_embedder(tmp_path, db):
+    """No GEMINI_API_KEY -> ctx.semantic is None -> degrade to keyword
+    results, never a hard error (Task 13)."""
     ctx = _ctx(tmp_path, db, cache=_sem_store(db))
     res = _run(ctx, "search_messages", query="vendor", mode="semantic")
-    assert res["error"]["code"] == "validation"
-    assert "keyword" in res["error"]["hint"]
+    assert res["ok"] is True
+    assert res["meta"]["degraded"] is True
+    assert "GEMINI_API_KEY" in res["meta"]["reason"]
 
 
 # --- /metrics --------------------------------------------------------------------

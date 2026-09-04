@@ -363,7 +363,7 @@ TOOLS: list[ToolSpec] = [
             "is spent by the first successful download."
         ),
         side_effect_class="read",
-        requires_ews=False,
+        requires_ews=True,
         input_schema=_schema({
             "id": {"type": "string", "description": "Message id (m-alias or raw)."},
             "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440,
