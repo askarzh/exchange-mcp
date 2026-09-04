@@ -13,6 +13,7 @@ capability URL the same way `create_upload_link` does in the other direction.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,15 @@ KINDS = ("capture", "verify", "delete", "embed", "all")
 ARCHIVED_MODES = ("any", "only", "exclude")
 
 
+def _policy_dict(policy: ArchivePolicy) -> dict[str, Any]:
+    return {"folders": list(policy.folders),
+            "after_days": policy.after_days,
+            "grace_days": policy.grace_days,
+            "exclude_categories": list(policy.exclude_categories),
+            "max_delete_per_run": policy.max_delete_per_run,
+            "min_free_gb": policy.min_free_gb}
+
+
 def _require_cache(ctx: Context) -> Any:
     if ctx.cache is None:
         raise ToolError("backend_unavailable", "the Postgres mirror is not available",
@@ -43,24 +53,67 @@ def _require_cache(ctx: Context) -> Any:
 # --------------------------------------------------------------------------
 
 
-async def _archive_run(ctx: Context, *, dry_run: bool = True, kind: str = "all",
-                       before: str | None = None,
-                       folders: list[str] | None = None) -> dict[str, Any]:
+def _check_kind(kind: str) -> None:
     if kind not in KINDS:
         raise ToolError("validation",
                         f"kind must be one of {', '.join(KINDS)} (got {kind!r})")
+
+
+def _check_runner(ctx: Context) -> None:
     if ctx.archive is None:
         raise ToolError("upstream_unavailable",
                         "the archive runner is not started on this server",
                         hint="Only ewsd runs the archive; check /readyz.",
                         retry_after_s=30)
-    result = await ctx.archive.run_once(kind=kind, dry_run=bool(dry_run),
-                                        before=before, folders=folders)
+
+
+def _check_blocked(result: dict[str, Any]) -> None:
     if not result.get("ok", True) and result.get("blocked") == "cycle in progress":
         raise ToolError("upstream_unavailable",
                         "an archive cycle is already in progress",
                         hint="Retry shortly — only one archive pass runs at a time.",
                         retry_after_s=result.get("retry_after_s", 30))
+
+
+async def _archive_run_preview(ctx: Context, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Confirm-gate hook: a REAL dry run, so the token binds the actual
+    resolved policy and candidate counts — not just the caller's literal
+    arguments. If the policy (or the mailbox) changes between preview and
+    confirm, the phase-2 dry run comes back different, the hash mismatches,
+    and the token is rejected (the same TOCTOU defense `_send_draft_preview`
+    uses for drafts)."""
+    kind = kwargs.get("kind") or "all"
+    before = kwargs.get("before")
+    folders = kwargs.get("folders")
+    _check_kind(kind)
+    _check_runner(ctx)
+    dry = await ctx.archive.run_once(kind=kind, dry_run=True, before=before,
+                                     folders=folders)
+    _check_blocked(dry)
+    policy = _policy_dict(ArchivePolicy.from_settings(ctx.settings).with_overrides(
+        before=before, folders=folders, tz=ctx.settings.ews_tz))
+    summary = {
+        "kind": kind, "policy": policy,
+        "candidates": dry.get("candidates"), "eligible": dry.get("eligible"),
+        "captured": dry.get("captured"), "verified": dry.get("verified"),
+        "deleted": dry.get("deleted"), "embedded": dry.get("embedded"),
+        "failed": dry.get("failed"), "sample": dry.get("sample"),
+    }
+    return {
+        "subject": f"archive_run kind={kind}",
+        "body_text": json.dumps(summary, sort_keys=True, default=str),
+        **summary,
+    }
+
+
+async def _archive_run(ctx: Context, *, dry_run: bool = True, kind: str = "all",
+                       before: str | None = None,
+                       folders: list[str] | None = None) -> dict[str, Any]:
+    _check_kind(kind)
+    _check_runner(ctx)
+    result = await ctx.archive.run_once(kind=kind, dry_run=bool(dry_run),
+                                        before=before, folders=folders)
+    _check_blocked(result)
     return result
 
 
@@ -93,12 +146,7 @@ async def _archive_status(ctx: Context) -> dict[str, Any]:
     out["free_gb"] = round(await asyncio.to_thread(
         files.free_gb, ctx.settings.data_dir), 2)
     policy = ArchivePolicy.from_settings(ctx.settings)
-    out["policy"] = {"folders": list(policy.folders),
-                     "after_days": policy.after_days,
-                     "grace_days": policy.grace_days,
-                     "exclude_categories": list(policy.exclude_categories),
-                     "max_delete_per_run": policy.max_delete_per_run,
-                     "min_free_gb": policy.min_free_gb}
+    out["policy"] = _policy_dict(policy)
     out["delete_enabled"] = policy.delete_enabled
     out["semantic_enabled"] = ctx.settings.semantic_enabled()
     if ctx.archive is not None:
@@ -112,6 +160,26 @@ async def _archive_status(ctx: Context) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _fetch_live_mime(account: Any, raw_id: str) -> bytes:
+    """Runs on the EWS pool (sync, via ctx.gateway.call). Live mail has no
+    stored MIME yet, so fetch it straight from Exchange — the exception-
+    instance convention applies: a missing/stale id arrives as an Exception
+    INSTANCE in the fetch stream, re-raised so map_exception classifies it
+    (ErrorItemNotFound -> not_found)."""
+    fetched = list(account.fetch(ids=[(raw_id, None)], only_fields=["mime_content"]))
+    if not fetched:
+        raise ToolError("not_found", "Message not found — the id may be stale.",
+                        hint="Re-run search_messages for a fresh id.")
+    item = fetched[0]
+    if isinstance(item, Exception):
+        raise item
+    mime = getattr(item, "mime_content", None)
+    if not isinstance(mime, (bytes, bytearray)):
+        raise ToolError("not_found",
+                        "No raw MIME is available for this message.")
+    return bytes(mime)
+
+
 async def _get_raw_message(ctx: Context, *, id: str,
                            ttl_minutes: int = 15) -> dict[str, Any]:
     cache = _require_cache(ctx)
@@ -119,18 +187,23 @@ async def _get_raw_message(ctx: Context, *, id: str,
     if row is None:
         raise ToolError("not_found", f"No mirrored message matches {id!r}.",
                         hint="Re-run search_messages for a fresh id.")
-    if not row["mime_path"]:
-        raise ToolError(
-            "not_found",
-            "That message is not archived yet, so there is no raw MIME to serve.",
-            hint="Raw MIME exists only for captured/verified/deleted mail — "
-                 "check archive_status, or use get_message for the text.")
-    path = Path(row["mime_path"])
-    if not path.is_file():
-        raise ToolError(
-            "not_found", f"The archived MIME file is missing at {path}.",
-            hint="The next verify pass will reset this message to live and "
-                 "re-capture it.")
+    if row["mime_path"]:
+        path = Path(row["mime_path"])
+        if not path.is_file():
+            raise ToolError(
+                "not_found", f"The archived MIME file is missing at {path}.",
+                hint="The next verify pass will reset this message to live "
+                     "and re-capture it.")
+        sha256 = row["mime_sha256"]
+    else:
+        # Live mail: fetch mime_content through the gateway and store it
+        # content-addressed (harmless — this does NOT capture the message;
+        # archive_state and mime_sha256 on the row are left untouched, so
+        # this fetch never races the capture worker).
+        mime = await ctx.gateway.call(
+            lambda account: _fetch_live_mime(account, row["ews_id"]))
+        sha256, path = await asyncio.to_thread(
+            files.store_mime, ctx.settings.data_dir, mime)
     ttl = max(1, min(int(ttl_minutes), 1440))
     subject = (row["subject"] or "message").strip() or "message"
     name = f"{subject[:60]}.eml"
@@ -145,7 +218,7 @@ async def _get_raw_message(ctx: Context, *, id: str,
         "name": rec["name"],
         "content_type": "message/rfc822",
         "size_bytes": path.stat().st_size,
-        "sha256": row["mime_sha256"],
+        "sha256": sha256,
         "archive_state": row["archive_state"],
         "expires_in_minutes": ttl,
         "curl": f'curl -o {rec["name"]!r} "{url}"',
@@ -263,6 +336,7 @@ TOOLS: list[ToolSpec] = [
         }),
         handler=_archive_run,
         confirm=lambda kw: not kw.get("dry_run", True),
+        preview=_archive_run_preview,
     ),
     ToolSpec(
         name="archive_status",
@@ -281,10 +355,11 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="get_raw_message",
         description=(
-            "Get the original RFC822 message of an ARCHIVED mail as a "
-            "single-use download URL (the bytes never travel through the "
-            "conversation). Works for captured, verified and deleted "
-            "messages; live mail has no stored MIME yet. The link expires and "
+            "Get the original RFC822 message as a single-use download URL "
+            "(the bytes never travel through the conversation). Works for "
+            "any message: captured/verified/deleted mail is served from the "
+            "on-disk archive; live mail is fetched fresh through Exchange and "
+            "cached, without changing its archive state. The link expires and "
             "is spent by the first successful download."
         ),
         side_effect_class="read",

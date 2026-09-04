@@ -2,8 +2,9 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 
-from conftest import FakeEmbedder, make_context, make_row
+from conftest import FakeEmbedder, FakeGateway, make_context, make_row
 
 from ewsmcp.archive import files
 from ewsmcp.semantic import SemanticIndex
@@ -85,11 +86,20 @@ def test_archive_run_for_real_is_two_phase(db, tmp_path):
     ctx.archive = _FakeRunner()
     phase1 = _run(ctx, "archive_run", dry_run=False)
     assert phase1["requires_confirmation"] is True and phase1["confirm_token"]
-    assert ctx.archive.calls == []                      # NOTHING executed
+    # Phase 1 previews with a REAL dry run — exactly one runner call, and it
+    # is a dry run — so nothing is executed, but the preview carries the
+    # resolved policy and the dry-run counts, not just the caller's args.
+    assert len(ctx.archive.calls) == 1
+    assert ctx.archive.calls[0]["dry_run"] is True
+    assert phase1["preview"]["policy"]["folders"] == ["f:inbox", "f:sent"]
+    assert phase1["preview"]["candidates"] == 3
+
     phase2 = _run(ctx, "archive_run", dry_run=False,
                   confirm_token=phase1["confirm_token"])
     assert phase2["ok"] is True
-    assert ctx.archive.calls[0]["dry_run"] is False
+    # Phase 2 makes the real (dry_run=False) call.
+    real_calls = [c for c in ctx.archive.calls if c["dry_run"] is False]
+    assert len(real_calls) == 1
 
 
 def test_archive_run_is_blocked_below_the_full_tier(db):
@@ -156,12 +166,50 @@ def test_get_raw_message_without_external_url_is_relative(db, tmp_path):
         "/download/")
 
 
-def test_get_raw_message_on_live_mail_explains_itself(db, tmp_path):
+class _FetchAccount:
+    """A minimal account double: only `fetch(ids=..., only_fields=...)`."""
+
+    def __init__(self, results):
+        self.results = results
+
+    def fetch(self, ids, only_fields=None):
+        return list(self.results)
+
+
+def test_get_raw_message_on_live_mail_fetches_mime_via_ewsd(db, tmp_path):
+    item = SimpleNamespace(mime_content=b"LIVE-MIME")
+    gateway = FakeGateway(_FetchAccount([item]))
+    ctx = _ctx(db, data_dir=str(tmp_path / "data"), gateway=gateway)
+    ctx.cache.upsert_messages([make_row("A1", subject="Still live")])
+
+    res = _run(ctx, "get_raw_message", id="A1")
+
+    assert res["ok"] is True
+    assert res["archive_state"] == "live"
+    assert res["sha256"] == files.sha256_bytes(b"LIVE-MIME")
+    assert gateway.calls == 1
+    # store_mime is content-addressed and does NOT flip archive_state or
+    # mime_sha256 on the row — this is a fetch-and-cache, not a capture.
+    row = ctx.cache.get_message("A1")
+    assert row["archive_state"] == "live"
+    assert row["mime_sha256"] is None
+
+
+def test_get_raw_message_for_an_unknown_id_is_not_found(db, tmp_path):
     ctx = _ctx(db, data_dir=str(tmp_path / "data"))
+    res = _run(ctx, "get_raw_message", id="NOPE")
+    assert res["ok"] is False and res["error"]["code"] == "not_found"
+
+
+def test_get_raw_message_when_exchange_says_not_found(db, tmp_path):
+    class ErrorItemNotFound(Exception):
+        pass
+
+    gateway = FakeGateway(_FetchAccount([ErrorItemNotFound("gone")]))
+    ctx = _ctx(db, data_dir=str(tmp_path / "data"), gateway=gateway)
     ctx.cache.upsert_messages([make_row("A1")])
     res = _run(ctx, "get_raw_message", id="A1")
     assert res["ok"] is False and res["error"]["code"] == "not_found"
-    assert "not archived" in res["error"]["message"]
 
 
 def test_get_raw_message_when_the_file_vanished(db, tmp_path):

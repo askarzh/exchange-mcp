@@ -44,7 +44,7 @@ the registry is the single source of truth for what exists.
 | `set_oof` | send | full | Set out-of-office auto-replies (externally visible → send class, two-phase confirmed). |
 | `archive_run` | destructive | full | Run one archive pass. |
 | `archive_status` | read | read | Where the archive stands: message counts per state (live, captured, verified, deleted), the last five runs with their counts and errors, blob-store size and free disk, the embedding backlog, the active policy, and whether deletion is enabled. |
-| `get_raw_message` | read | read | Get the original RFC822 message of an ARCHIVED mail as a single-use download URL (the bytes never travel through the conversation). |
+| `get_raw_message` | read | read | Get the original RFC822 message as a single-use download URL (the bytes never travel through the conversation). |
 | `find_similar` | read | read | Find mail that MEANS the same thing, not mail that shares words: pass `id` to find messages like that one, or `text` to describe what you are looking for. |
 <!-- TOOL_TABLE_END -->
 
@@ -424,7 +424,7 @@ _No parameters._
 
 #### `get_raw_message` — read (min tier: read)
 
-Get the original RFC822 message of an ARCHIVED mail as a single-use download URL (the bytes never travel through the conversation). Works for captured, verified and deleted messages; live mail has no stored MIME yet. The link expires and is spent by the first successful download.
+Get the original RFC822 message as a single-use download URL (the bytes never travel through the conversation). Works for any message: captured/verified/deleted mail is served from the on-disk archive; live mail is fetched fresh through Exchange and cached, without changing its archive state. The link expires and is spent by the first successful download.
 
 | parameter | type | required | description |
 |---|---|---|---|
