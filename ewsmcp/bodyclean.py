@@ -27,7 +27,14 @@ from html.parser import HTMLParser
 _QUOTE_PREFIX_RE = re.compile(r"^(?:>\s?)+")
 
 
+# Invisible code points mail clients leave behind (Apple Mail's U+FEFF after
+# a forward header, zero-width spaces/joiners from HTML). NBSP becomes a
+# plain space so word matching and tokenising see it as one.
+_INVISIBLE_RE = re.compile("[\ufeff\u200b\u200c\u200d\u2060]")
+
+
 def _normalize_newlines(text: str) -> str:
+    text = _INVISIBLE_RE.sub("", text).replace("\u00a0", " ")
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -236,8 +243,25 @@ _RU_HEADER_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE)
 
 
+# Corporate "external sender" banners the mail gateway prepends to every
+# inbound message (KZ / RU / EN variants of the same four lines). Identical
+# on ~15% of the mailbox, they make unrelated external mail look alike to the
+# embedder and add nothing a reader wants. Matched per line, anywhere in the
+# body (they also ride inside quoted history).
+_BANNER_LINE_RE = re.compile(
+    r"^.*(?:"
+    r"назар аударыңыз|бұл хатты сыртқы адресат|егер хатты күдікті деп|"
+    r"данное письмо отправлено внешним|если считаете письмо подозрительным|"
+    r"будьте осторожны при работе с вложениями|"
+    r"this (?:e-?mail|message) (?:was|is) sent (?:by|from) an external|"
+    r"if you (?:consider|find) this (?:e-?mail|message) suspicious"
+    r").*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
 def strip_header_lines(text: str) -> str:
-    return _RU_HEADER_LINE_RE.sub("", text)
+    text = _RU_HEADER_LINE_RE.sub("", text)
+    return _BANNER_LINE_RE.sub("", text)
 
 
 def clean_body(text: str, max_chars: int = 4000) -> dict:
@@ -253,7 +277,7 @@ def clean_body(text: str, max_chars: int = 4000) -> dict:
     t = strip_header_lines(t)
     t = strip_signature(t)
     t = _BLANK_RUN_RE.sub("\n\n", t)
-    t = t.rstrip()
+    t = t.strip()
 
     truncated = False
     if max_chars and len(t) > max_chars:

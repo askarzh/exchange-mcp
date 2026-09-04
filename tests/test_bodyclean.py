@@ -361,3 +361,24 @@ def test_russian_forward_header_lines_are_dropped_but_content_stays():
     # A body line that merely starts with one of the words is not a header.
     assert clean_body("Тема встречи обсуждалась вчера.")["text"] == (
         "Тема встречи обсуждалась вчера.")
+
+
+def test_external_sender_banner_and_invisible_marks_are_dropped():
+    """The gateway's KZ/RU 'external sender' banner rides on every inbound
+    mail and must not reach the embedder; Apple Mail's U+FEFF and NBSPs are
+    normalised away too."""
+    text = (
+        "Назар аударыңыз! Бұл хатты сыртқы адресат жіберген. Сақ болыңыз!\n"
+        "Егер хатты күдікті деп ойласаңыз, АҚҚО-на дереу хабарласыңыз: "
+        "АҚҚО<mailto:ib-incident@bank.example>\n"
+        "Внимание! Данное письмо отправлено внешним адресатом. "
+        "Будьте осторожны при работе с вложениями и ссылками!\n"
+        "Если считаете письмо подозрительным, незамедлительно обратитесь в ЦОИБ\n"
+        "\n"
+        "\ufeff\n"
+        "Джан, потрясающие идеи.\n"
+        "Давайте сконцентрируемся на Кейсе 1 и 2.\n"
+    )
+    out = clean_body(text)["text"]
+    assert out == "Джан, потрясающие идеи.\nДавайте сконцентрируемся на Кейсе 1 и 2."
+    assert "\ufeff" not in out and "\u00a0" not in out

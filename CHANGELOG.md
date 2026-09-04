@@ -17,6 +17,7 @@ this file starts from the point this repository was extracted.
 - `list_folders` documents `archived` as the number of messages the archive holds a copy of (captured, verified or deleted), which is what it always counted.
 - `bodyclean` drops Russian forward/reply header lines (От/Дата/Кому/Копия/Тема, "Начало переадресованного письма") while keeping the forwarded text, so `find_similar` stops ranking every forward next to every other forward. `scripts/backfill_bodies.py --all` re-cleans existing rows.
 - `get_raw_message` names no longer contain `:` or other filesystem-unsafe characters ("Fwd: X" → "Fwd - X.eml"), so the curl hint works on Windows.
+- `bodyclean` removes the corporate "external sender" banner (KZ/RU/EN lines) and invisible code points (U+FEFF, zero-width spaces, NBSP) before storing and embedding; on this mailbox the banner sat on 15% of messages and made unrelated external mail look alike to `find_similar`.
 
 ## [5.1.0a1] - 2026-09-04 (pre-release)
 
