@@ -322,3 +322,25 @@ def test_archive_run_status_route(db):
     assert status == 200 and body["captured"] == 2 and body["kind"] == "capture"
     assert _drive(app, "/v1/archive/runs/999999", headers=AUTH)[0] == 404
     assert _drive(app, "/v1/archive/runs/abc", headers=AUTH)[0] == 400
+
+
+def test_download_disposition_carries_a_non_ascii_filename(db):
+    """The header must offer the real name (RFC 5987) and still be a single
+    ASCII line: mail-derived filenames are attacker-influenced."""
+    from pathlib import Path
+
+    from ewsmcp import downloads
+
+    ctx = make_context(db, ewsd_api_key="k")
+    mime = Path(ctx.settings.data_dir) / "mime"
+    mime.mkdir(parents=True, exist_ok=True)
+    (mime / "r.eml").write_bytes(b"RAW")
+    token = downloads.mint(ctx.settings.data_dir, path=str(mime / "r.eml"),
+                           name="Отчёт.pdf")["token"]
+    app = build_daemon_app(ctx, ctx.settings)
+    status, headers, _body = _drive_raw(app, f"/download/{token}")
+    assert status == 200
+    value = next(v for k, v in headers if k == b"content-disposition")
+    assert value.startswith(b'attachment; filename="pdf"; ')
+    assert b"filename*=UTF-8''%D0%9E" in value
+    assert b"\r" not in value and b"\n" not in value

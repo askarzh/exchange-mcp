@@ -273,9 +273,12 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
             # though downloads.redeem() already did — these ride verbatim
             # into HTTP headers and are ultimately attacker-influenced
             # (mail-derived names/types).
-            safe_name = downloads.safe_header_name(rec["name"])
             safe_ct = downloads.safe_content_type(rec["content_type"])
-            disposition = f'attachment; filename="{safe_name}"'.encode()
+            # One line, two forms: an ASCII-safe `filename=` plus the real
+            # (possibly non-ASCII) name percent-encoded in `filename*`
+            # (RFC 5987) — otherwise "Отчёт.pdf" is served as "pdf".
+            disposition = downloads.content_disposition(
+                rec.get("orig_name") or rec["name"]).encode("ascii")
             await send({"type": "http.response.start", "status": 200, "headers": [
                 [b"content-type", safe_ct.encode()],
                 [b"content-length", str(size).encode()],

@@ -21,6 +21,7 @@ import secrets
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 TOKEN_BYTES = 32
 DEFAULT_TTL_SECONDS = 15 * 60
@@ -35,7 +36,13 @@ _TOKEN_RE = re.compile(r"^[0-9a-f]{32,128}$")
 # subjects, attachment filenames). Keep only what's safe on an HTTP header
 # line — no CR/LF, no quote, no control characters.
 _NAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
-_CONTENT_TYPE_RE = re.compile(r"^[\w.+-]+/[\w.+-]+$")
+# Anything that could break out of, or inject into, a header line. Note that
+# non-ASCII is NOT in here: the original name survives in `filename*` (RFC
+# 5987), percent-encoded, so a Cyrillic or Arabic attachment keeps its name.
+_HEADER_UNSAFE_RE = re.compile(r"[\r\n\"\\\x00-\x1f\x7f]")
+# re.ASCII: without it \w matches Unicode letters, so a content type like
+# "application/pdf\u010d" would pass and ride into the header.
+_CONTENT_TYPE_RE = re.compile(r"^[\w.+-]+/[\w.+-]+$", re.ASCII)
 
 
 class DownloadRejected(Exception):
@@ -52,6 +59,28 @@ def safe_header_name(name: str) -> str:
     base = Path(str(name or "")).name           # strips any directory part
     cleaned = _NAME_RE.sub("_", base).strip("._ ")
     return cleaned or "download.bin"
+
+
+def clean_name(name: str) -> str:
+    """The ORIGINAL filename with only header-unsafe characters removed.
+
+    Unlike ``safe_header_name`` this keeps non-ASCII: it is what goes into
+    ``filename*=UTF-8''...`` percent-encoded, so `Отчёт.pdf` arrives as
+    `Отчёт.pdf` instead of `pdf`."""
+    base = Path(str(name or "")).name           # strips any directory part
+    cleaned = _HEADER_UNSAFE_RE.sub("", base).strip()
+    return cleaned or "download.bin"
+
+
+def content_disposition(name: str) -> str:
+    """RFC 6266/5987 `content-disposition` value for a downloaded file.
+
+    Both forms are emitted on ONE line: `filename=` carries an ASCII-safe
+    reduction for ancient clients, `filename*=` the real (possibly
+    non-ASCII) name. Everything here is ASCII by construction — the name is
+    percent-encoded — so the value can never inject a header break."""
+    return (f'attachment; filename="{safe_header_name(name)}"; '
+            f"filename*=UTF-8''{quote(clean_name(name), safe='')}")
 
 
 def safe_content_type(content_type: str) -> str:
@@ -83,6 +112,9 @@ def mint(data_dir: str, *, path: str, name: str,
     safe_ct = safe_content_type(content_type)
     record = {"path": str(target),
               "name": safe_name,
+              # The original name (minus header-unsafe characters) is kept
+              # so the download can offer it through `filename*`.
+              "orig_name": clean_name(name),
               "content_type": safe_ct,
               "expires_at": time.time() + ttl, "used": False}
     links = _links_dir(data_dir)
@@ -121,6 +153,8 @@ def redeem(data_dir: str, token: str) -> dict[str, Any]:
     # ever written by a path that bypassed mint()'s sanitizing.
     return {"path": str(target),
             "name": safe_header_name(record.get("name") or target.name),
+            "orig_name": clean_name(record.get("orig_name")
+                                    or record.get("name") or target.name),
             "content_type": safe_content_type(record.get("content_type"))}
 
 

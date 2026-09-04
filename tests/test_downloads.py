@@ -118,3 +118,35 @@ def test_sweep_removes_used_and_expired_records(tmp_path):
     downloads.redeem(str(tmp_path), used)
     downloads.mint(str(tmp_path), path=str(path), name="b")
     assert downloads.sweep(str(tmp_path)) == 1
+
+
+def test_a_non_ascii_name_survives_in_filename_star(tmp_path):
+    """RFC 5987: `filename=` keeps an ASCII reduction for old clients, but
+    the real name rides in `filename*` percent-encoded — otherwise
+    "Отчёт.pdf" is served as "pdf"."""
+    path = _file(tmp_path)
+    rec = downloads.mint(str(tmp_path), path=str(path), name="Отчёт.pdf")
+    assert rec["name"] == "pdf"                      # the ASCII reduction
+    got = downloads.redeem(str(tmp_path), rec["token"])
+    assert got["orig_name"] == "Отчёт.pdf"           # the original, intact
+    value = downloads.content_disposition(got["orig_name"])
+    assert value.startswith('attachment; filename="pdf"; ')
+    assert "filename*=UTF-8''%D0%9E" in value and value.endswith(".pdf")
+
+
+def test_the_disposition_header_is_always_one_ascii_line(tmp_path):
+    for name in ("evil.eml\r\nX-Injected: 1", 'q"uote.pdf', "Отчёт.pdf",
+                 "../../etc/passwd", ""):
+        value = downloads.content_disposition(name)
+        value.encode("ascii")                        # never raises
+        assert "\r" not in value and "\n" not in value
+        assert value.count('"') == 2                 # only the two we wrote
+
+
+def test_a_unicode_content_type_does_not_pass_as_a_token(tmp_path):
+    """\\w is Unicode-aware by default; the regex is re.ASCII so a type like
+    "application/pdfč" falls back instead of riding into the header."""
+    path = _file(tmp_path)
+    rec = downloads.mint(str(tmp_path), path=str(path), name="x",
+                         content_type="application/pdfč")
+    assert rec["content_type"] == "application/octet-stream"
