@@ -81,6 +81,18 @@ def _account(extra=()):
                   account.outbox, account.calendar, account.contacts,
                   account.tasks, *extra])
     account.root = FakeRoot(account.msg_folder_root)
+    # exchangelib's Account.fetch: yields, per input item, the fetched item or
+    # an exception. The default fake echoes the scripted items (their
+    # `text_body` stands in for what GetItem would return); tests override it
+    # to script bodies that the sync delta did NOT carry.
+    account.fetch_calls = []
+
+    def fetch(items, only_fields=None, **kw):
+        items = list(items)
+        account.fetch_calls.append((len(items), tuple(only_fields or ())))
+        return iter(items)
+
+    account.fetch = fetch
     return account
 
 
@@ -107,6 +119,96 @@ def _engine(db, account, **overrides):
 def _row_in(folder_id, ews_id):
     from conftest import make_row
     return make_row(ews_id, folder_id=folder_id)
+
+
+def _body_of(store, ews_id):
+    with store.db.conn() as c:
+        return c.execute("SELECT body_clean FROM ews.messages WHERE ews_id = %s",
+                         (ews_id,)).fetchone()["body_clean"]
+
+
+# --- bodies come from GetItem, never from the sync delta ----------------------
+
+
+def test_sync_fetches_bodies_in_bulk_because_the_delta_has_none(db):
+    """Exchange leaves item:TextBody empty in SyncFolderItems (verified live
+    on Exchange 2016): the engine must hydrate bodies with Account.fetch
+    before cleaning, and do it in bulk, not one GetItem per message."""
+    account = _account()
+    account.inbox.queue(
+        [("create", _msg(f"M-{i}", body=None)) for i in range(5)], "tok-1")
+    bodies = {f"M-{i}": f"fetched body {i}" for i in range(5)}
+
+    def fetch(items, only_fields=None, **kw):
+        items = list(items)
+        account.fetch_calls.append((len(items), tuple(only_fields or ())))
+        return iter([SimpleNamespace(id=i.id, text_body=bodies[i.id]) for i in items])
+
+    account.fetch = fetch
+    engine, store = _engine(db, account)
+    asyncio.run(engine._cycle())
+
+    assert account.fetch_calls == [(5, ("text_body",))]
+    assert _body_of(store, "M-3") == "fetched body 3"
+    assert store.stats()["rows"]["messages"] == 5
+
+
+def test_a_failed_body_fetch_keeps_the_row_and_the_folder(db):
+    """One id GetItem rejects (exchangelib yields the exception in its slot)
+    must not lose the message or abort the folder: the row lands with an
+    empty body and the token still advances."""
+    account = _account()
+    account.inbox.queue(
+        [("create", _msg("OK-1", body=None)), ("create", _msg("BAD-1", body=None))],
+        "tok-1")
+
+    def fetch(items, only_fields=None, **kw):
+        out = []
+        for i in items:
+            out.append(RuntimeError("ErrorItemNotFound") if i.id == "BAD-1"
+                       else SimpleNamespace(id=i.id, text_body="hello"))
+        return iter(out)
+
+    account.fetch = fetch
+    engine, store = _engine(db, account)
+    asyncio.run(engine._cycle())
+
+    assert _body_of(store, "OK-1") == "hello"
+    assert _body_of(store, "BAD-1") == ""
+    assert store.get_sync_state("item:F-IN") == "tok-1"
+
+
+def test_a_fetch_that_blows_up_entirely_still_writes_the_rows(db):
+    account = _account()
+    account.inbox.queue([("create", _msg("M-1", body=None))], "tok-1")
+
+    def fetch(items, only_fields=None, **kw):
+        raise RuntimeError("EWS 503")
+
+    account.fetch = fetch
+    engine, store = _engine(db, account)
+    asyncio.run(engine._cycle())
+    assert _body_of(store, "M-1") == ""
+    assert store.get_sync_state("item:F-IN") == "tok-1"
+
+
+def test_update_bodies_requeues_the_message_for_embedding(db):
+    """The backfill's store half: body written, chunks dropped, embedded_at
+    cleared — all in one transaction."""
+    account = _account()
+    account.inbox.queue([("create", _msg("M-1", body=None))], "tok-1")
+    engine, store = _engine(db, account)
+    asyncio.run(engine._cycle())
+    store.replace_chunks("M-1", [{"seq": 0, "text": "Subj", "embedding": [0.0] * 768}])
+    assert store.embedding_backlog() == 0
+    assert [r["ews_id"] for r in store.messages_missing_body(10)] == ["M-1"]
+
+    assert store.update_bodies({"M-1": "real body"}) == 1
+    assert _body_of(store, "M-1") == "real body"
+    assert store.embedding_backlog() == 1
+    assert store.messages_missing_body(10) == []
+    with store.db.conn() as c:
+        assert c.execute("SELECT count(*) AS n FROM ews.chunks").fetchone()["n"] == 0
 
 
 def test_cycle_applies_creates_updates_deletes_and_read_flags(db):

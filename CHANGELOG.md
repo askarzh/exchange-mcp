@@ -9,6 +9,8 @@ this file starts from the point this repository was extracted.
 ### Fixed
 - `archive_status` failed with "Object of type datetime is not JSON serializable": `recent_runs` timestamps are now ISO-8601 strings.
 - `archive_status` from the MCP reported the policy and `delete_enabled` from the MCP container's own defaults, contradicting the daemon. It now copies both from ewsd's status (`policy_source: "ewsd"`) and flags them as defaults when ewsd is unreachable.
+- The mirror never had message bodies: Exchange leaves `item:TextBody` empty in SyncFolderItems, so `body_clean` was `""` for every row and full-text search plus embeddings ran on subject and sender only. The sync engine now fetches bodies in bulk with GetItem (100 per call) before cleaning; `scripts/backfill_bodies.py` repairs rows synced before the fix and re-queues them for embedding.
+- `archive_status` from the MCP reported `semantic_enabled: false` because only ewsd holds `GEMINI_API_KEY`; the flag is now copied from ewsd.
 
 ## [5.1.0a1] - 2026-09-04 (pre-release)
 

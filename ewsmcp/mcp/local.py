@@ -202,7 +202,8 @@ async def waiting_on(ctx: Context, **kw) -> dict[str, Any]:
 
 
 _ARCHIVE_RUNNER_KEYS_TO_DROP = ("state_counts", "embedding_backlog",
-                               "blob_store_bytes", "free_gb", "policy")
+                               "blob_store_bytes", "free_gb", "policy",
+                               "semantic_enabled")
 
 
 async def archive_status(ctx: Context, **kw) -> dict[str, Any]:
@@ -242,6 +243,10 @@ async def archive_status(ctx: Context, **kw) -> dict[str, Any]:
         out["policy_source"] = "ewsd"
     if "delete_enabled" in archive_block:
         out["delete_enabled"] = bool(archive_block["delete_enabled"])
+    # Likewise GEMINI_API_KEY lives on ewsd only, so the MCP's own
+    # semantic_enabled() is always false and would misreport the service.
+    if "semantic_enabled" in archive_block:
+        out["semantic_enabled"] = bool(archive_block["semantic_enabled"])
     runner_keys = {k: v for k, v in archive_block.items()
                    if k not in _ARCHIVE_RUNNER_KEYS_TO_DROP}
     if runner_keys:

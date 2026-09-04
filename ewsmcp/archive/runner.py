@@ -210,6 +210,7 @@ class ArchiveRunner:
             # The policy ewsd actually runs. The MCP process has no ARCHIVE_*
             # environment of its own, so this is the only truthful source.
             "policy": self._policy_dict(),
+            "semantic_enabled": bool(self.settings.semantic_enabled()),
         }
 
     def _policy_dict(self) -> dict[str, Any]:

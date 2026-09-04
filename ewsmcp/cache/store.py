@@ -669,6 +669,31 @@ class CacheStore:
             c.execute("UPDATE ews.messages SET embedded_at = now() "
                       "WHERE ews_id = %s", (ews_id,))
 
+    def messages_missing_body(self, limit: int) -> list[dict[str, Any]]:
+        """Rows still on Exchange whose mirror body is empty — the backfill
+        set for `scripts/backfill_bodies.py`. Deleted rows are excluded: their
+        only copy is the MIME on disk, not GetItem."""
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT ews_id, changekey FROM ews.messages "
+                "WHERE coalesce(body_clean, '') = '' AND archive_state <> 'deleted' "
+                "ORDER BY date_ts DESC NULLS LAST LIMIT %s", (int(limit),)).fetchall()
+
+    def update_bodies(self, bodies: dict[str, str]) -> int:
+        """Set `body_clean` for the given ids and put them back on the
+        embedding backlog: the old chunks were built from an empty body, so
+        they are dropped and `embedded_at` cleared in the same transaction."""
+        if not bodies:
+            return 0
+        ids = list(bodies)
+        with self.db.conn() as c:
+            c.cursor().executemany(
+                "UPDATE ews.messages SET body_clean = %(body)s, embedded_at = NULL "
+                "WHERE ews_id = %(ews_id)s",
+                [{"ews_id": k, "body": v} for k, v in bodies.items()])
+            c.execute("DELETE FROM ews.chunks WHERE message_ews_id = ANY(%s)", (ids,))
+        return len(ids)
+
     def mark_embedded(self, ews_ids: list[str]) -> None:
         """Stamp `embedded_at` directly. `replace_chunks` already does this per
         message, so callers normally don't need this — kept as a standalone,

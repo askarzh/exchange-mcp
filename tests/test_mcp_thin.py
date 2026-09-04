@@ -305,6 +305,7 @@ def test_archive_status_policy_and_delete_switch_come_from_the_daemon(db):
             return {"ok": True, "archive": {
                 "running": True, "cycles": 1, "delete_enabled": True,
                 "delete_auto": True, "policy": ewsd_policy,
+                "semantic_enabled": True,
             }}
 
     ctx = _mcp_ctx(db, StatusWithPolicy())
@@ -313,8 +314,10 @@ def test_archive_status_policy_and_delete_switch_come_from_the_daemon(db):
     assert res["policy"] == ewsd_policy
     assert res["policy_source"] == "ewsd"
     assert res["delete_enabled"] is True
+    assert res["semantic_enabled"] is True   # the MCP itself has no Gemini key
     assert res["runner"]["delete_enabled"] is True
     assert "policy" not in res["runner"]
+    assert "semantic_enabled" not in res["runner"]
 
 
 def test_archive_status_omits_disk_figures_with_the_daemon_down(db):

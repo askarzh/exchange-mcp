@@ -108,6 +108,42 @@ def _ts(dt: Any) -> int | None:
         return None
 
 
+BODY_FETCH_CHUNK = 100
+
+
+def hydrate_bodies(account: Any, items: list[Any]) -> int:
+    """Fill `text_body` on synced items with a bulk GetItem.
+
+    SyncFolderItems never carries the body: Exchange answers `item:TextBody`
+    only through GetItem, so every item that comes out of `sync_items` has
+    `text_body == None` however it was projected (verified live against
+    Exchange 2016, build 15.2.1748: sync → 0 chars, fetch → the full text).
+    Items are handed to `Account.fetch` as they are (id + changekey);
+    exchangelib chunks the call and yields, in order, either the fetched
+    item or an exception for that one id — a failed id keeps whatever body
+    it had (none) and is retried on its next change, never failing the
+    folder. Returns the number of items that received a body."""
+    if not items:
+        return 0
+    filled = 0
+    for start in range(0, len(items), BODY_FETCH_CHUNK):
+        batch = items[start:start + BODY_FETCH_CHUNK]
+        try:
+            fetched = list(account.fetch(batch, only_fields=["text_body"]))
+        except Exception as exc:  # noqa: BLE001 - a body is never worth a folder
+            logger.warning("body fetch for %d items failed: %s", len(batch), exc)
+            continue
+        for item, res in zip(batch, fetched):
+            if isinstance(res, Exception):
+                logger.debug("body fetch for %s failed: %s", getattr(item, "id", "?"), res)
+                continue
+            text = getattr(res, "text_body", None)
+            if isinstance(text, str):
+                item.text_body = text
+                filled += 1
+    return filled
+
+
 def row_from_message(item: Any, folder_id: str, tz: str) -> dict[str, Any]:
     """Message item → mirror row. The body is cleaned HERE, once, at sync time."""
     sender = getattr(item, "sender", None)
@@ -354,12 +390,17 @@ class SyncEngine:
         tz = self.settings.ews_tz
         for folder_id, folder in list(self._folders.items()):
             try:
-                self._sync_one_folder(folder_id, folder, tz)
+                self._sync_one_folder(folder_id, folder, tz, account)
             except Exception as exc:  # noqa: BLE001 - per-folder degrade
                 logger.warning("folder %s delta failed: %s", folder_id, exc)
 
-    def _sync_one_folder(self, folder_id: str, folder: Any, tz: str) -> None:
+    def _sync_one_folder(self, folder_id: str, folder: Any, tz: str,
+                         account: Any) -> None:
         """Apply one folder's item delta, flushing every FLUSH_EVERY changes.
+
+        Created/updated items are buffered as items (not rows) so each flush
+        can pull their bodies in one bulk GetItem (`hydrate_bodies`) before
+        `row_from_message` cleans them — the sync delta itself has no body.
 
         The token is persisted ONCE, at the end. exchangelib only learns the
         new sync state when SyncFolderItems reports the last item in range: it
@@ -372,13 +413,15 @@ class SyncEngine:
         re-upserted next boot, which is idempotent.
         """
         token = self.store.get_sync_state(f"item:{folder_id}")
-        upserts: list[dict[str, Any]] = []
+        upserts: list[Any] = []
         deletes: list[str] = []
         read_flags: list[tuple] = []
 
         def flush() -> None:
             if upserts:
-                self.store.upsert_messages(upserts)
+                hydrate_bodies(account, upserts)
+                self.store.upsert_messages(
+                    [row_from_message(item, folder_id, tz) for item in upserts])
                 upserts.clear()
             if deletes:
                 # Spec §3: an archived row that disappears upstream (our own
@@ -399,7 +442,7 @@ class SyncEngine:
         ):
             if change_type in ("create", "update"):
                 if getattr(payload, "id", None):
-                    upserts.append(row_from_message(payload, folder_id, tz))
+                    upserts.append(payload)
                     pending += 1
             elif change_type == "delete":
                 deletes.append(str(payload.id))
