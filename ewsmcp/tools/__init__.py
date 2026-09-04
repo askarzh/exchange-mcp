@@ -1,20 +1,22 @@
-"""Tool registry: tools in four packs, tier-filtered. The count is asserted
-by boot smokes and the generated docs — change it DELIBERATELY."""
+"""Tool packs. Deliberately EMPTY of imports.
 
-from typing import Dict
+``build_registry`` and the packs live in ``tools/registry.py``: the thin MCP
+imports ``tools.base``/``tools.cache_reads``/``tools.write_specs``, and any
+import here would run for it too — pulling exchangelib (via writes.py) into
+a process that must never load it (tests/test_mcp_import_boundary.py).
 
-from . import archive, calendar_people, mail_read, tasks, writes
-from .base import CLASS_TIER, TIER_RANK, Context, ToolSpec
+``from ewsmcp.tools import build_registry`` still works: it resolves lazily
+through ``__getattr__`` below, for the daemon and for tests.
+"""
+
+from typing import Any
+
+__all__ = ["build_registry"]
 
 
-def build_registry(ctx: Context) -> Dict[str, ToolSpec]:
-    specs = [*mail_read.TOOLS, *calendar_people.TOOLS, *tasks.TOOLS,
-             *writes.TOOLS, *archive.TOOLS]
-    tier = ctx.settings.ews_capability_tier
-    registry: Dict[str, ToolSpec] = {}
-    for spec in specs:
-        need = CLASS_TIER.get(spec.side_effect_class, "draft")
-        if TIER_RANK[need] <= TIER_RANK.get(tier, 2):
-            registry[spec.name] = spec
-    ctx.registry = registry
-    return registry
+def __getattr__(name: str) -> Any:
+    if name == "build_registry":
+        from .registry import build_registry
+
+        return build_registry
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

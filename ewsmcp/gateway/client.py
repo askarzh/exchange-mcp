@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 
 from exchangelib import DELEGATE, Account, Configuration, Credentials, EWSTimeZone
 from exchangelib.protocol import (
@@ -24,13 +24,13 @@ from exchangelib.protocol import (
 from ..config import Settings
 from ..errors import ToolError
 
+# Re-exported: WELL_KNOWN/paginate are exchangelib-free by design (see
+# wellknown.py) so the thin MCP's read tools can import them directly.
+from .wellknown import WELL_KNOWN as WELL_KNOWN
+from .wellknown import paginate as paginate
+
 logger = logging.getLogger(__name__)
 
-WELL_KNOWN = {
-    "f:inbox": "inbox", "f:sent": "sent", "f:drafts": "drafts",
-    "f:trash": "trash", "f:junk": "junk", "f:outbox": "outbox",
-    "f:calendar": "calendar", "f:contacts": "contacts", "f:tasks": "tasks",
-}
 
 
 class EWSGateway:
@@ -173,34 +173,3 @@ class EWSGateway:
                 hint="Use list_folders and pass one of its ids or paths.",
             )
         return folder
-
-
-def paginate(query: Any, *, offset: int, limit: int,
-             chunk: int = 50) -> Tuple[List[Any], Optional[int]]:
-    """Materialize query[offset:offset+limit] in chunks (sync, raises on
-    mid-iteration failure — the caller's error mapper classifies it).
-
-    Returns ``(items, next_offset)``. NEVER calls ``QuerySet.count()`` —
-    in exchangelib that iterates every matching id server-side, so a 20k
-    inbox paid ~20k ids of round trips on every "read 10 emails". Whether
-    another page exists comes from a one-item lookahead instead; callers
-    that want an exact total use a refreshed ``folder.total_count`` (only
-    valid for unfiltered listings) or a local mirror count.
-    """
-    offset = max(0, offset)
-    limit = max(0, limit)
-    lookahead = limit + 1
-    items: List[Any] = []
-    cursor = offset
-    chunk = max(1, min(chunk, 250))
-    while len(items) < lookahead:
-        want = min(chunk, lookahead - len(items))
-        batch = list(query[cursor:cursor + want])
-        if not batch:
-            break
-        items.extend(batch)
-        cursor += len(batch)
-        if len(batch) < want:
-            break
-    next_offset = offset + limit if len(items) > limit else None
-    return items[:limit], next_offset

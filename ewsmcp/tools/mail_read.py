@@ -29,7 +29,7 @@ import psycopg
 from .. import shared
 from ..dto import envelope, event_card, msg_card, msg_full
 from ..errors import ToolError
-from ..gateway.client import WELL_KNOWN, paginate
+from ..gateway.wellknown import WELL_KNOWN, paginate
 from . import cache_reads
 from .base import Context, ToolSpec
 from .cache_reads import _stamp

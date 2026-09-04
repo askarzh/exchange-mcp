@@ -47,7 +47,7 @@ from exchangelib.folders import Messages
 
 from ..bodyclean import clean_body
 from ..dto import fmt_dt
-from ..gateway.client import WELL_KNOWN
+from ..gateway.wellknown import WELL_KNOWN
 from .store import CacheStore
 
 logger = logging.getLogger(__name__)

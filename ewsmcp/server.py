@@ -2,8 +2,9 @@
 
 import logging
 
-from mcp.types import ToolAnnotations
-
+# Re-exported for the daemon's own wiring; the definition lives in
+# ewsmcp/annotations.py so the thin MCP can import it without exchangelib.
+from .annotations import ANNOTATIONS as ANNOTATIONS
 from .audit import AuditLog, NullAudit
 from .cache import CacheStore
 from .config import Settings
@@ -11,21 +12,10 @@ from .db import Database
 from .gateway.client import EWSGateway
 from .gateway.connection import ConnectionManager
 from .ids import IdAliaser
-from .tools import build_registry
 from .tools.base import Context
+from .tools.registry import build_registry
 
 logger = logging.getLogger(__name__)
-
-ANNOTATIONS = {
-    "read": ToolAnnotations(readOnlyHint=True, destructiveHint=False,
-                            idempotentHint=True, openWorldHint=False),
-    "write": ToolAnnotations(readOnlyHint=False, destructiveHint=False,
-                             idempotentHint=False, openWorldHint=False),
-    "destructive": ToolAnnotations(readOnlyHint=False, destructiveHint=True,
-                                   idempotentHint=False, openWorldHint=False),
-    "send": ToolAnnotations(readOnlyHint=False, destructiveHint=True,
-                            idempotentHint=False, openWorldHint=True),
-}
 
 
 def build_context(settings: Settings) -> Context:

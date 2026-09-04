@@ -2,7 +2,7 @@
 status (DESIGN.md §Transports). No /mcp here — that's ewsmcp/mcp/http.py,
 the only module that speaks MCP over Streamable HTTP."""
 
-import hmac
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -12,6 +12,11 @@ import jsonschema
 
 from . import __version__, downloads, uploads
 from .errors import HTTP_BY_CODE
+
+# Re-exported: the thin MCP's HTTP transport imports them from here today,
+# but they must not drag ewsd's gateway/tool imports along (see httputil.py).
+from .httputil import _authorized as _authorized
+from .httputil import _send_json as _send_json
 from .server import start_connection_manager
 from .tools.base import dispatch, validator_for
 from .tools.calendar_people import _get_server_status
@@ -22,32 +27,13 @@ MAX_BODY_BYTES = 1_048_576  # 1 MiB — tool arguments, not attachments
 _DOWNLOAD_CHUNK = 1024 * 1024  # stream files in 1 MiB chunks, not whole into memory
 
 
-def _authorized(headers, api_key: str) -> bool:
-    expected = api_key.encode()
-    for name, value in headers or []:
-        lname = name.lower() if isinstance(name, bytes) else str(name).encode().lower()
-        raw = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
-        if lname == b"authorization" and raw.lower().startswith("bearer "):
-            if hmac.compare_digest(raw[7:].strip().encode(), expected):
-                return True
-        elif lname == b"x-api-key":
-            if hmac.compare_digest(raw.strip().encode(), expected):
-                return True
-    return False
-
-
-async def _send_json(send, status: int, payload: dict[str, Any]) -> None:
-    body = json.dumps(payload, ensure_ascii=False, default=str).encode()
-    await send({"type": "http.response.start", "status": status, "headers": [
-        [b"content-type", b"application/json"],
-        [b"content-length", str(len(body)).encode()],
-    ]})
-    await send({"type": "http.response.body", "body": body})
-
-
-def _metrics_text(ctx) -> str:
+async def _metrics_text(ctx) -> str:
     """Prometheus exposition (text format 0.0.4). Behind the API key like
-    every non-health endpoint — scrape with a bearer token."""
+    every non-health endpoint — scrape with a bearer token.
+
+    Async because the cache/archive gauges are Postgres COUNT queries: they
+    go through asyncio.to_thread rather than blocking the event loop of a
+    process that is also serving tool calls."""
     import time as _t
     lines = [
         "# TYPE ewsmcp_uptime_seconds gauge",
@@ -65,7 +51,7 @@ def _metrics_text(ctx) -> str:
             lines.append(f'ewsmcp_errors_total{{code="{key[4:]}"}} {value}')
     if ctx.cache is not None:
         try:
-            stats = ctx.cache.stats()
+            stats = await asyncio.to_thread(ctx.cache.stats)
             lines.append("# TYPE ewsmcp_cache_rows gauge")
             for table, n in stats.get("rows", {}).items():
                 lines.append(f'ewsmcp_cache_rows{{table="{table}"}} {n}')
@@ -91,11 +77,14 @@ def _metrics_text(ctx) -> str:
         lines.append(f"ewsmcp_archive_degraded {1 if status.get('last_error') else 0}")
         if ctx.cache is not None:
             try:
+                counts, backlog = await asyncio.to_thread(
+                    lambda: (ctx.cache.archive_state_counts(),
+                             ctx.cache.embedding_backlog()))
                 lines.append("# TYPE ewsmcp_archive_messages gauge")
-                for state, n in ctx.cache.archive_state_counts().items():
+                for state, n in counts.items():
                     lines.append(f'ewsmcp_archive_messages{{state="{state}"}} {n}')
                 lines.append("# TYPE ewsmcp_archive_embedding_backlog gauge")
-                lines.append(f"ewsmcp_archive_embedding_backlog {ctx.cache.embedding_backlog()}")
+                lines.append(f"ewsmcp_archive_embedding_backlog {backlog}")
             except Exception:
                 pass
     return "\n".join(lines) + "\n"
@@ -336,7 +325,7 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
             return await _send_json(send, 200, {"ok": True, **dict(row)})
 
         if path == "/metrics" and method == "GET":
-            body = _metrics_text(ctx).encode()
+            body = (await _metrics_text(ctx)).encode()
             await send({"type": "http.response.start", "status": 200, "headers": [
                 [b"content-type", b"text/plain; version=0.0.4; charset=utf-8"],
                 [b"content-length", str(len(body)).encode()],
