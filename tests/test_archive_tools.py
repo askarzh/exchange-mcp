@@ -148,14 +148,17 @@ class _FakeRunner:
 def test_get_raw_message_returns_a_capability_url(db, tmp_path):
     ctx = _ctx(db, data_dir=str(tmp_path / "data"),
                external_url="https://ews.example.com")
-    ctx.cache.upsert_messages([make_row("A1", subject="Contract")])
+    ctx.cache.upsert_messages([make_row("A1", subject="Fwd: Прогноз - инвестиции")])
     sha, path = files.store_mime(ctx.settings.data_dir, b"RAW-MIME")
     ctx.cache.mark_captured("A1", mime_sha256=sha, mime_path=str(path))
 
     res = _run(ctx, "get_raw_message", id="A1")
     assert res["ok"] is True
     assert res["download_url"].startswith("https://ews.example.com/download/")
-    assert res["name"].endswith(".eml")
+    # The real subject, not the ASCII reduction ("Fwd_ _ - _.eml") — the
+    # download itself serves it through filename*.
+    assert res["name"] == "Fwd: Прогноз - инвестиции.eml"
+    assert res["name"] in res["curl"]
     assert res["size_bytes"] == len(b"RAW-MIME")
     assert res["expires_in_minutes"] == 15
 

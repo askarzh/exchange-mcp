@@ -320,6 +320,7 @@ async def _get_attachment(ctx: Context, message_id: str,
             "name": name,
             "size_bytes": getattr(att, "size", None),
             "content_type": content_type,
+            "source": "live",   # the archive path stamps source='archive'
         }
         chosen = mode
         if mode == "auto":
@@ -441,7 +442,8 @@ TOOLS: List[ToolSpec] = [
             "Well-known folders also carry `wk` (e.g. 'f:inbox') — prefer "
             "passing that stable alias. Set include_empty=false to hide "
             "folders with zero items. Each row also carries archived: how "
-            "many of that folder's messages now live only in the archive."
+            "many of that folder's messages the archive holds a copy of "
+            "(captured, verified, or already deleted from Exchange)."
         ),
         side_effect_class="read",
         requires_ews=True,

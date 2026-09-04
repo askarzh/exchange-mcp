@@ -109,27 +109,29 @@ def _ts(dt: Any) -> int | None:
 
 
 BODY_FETCH_CHUNK = 100
+# What SyncFolderItems leaves empty and GetItem must supply.
+HYDRATE_FIELDS = ["text_body", "to_recipients"]
 
 
 def hydrate_bodies(account: Any, items: list[Any]) -> int:
-    """Fill `text_body` on synced items with a bulk GetItem.
+    """Fill `text_body` and `to_recipients` on synced items with a bulk GetItem.
 
-    SyncFolderItems never carries the body: Exchange answers `item:TextBody`
-    only through GetItem, so every item that comes out of `sync_items` has
-    `text_body == None` however it was projected (verified live against
-    Exchange 2016, build 15.2.1748: sync → 0 chars, fetch → the full text).
-    Items are handed to `Account.fetch` as they are (id + changekey);
-    exchangelib chunks the call and yields, in order, either the fetched
-    item or an exception for that one id — a failed id keeps whatever body
-    it had (none) and is retried on its next change, never failing the
-    folder. Returns the number of items that received a body."""
+    SyncFolderItems never carries them: Exchange answers `item:TextBody` and
+    `message:ToRecipients` only through GetItem, so every item that comes out
+    of `sync_items` has both empty however it was projected (verified live
+    against Exchange 2016, build 15.2.1748: sync → 0 chars / no recipients,
+    fetch → the full text and the list). Items are handed to `Account.fetch`
+    as they are (id + changekey); exchangelib chunks the call and yields, in
+    order, either the fetched item or an exception for that one id — a
+    failed id keeps what it had and is retried on its next change, never
+    failing the folder. Returns the number of items that received a body."""
     if not items:
         return 0
     filled = 0
     for start in range(0, len(items), BODY_FETCH_CHUNK):
         batch = items[start:start + BODY_FETCH_CHUNK]
         try:
-            fetched = list(account.fetch(batch, only_fields=["text_body"]))
+            fetched = list(account.fetch(batch, only_fields=HYDRATE_FIELDS))
         except Exception as exc:  # noqa: BLE001 - a body is never worth a folder
             logger.warning("body fetch for %d items failed: %s", len(batch), exc)
             continue
@@ -141,7 +143,19 @@ def hydrate_bodies(account: Any, items: list[Any]) -> int:
             if isinstance(text, str):
                 item.text_body = text
                 filled += 1
+            to = getattr(res, "to_recipients", None)
+            if to is not None:
+                item.to_recipients = list(to)
     return filled
+
+
+def recipients_json(item: Any) -> str:
+    to = [
+        r.email_address
+        for r in (getattr(item, "to_recipients", None) or [])
+        if getattr(r, "email_address", None)
+    ]
+    return json.dumps(to, ensure_ascii=False)
 
 
 def row_from_message(item: Any, folder_id: str, tz: str) -> dict[str, Any]:
@@ -157,11 +171,6 @@ def row_from_message(item: Any, folder_id: str, tz: str) -> dict[str, Any]:
             body_clean = clean_body(text, max_chars=BODY_CLEAN_MAX)["text"]
         except Exception:  # noqa: BLE001 - fall back to the raw body, never fail sync
             body_clean = text[:BODY_CLEAN_MAX]
-    to = [
-        r.email_address
-        for r in (getattr(item, "to_recipients", None) or [])
-        if getattr(r, "email_address", None)
-    ]
     received = getattr(item, "datetime_received", None)
     conv = getattr(item, "conversation_id", None)
     imid = getattr(item, "message_id", None)
@@ -172,7 +181,7 @@ def row_from_message(item: Any, folder_id: str, tz: str) -> dict[str, Any]:
         "conversation_id": getattr(conv, "id", None),
         "sender_name": sender_name,
         "sender_email": sender_email,
-        "to_json": json.dumps(to, ensure_ascii=False),
+        "to_json": recipients_json(item),
         "subject": subject,
         "date_ts": _ts(received),
         "date_iso": fmt_dt(received, tz),

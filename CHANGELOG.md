@@ -11,6 +11,10 @@ this file starts from the point this repository was extracted.
 - `archive_status` from the MCP reported the policy and `delete_enabled` from the MCP container's own defaults, contradicting the daemon. It now copies both from ewsd's status (`policy_source: "ewsd"`) and flags them as defaults when ewsd is unreachable.
 - The mirror never had message bodies: Exchange leaves `item:TextBody` empty in SyncFolderItems, so `body_clean` was `""` for every row and full-text search plus embeddings ran on subject and sender only. The sync engine now fetches bodies in bulk with GetItem (100 per call) before cleaning; `scripts/backfill_bodies.py` repairs rows synced before the fix and re-queues them for embedding.
 - `archive_status` from the MCP reported `semantic_enabled: false` because only ewsd holds `GEMINI_API_KEY`; the flag is now copied from ewsd.
+- Recipients were empty on every mirrored row for the same reason as bodies (`message:ToRecipients` is absent from SyncFolderItems); the bulk GetItem now fetches `to_recipients` too and the backfill repairs `to_json` without re-embedding unchanged bodies.
+- `get_attachment` on live mail now stamps `source: "live"` (the archive path already stamped `archive`).
+- `get_raw_message` returned the ASCII-reduced filename (a Cyrillic subject became `Fwd_ _ - _.eml`); it now reports the real name, which the download already served through `filename*`.
+- `list_folders` documents `archived` as the number of messages the archive holds a copy of (captured, verified or deleted), which is what it always counted.
 
 ## [5.1.0a1] - 2026-09-04 (pre-release)
 

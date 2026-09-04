@@ -58,7 +58,7 @@ regenerate with `python scripts/dump_tool_table.py --write`.
 
 #### `list_folders` — read (min tier: read)
 
-List mail folders as a depth-limited tree walk. Each row is {id, name, path, total, unread, children}; `id` is a short folder alias (f7) reusable as a `folder`/`parent` argument anywhere. Well-known folders also carry `wk` (e.g. 'f:inbox') — prefer passing that stable alias. Set include_empty=false to hide folders with zero items. Each row also carries archived: how many of that folder's messages now live only in the archive.
+List mail folders as a depth-limited tree walk. Each row is {id, name, path, total, unread, children}; `id` is a short folder alias (f7) reusable as a `folder`/`parent` argument anywhere. Well-known folders also carry `wk` (e.g. 'f:inbox') — prefer passing that stable alias. Set include_empty=false to hide folders with zero items. Each row also carries archived: how many of that folder's messages the archive holds a copy of (captured, verified, or already deleted from Exchange).
 
 | parameter | type | required | description |
 |---|---|---|---|

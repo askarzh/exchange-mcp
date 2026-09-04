@@ -142,15 +142,23 @@ def test_sync_fetches_bodies_in_bulk_because_the_delta_has_none(db):
     def fetch(items, only_fields=None, **kw):
         items = list(items)
         account.fetch_calls.append((len(items), tuple(only_fields or ())))
-        return iter([SimpleNamespace(id=i.id, text_body=bodies[i.id]) for i in items])
+        return iter([SimpleNamespace(
+            id=i.id, text_body=bodies[i.id],
+            to_recipients=[SimpleNamespace(email_address=f"to-{i.id}@corp.example")])
+            for i in items])
 
     account.fetch = fetch
     engine, store = _engine(db, account)
     asyncio.run(engine._cycle())
 
-    assert account.fetch_calls == [(5, ("text_body",))]
+    assert account.fetch_calls == [(5, ("text_body", "to_recipients"))]
     assert _body_of(store, "M-3") == "fetched body 3"
     assert store.stats()["rows"]["messages"] == 5
+    # Recipients are just as absent from the sync delta as the body.
+    with store.db.conn() as c:
+        to_json = c.execute("SELECT to_json FROM ews.messages WHERE ews_id = 'M-3'"
+                            ).fetchone()["to_json"]
+    assert to_json == '["to-M-3@corp.example"]'
 
 
 def test_a_failed_body_fetch_keeps_the_row_and_the_folder(db):
@@ -203,12 +211,22 @@ def test_update_bodies_requeues_the_message_for_embedding(db):
     assert store.embedding_backlog() == 0
     assert [r["ews_id"] for r in store.messages_missing_body(10)] == ["M-1"]
 
-    assert store.update_bodies({"M-1": "real body"}) == 1
+    assert store.update_bodies({"M-1": "real body"}, {"M-1": '["x@corp.example"]'}) == 1
     assert _body_of(store, "M-1") == "real body"
     assert store.embedding_backlog() == 1
     assert store.messages_missing_body(10) == []
     with store.db.conn() as c:
         assert c.execute("SELECT count(*) AS n FROM ews.chunks").fetchone()["n"] == 0
+        assert c.execute("SELECT to_json FROM ews.messages WHERE ews_id = 'M-1'"
+                         ).fetchone()["to_json"] == '["x@corp.example"]'
+
+    # A re-run with the same body (recipients-only repair) must NOT re-queue
+    # the message or throw away its chunks.
+    store.replace_chunks("M-1", [{"seq": 0, "text": "real body", "embedding": [0.0] * 768}])
+    assert store.update_bodies({"M-1": "real body"}, {"M-1": '["y@corp.example"]'}) == 1
+    assert store.embedding_backlog() == 0
+    with store.db.conn() as c:
+        assert c.execute("SELECT count(*) AS n FROM ews.chunks").fetchone()["n"] == 1
 
 
 def test_cycle_applies_creates_updates_deletes_and_read_flags(db):

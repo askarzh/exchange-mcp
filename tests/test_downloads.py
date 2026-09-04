@@ -127,6 +127,7 @@ def test_a_non_ascii_name_survives_in_filename_star(tmp_path):
     path = _file(tmp_path)
     rec = downloads.mint(str(tmp_path), path=str(path), name="Отчёт.pdf")
     assert rec["name"] == "pdf"                      # the ASCII reduction
+    assert rec["orig_name"] == "Отчёт.pdf"           # for callers' display/curl hints
     got = downloads.redeem(str(tmp_path), rec["token"])
     assert got["orig_name"] == "Отчёт.pdf"           # the original, intact
     value = downloads.content_disposition(got["orig_name"])

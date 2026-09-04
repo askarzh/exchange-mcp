@@ -670,29 +670,46 @@ class CacheStore:
                       "WHERE ews_id = %s", (ews_id,))
 
     def messages_missing_body(self, limit: int) -> list[dict[str, Any]]:
-        """Rows still on Exchange whose mirror body is empty — the backfill
-        set for `scripts/backfill_bodies.py`. Deleted rows are excluded: their
-        only copy is the MIME on disk, not GetItem."""
+        """Rows still on Exchange whose mirror body or recipient list is
+        empty — the backfill set for `scripts/backfill_bodies.py`. Deleted
+        rows are excluded: their only copy is the MIME on disk, not GetItem."""
         with self.db.conn() as c:
             return c.execute(
                 "SELECT ews_id, changekey FROM ews.messages "
-                "WHERE coalesce(body_clean, '') = '' AND archive_state <> 'deleted' "
+                "WHERE (coalesce(body_clean, '') = '' OR coalesce(to_json, '[]') = '[]') "
+                "AND archive_state <> 'deleted' "
                 "ORDER BY date_ts DESC NULLS LAST LIMIT %s", (int(limit),)).fetchall()
 
-    def update_bodies(self, bodies: dict[str, str]) -> int:
-        """Set `body_clean` for the given ids and put them back on the
-        embedding backlog: the old chunks were built from an empty body, so
-        they are dropped and `embedded_at` cleared in the same transaction."""
+    def update_bodies(self, bodies: dict[str, str],
+                      recipients: dict[str, str] | None = None) -> int:
+        """Set `body_clean` (and `to_json` when given) for the ids in
+        `bodies`. A row whose body actually changed goes back on the
+        embedding backlog — its chunks were built from the old text, so they
+        are dropped and `embedded_at` cleared in the same transaction; a row
+        whose body is unchanged (recipients-only repair, or a re-run) keeps
+        its chunks and its stamp. Returns the number of rows updated."""
         if not bodies:
             return 0
-        ids = list(bodies)
+        recipients = recipients or {}
+        requeued: list[str] = []
         with self.db.conn() as c:
-            c.cursor().executemany(
-                "UPDATE ews.messages SET body_clean = %(body)s, embedded_at = NULL "
-                "WHERE ews_id = %(ews_id)s",
-                [{"ews_id": k, "body": v} for k, v in bodies.items()])
-            c.execute("DELETE FROM ews.chunks WHERE message_ews_id = ANY(%s)", (ids,))
-        return len(ids)
+            for ews_id, body in bodies.items():
+                row = c.execute(
+                    "UPDATE ews.messages SET "
+                    "  embedded_at = CASE WHEN body_clean IS DISTINCT FROM %(body)s "
+                    "                     THEN NULL ELSE embedded_at END, "
+                    "  body_clean = %(body)s, "
+                    "  to_json = coalesce(%(to)s, to_json) "
+                    "WHERE ews_id = %(ews_id)s "
+                    "RETURNING (embedded_at IS NULL) AS requeued",
+                    {"ews_id": ews_id, "body": body,
+                     "to": recipients.get(ews_id)}).fetchone()
+                if row and row["requeued"]:
+                    requeued.append(ews_id)
+            if requeued:
+                c.execute("DELETE FROM ews.chunks WHERE message_ews_id = ANY(%s)",
+                          (requeued,))
+        return len(bodies)
 
     def mark_embedded(self, ews_ids: list[str]) -> None:
         """Stamp `embedded_at` directly. `replace_chunks` already does this per

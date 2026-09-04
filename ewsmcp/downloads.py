@@ -120,7 +120,7 @@ def mint(data_dir: str, *, path: str, name: str,
     links = _links_dir(data_dir)
     links.mkdir(parents=True, exist_ok=True)
     (links / f"{token}.json").write_text(json.dumps(record))
-    return {"token": token, "name": safe_name,
+    return {"token": token, "name": safe_name, "orig_name": record["orig_name"],
             "content_type": safe_ct, "expires_at": record["expires_at"]}
 
 

@@ -246,16 +246,20 @@ async def _get_raw_message(ctx: Context, *, id: str,
     await asyncio.to_thread(downloads.sweep, ctx.settings.data_dir)
     base = (getattr(ctx.settings, "external_url", "") or "").rstrip("/")
     url = f"{base}/download/{rec['token']}" if base else f"/download/{rec['token']}"
+    # The real (possibly non-ASCII) name: the download serves it through
+    # `filename*`, so the model and the curl hint should use it too — the
+    # ASCII reduction in rec["name"] turns a Cyrillic subject into "_ _ _".
+    shown = rec.get("orig_name") or rec["name"]
     return {
         "ok": True,
         "download_url": url,
-        "name": rec["name"],
+        "name": shown,
         "content_type": "message/rfc822",
         "size_bytes": path.stat().st_size,
         "sha256": sha256,
         "archive_state": row["archive_state"],
         "expires_in_minutes": ttl,
-        "curl": f'curl -o {rec["name"]!r} "{url}"',
+        "curl": f'curl -o {shown!r} "{url}"',
         "note": "single use — the link is spent by the first successful GET",
     }
 
