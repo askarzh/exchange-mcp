@@ -8,6 +8,7 @@ this file starts from the point this repository was extracted.
 
 ### Fixed
 - `archive_status` failed with "Object of type datetime is not JSON serializable": `recent_runs` timestamps are now ISO-8601 strings.
+- `archive_status` from the MCP reported the policy and `delete_enabled` from the MCP container's own defaults, contradicting the daemon. It now copies both from ewsd's status (`policy_source: "ewsd"`) and flags them as defaults when ewsd is unreachable.
 
 ## [5.1.0a1] - 2026-09-04 (pre-release)
 

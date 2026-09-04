@@ -207,7 +207,18 @@ class ArchiveRunner:
             "last_error": self.last_error,
             "delete_enabled": bool(self.settings.archive_delete_enabled),
             "delete_auto": bool(self.settings.archive_delete_auto),
+            # The policy ewsd actually runs. The MCP process has no ARCHIVE_*
+            # environment of its own, so this is the only truthful source.
+            "policy": self._policy_dict(),
         }
+
+    def _policy_dict(self) -> dict[str, Any]:
+        p = ArchivePolicy.from_settings(self.settings)
+        return {"folders": list(p.folders), "after_days": p.after_days,
+                "grace_days": p.grace_days,
+                "exclude_categories": list(p.exclude_categories),
+                "max_delete_per_run": p.max_delete_per_run,
+                "min_free_gb": p.min_free_gb}
 
     _DISK_STATS_TTL_S = 60
 

@@ -291,6 +291,32 @@ def test_archive_status_disk_figures_come_from_the_daemon_never_the_mcps_own_dis
     assert "disk_stats" not in res
 
 
+def test_archive_status_policy_and_delete_switch_come_from_the_daemon(db):
+    """The MCP container carries no ARCHIVE_* environment, so computing the
+    policy from its own settings reports defaults that can contradict what
+    ewsd actually runs (seen in production: top-level delete_enabled=false
+    beside runner delete_enabled=true)."""
+    ewsd_policy = {"folders": ["f:inbox"], "after_days": 120, "grace_days": 1,
+                   "exclude_categories": [], "max_delete_per_run": 200,
+                   "min_free_gb": 5.0}
+
+    class StatusWithPolicy(RecordingDaemon):
+        async def status(self):
+            return {"ok": True, "archive": {
+                "running": True, "cycles": 1, "delete_enabled": True,
+                "delete_auto": True, "policy": ewsd_policy,
+            }}
+
+    ctx = _mcp_ctx(db, StatusWithPolicy())
+    _seed(ctx)
+    res = _run(ctx, "archive_status")
+    assert res["policy"] == ewsd_policy
+    assert res["policy_source"] == "ewsd"
+    assert res["delete_enabled"] is True
+    assert res["runner"]["delete_enabled"] is True
+    assert "policy" not in res["runner"]
+
+
 def test_archive_status_omits_disk_figures_with_the_daemon_down(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     _seed(ctx)
@@ -299,6 +325,7 @@ def test_archive_status_omits_disk_figures_with_the_daemon_down(db):
     assert "blob_store_bytes" not in res
     assert "free_gb" not in res
     assert res["disk_stats"] == "unavailable — ewsd unreachable"
+    assert res["policy_source"].startswith("mcp defaults")
 
 
 def test_the_mcp_never_holds_the_gemini_key(db):

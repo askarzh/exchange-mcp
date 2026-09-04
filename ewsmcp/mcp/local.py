@@ -202,7 +202,7 @@ async def waiting_on(ctx: Context, **kw) -> dict[str, Any]:
 
 
 _ARCHIVE_RUNNER_KEYS_TO_DROP = ("state_counts", "embedding_backlog",
-                               "blob_store_bytes", "free_gb")
+                               "blob_store_bytes", "free_gb", "policy")
 
 
 async def archive_status(ctx: Context, **kw) -> dict[str, Any]:
@@ -228,11 +228,20 @@ async def archive_status(ctx: Context, **kw) -> dict[str, Any]:
         status = await ctx.daemon.status()
     except ToolError:
         out["disk_stats"] = "unavailable — ewsd unreachable"
+        out["policy_source"] = ("mcp defaults — ewsd unreachable; the policy "
+                                "ewsd actually runs may differ")
         return out
     archive_block = status.get("archive") or {}
     for key in ("blob_store_bytes", "free_gb"):
         if key in archive_block:
             out[key] = archive_block[key]
+    # The policy and the delete switch are ewsd's configuration, not this
+    # process's: its ARCHIVE_* environment is the one that counts.
+    if "policy" in archive_block:
+        out["policy"] = archive_block["policy"]
+        out["policy_source"] = "ewsd"
+    if "delete_enabled" in archive_block:
+        out["delete_enabled"] = bool(archive_block["delete_enabled"])
     runner_keys = {k: v for k, v in archive_block.items()
                    if k not in _ARCHIVE_RUNNER_KEYS_TO_DROP}
     if runner_keys:
