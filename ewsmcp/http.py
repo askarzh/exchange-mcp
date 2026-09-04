@@ -111,6 +111,28 @@ def _openapi(ctx, tools_prefix: str) -> dict[str, Any]:
             "requestBody": {"content": {"application/json": {"schema": schema["inputSchema"]}}},
             "responses": {"200": {"description": "tool result"}},
         }}
+    # /v1/archive/run is a thin alias for POST /v1/tools/archive_run (see
+    # _dispatch_tool_route) — only documented when the tool is actually
+    # registered at this server's tier, same as every other tools_prefix
+    # entry above.
+    archive_run_spec = ctx.registry.get("archive_run")
+    if archive_run_spec is not None:
+        schema = archive_run_spec.public_schema()
+        paths["/v1/archive/run"] = {"post": {
+            "operationId": "archive_run_route",
+            "summary": schema["description"][:120],
+            "requestBody": {"content": {"application/json": {"schema": schema["inputSchema"]}}},
+            "responses": {"200": {"description": "archive_run result or "
+                                                  "two-phase confirmation"}},
+        }}
+    paths["/v1/archive/runs/{id}"] = {"get": {
+        "operationId": "get_archive_run",
+        "summary": "Read one archive_runs row by id.",
+        "parameters": [{"name": "id", "in": "path", "required": True,
+                        "schema": {"type": "integer"}}],
+        "responses": {"200": {"description": "the archive_runs row"},
+                     "404": {"description": "no such run"}},
+    }}
     return {"openapi": "3.0.3",
             "info": {"title": "ews-mcp v5", "version": __version__},
             "paths": paths}

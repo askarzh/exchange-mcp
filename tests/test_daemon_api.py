@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-from conftest import make_context
+from conftest import make_context, make_row
 
 from ewsmcp.daemon import build_daemon_app
 
@@ -64,7 +64,25 @@ def test_openapi_paths_use_daemon_tools_prefix(db):
     app = build_daemon_app(ctx, ctx.settings)
     _status, body = _drive(app, "/openapi.json", headers=AUTH)
     assert body["paths"]
-    assert all(p.startswith("/v1/tools/") for p in body["paths"])
+    assert all(p.startswith("/v1/tools/") or p.startswith("/v1/archive/")
+              for p in body["paths"])
+
+
+def test_openapi_archive_run_path_follows_the_registry_tier(db):
+    full = make_context(db, ewsd_api_key="k", ews_capability_tier="full")
+    app = build_daemon_app(full, full.settings)
+    _status, body = _drive(app, "/openapi.json", headers=AUTH)
+    assert "/v1/archive/run" in body["paths"]
+    assert "/v1/archive/runs/{id}" in body["paths"]
+    schema = body["paths"]["/v1/archive/run"]["post"]["requestBody"][
+        "content"]["application/json"]["schema"]
+    assert "confirm_token" in schema["properties"]
+
+    below_full = make_context(db, ewsd_api_key="k", ews_capability_tier="read")
+    app = build_daemon_app(below_full, below_full.settings)
+    _status, body = _drive(app, "/openapi.json", headers=AUTH)
+    assert "/v1/archive/run" not in body["paths"]
+    assert "/v1/archive/runs/{id}" in body["paths"]
 
 
 def test_tools_listing_carries_public_schemas(db):
@@ -83,6 +101,48 @@ def test_status_answers_cold(db):
     status, body = _drive(app, "/v1/status", headers=AUTH)
     assert status == 200 and body["ok"] and body["version"].startswith("5.0.")
     assert body["cache"]["ready"] is True
+
+
+class _StatusRunner:
+    """A fake ArchiveRunner exposing only .status() — status/metrics never
+    call run_once."""
+
+    def status(self):
+        return {"running": True, "cycles": 4, "cycle_seconds": 300,
+                "last_cycle_age_s": 12, "last_run_id": 7,
+                "last_error": "boom: disk full", "delete_enabled": False}
+
+
+def test_status_route_includes_the_archive_block(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _StatusRunner()
+    ctx.cache.upsert_messages([make_row("A1"), make_row("A2")])
+    ctx.cache.mark_captured("A1", mime_sha256="a" * 64, mime_path="/x.eml")
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, "/v1/status", headers=AUTH)
+    assert status == 200
+    archive = body["archive"]
+    assert archive["cycles"] == 4
+    assert archive["last_error"] == "boom: disk full"
+    assert archive["state_counts"] == {"live": 1, "captured": 1, "verified": 0,
+                                       "deleted": 0}
+    assert archive["embedding_backlog"] == 2
+
+
+def test_metrics_route_includes_the_archive_gauges(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _StatusRunner()
+    ctx.cache.upsert_messages([make_row("A1"), make_row("A2")])
+    ctx.cache.mark_captured("A1", mime_sha256="a" * 64, mime_path="/x.eml")
+    app = build_daemon_app(ctx, ctx.settings)
+    status, headers, raw = _drive_raw(app, "/metrics", headers=AUTH)
+    text = raw.decode()
+    assert status == 200
+    assert "ewsmcp_archive_cycles_total 4" in text
+    assert "ewsmcp_archive_degraded 1" in text
+    assert 'ewsmcp_archive_messages{state="live"} 1' in text
+    assert 'ewsmcp_archive_messages{state="captured"} 1' in text
+    assert "ewsmcp_archive_embedding_backlog 2" in text
 
 
 def test_tool_dispatch_runs_gate_chain(db):
