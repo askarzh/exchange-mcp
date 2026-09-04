@@ -146,3 +146,15 @@ def test_protocol_cache_is_evictable():
     fresh session + auth negotiation; closing the protocol alone hands
     the same wedged instance back on the next build."""
     assert callable(getattr(CachingProtocol, "clear_cache", None))
+
+
+def test_file_attachment_exposes_the_fields_capture_reads():
+    from exchangelib.attachments import FileAttachment, ItemAttachment
+    for field in ("name", "content_type", "size", "is_inline", "content"):
+        assert hasattr(FileAttachment, field), field
+    assert issubclass(ItemAttachment, object)
+
+
+def test_message_exposes_mime_content():
+    from exchangelib import Message
+    assert "mime_content" in {f.name for f in Message.FIELDS}
