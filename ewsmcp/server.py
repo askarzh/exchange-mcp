@@ -50,6 +50,18 @@ def build_context(settings: Settings) -> Context:
         cache=CacheStore(db),
         db=db,
     )
+    if settings.semantic_enabled():
+        from .embeddings import GeminiEmbedder
+        from .semantic import SemanticIndex
+        ctx.semantic = SemanticIndex(
+            ctx.cache, GeminiEmbedder(settings.gemini_api_key,
+                                      dims=settings.embed_dims))
+    else:
+        logger.info("GEMINI_API_KEY unset — semantic search disabled, "
+                    "keyword search unaffected")
+    from .archive import ArchiveRunner
+    ctx.archive = ArchiveRunner(settings, gateway, ctx.cache, audit,
+                                index=ctx.semantic)
     build_registry(ctx)
     return ctx
 
@@ -74,6 +86,12 @@ async def start_connection_manager(ctx: Context) -> None:
             except Exception as exc:  # noqa: BLE001 - sync is best-effort; cache stays stale
                 logger.error("sync engine start failed (%s) — cache stays "
                              "stale; reads fall back to live EWS", exc)
+        if ctx.archive is not None:
+            try:
+                await ctx.archive.start()
+            except Exception as exc:  # noqa: BLE001 - archive is best-effort
+                logger.error("archive runner start failed (%s) — capture/verify "
+                             "will not run until ewsd restarts", exc)
 
     await manager.start(on_warm=on_warm)
     logger.info("Exchange warmup running in background (see /readyz)")

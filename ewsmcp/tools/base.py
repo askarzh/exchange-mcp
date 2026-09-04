@@ -116,6 +116,8 @@ class Context:
     audit: Any
     cache: Any = None  # CacheStore | None (None = cache disabled/broken)
     sync: Any = None  # SyncEngine | None
+    archive: Any = None  # ArchiveRunner | None (daemon only)
+    semantic: Any = None  # SemanticIndex | None (daemon only — holds the Gemini key)
     db: Any = None  # Database | None
     daemon: Any = None  # daemon client | None
     registry: Dict[str, ToolSpec] = field(default_factory=dict)
