@@ -11,11 +11,25 @@ is issued:
    verified at least a grace period ago — `CacheStore.deletable_rows` is the
    only query that selects candidates, so both halves of rail 3 live there.
 
-On top of that, right before each item is actually deleted: the changekey
-re-fetched from Exchange must still match `captured_changekey` (the snapshot
-taken at capture/verify time). A mismatch — or either side missing — means
-the item changed after it was verified and is skipped, never deleted; it is
-counted in `failed` and gets a line in `reasons`, not silently dropped.
+On top of that, two LAST-MILE checks are re-done immediately before a batch
+is deleted, because at least ARCHIVE_GRACE_DAYS pass between verification and
+deletion and neither disk nor mailbox stands still in the meantime:
+
+- **The archive copy is re-checked against DISK** (`_unusable_copies`, run off
+  the event loop for the whole batch before the gateway call is made): the
+  `.eml` for `mime_sha256` must exist and still hash to it, and every
+  attachment row carrying a sha must have a blob of the recorded size. A row
+  that fails is NOT deleted — it is counted in `failed` with an "archive copy
+  missing/corrupt" reason and demoted `verified → captured`
+  (`CacheStore.demote_to_captured`) so the verifier re-runs every check next
+  cycle and resets it to `live` if the copy is truly gone. Deleting mail from
+  Exchange on the strength of a week-old verification is exactly the failure
+  this rail exists to prevent.
+- **The changekey re-fetched from Exchange** must still match
+  `captured_changekey` (the snapshot taken at capture/verify time). A
+  mismatch — or either side missing — means the item changed after it was
+  verified and is skipped, never deleted; it is counted in `failed` and gets a
+  line in `reasons`, not silently dropped.
 
 Deletes go to Exchange in batches of `BATCH_SIZE`. `mark_deleted` plus one
 destructive-class audit record per successfully deleted item are written
@@ -60,10 +74,12 @@ rather than silently assumed complete.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
 
+from . import files
 from .policy import ArchivePolicy
 
 logger = logging.getLogger(__name__)
@@ -92,7 +108,8 @@ class Deleter:
                 "ARCHIVE_DELETE_ENABLED=false — nothing is deleted from Exchange. "
                 "Flip it deliberately once you trust the archive.")
             return result
-        rows = self.store.deletable_rows(
+        rows = await asyncio.to_thread(
+            self.store.deletable_rows,
             before_ts=self.policy.delete_cutoff_ts(),
             verified_before=self.policy.grace_instant_ts(),
             limit=int(self.policy.max_delete_per_run))
@@ -111,7 +128,19 @@ class Deleter:
         failed_count = 0
         processed_upto = 0  # index into `ids`: how much we actually attempted
         for start in range(0, len(ids), BATCH_SIZE):
-            batch = ids[start:start + BATCH_SIZE]
+            chunk = ids[start:start + BATCH_SIZE]
+            # Last-mile rail: re-check the archive copy against disk for the
+            # WHOLE batch (one to_thread hop: hashing and the attachment
+            # lookups are blocking) BEFORE any gateway call, so an item whose
+            # .eml vanished or rotted since verification is never deleted.
+            unusable = await asyncio.to_thread(self._unusable_copies, chunk, by_id)
+            for raw_id, reason in unusable.items():
+                result["reasons"].append(f"{raw_id}: {reason}")
+            failed_count += len(unusable)
+            batch = [i for i in chunk if i not in unusable]
+            if not batch:
+                processed_upto = start + len(chunk)
+                continue
             try:
                 deleted, timings, reasons = await self.gateway.call(
                     lambda account, b=batch: self._delete_batch(account, b, by_id))
@@ -120,7 +149,7 @@ class Deleter:
                 logger.error("archive delete batch failed, stopping run: %s",
                             result["error"])
                 break
-            processed_upto = start + len(batch)
+            processed_upto = start + len(chunk)
             for raw_id, reason in reasons.items():
                 result["reasons"].append(f"{raw_id}: {reason}")
             failed_count += len(reasons)
@@ -133,29 +162,15 @@ class Deleter:
             deleted_count += len(deleted)
             # Persisted IMMEDIATELY, one batch at a time (see module docstring).
             try:
-                marked = self.store.mark_deleted(deleted)
-                unmarked_ids: list[str] = []
-                if marked != len(deleted):
-                    after = self.store.messages_by_ids(deleted)
-                    unmarked_ids = [i for i in deleted
-                                    if after.get(i, {}).get("archive_state") != "deleted"]
+                unmarked_ids = await asyncio.to_thread(
+                    self._persist_batch, deleted, by_id, timings, run_id)
+                if unmarked_ids:
                     result["unmarked"] += len(unmarked_ids)
                     result["deleted_unrecorded"].extend(unmarked_ids)
                     logger.warning(
                         "archive delete: %d item(s) deleted from Exchange but "
                         "not marked deleted in the store (state changed "
                         "concurrently) — %s", len(unmarked_ids), unmarked_ids)
-                recorded = [i for i in deleted if i not in unmarked_ids]
-                for ews_id in recorded:
-                    row = by_id[ews_id]
-                    self.audit.record(
-                        tool="archive_delete", side_effect_class="destructive",
-                        outcome="ok", latency_ms=timings.get(ews_id, 0),
-                        transport="archive",
-                        detail={"ews_id": ews_id,
-                                "internet_message_id": row.get("internet_message_id"),
-                                "mime_sha256": row.get("mime_sha256"),
-                                "run_id": run_id})
             except Exception as exc:  # noqa: BLE001 - mail is gone; record it or stop trying
                 result["deleted_unrecorded"].extend(deleted)
                 result["error"] = f"{type(exc).__name__}: {exc}"
@@ -168,6 +183,74 @@ class Deleter:
         result["failed"] = failed_count
         result["remaining"] = len(ids) - processed_upto
         return result
+
+    # Runs on a worker thread (asyncio.to_thread): the mark plus one audit
+    # write per item are blocking DB calls. Returns the ids that did NOT
+    # transition (a concurrent state change raced us); anything raising here
+    # is the caller's "mail is gone, nothing recorded" path.
+    def _persist_batch(self, deleted: list[str], by_id: dict[str, Any],
+                       timings: dict[str, int], run_id: int | None) -> list[str]:
+        marked = self.store.mark_deleted(deleted)
+        unmarked_ids: list[str] = []
+        if marked != len(deleted):
+            after = self.store.messages_by_ids(deleted)
+            unmarked_ids = [i for i in deleted
+                            if after.get(i, {}).get("archive_state") != "deleted"]
+        for ews_id in (i for i in deleted if i not in unmarked_ids):
+            row = by_id[ews_id]
+            self.audit.record(
+                tool="archive_delete", side_effect_class="destructive",
+                outcome="ok", latency_ms=timings.get(ews_id, 0),
+                transport="archive",
+                detail={"ews_id": ews_id,
+                        "internet_message_id": row.get("internet_message_id"),
+                        "mime_sha256": row.get("mime_sha256"),
+                        "run_id": run_id})
+        return unmarked_ids
+
+    # Runs on a worker thread (asyncio.to_thread): file hashing and the
+    # per-row attachment lookups are both blocking.
+    # Returns {ews_id: reason} for every row whose archive copy is unusable.
+    def _unusable_copies(self, ids: list[str],
+                         by_id: dict[str, Any]) -> dict[str, str]:
+        bad: dict[str, str] = {}
+        for ews_id in ids:
+            try:
+                problem = self._copy_problem(by_id[ews_id])
+            except Exception as exc:  # noqa: BLE001 - a poisoned row is unusable
+                problem = f"{type(exc).__name__}: {exc}"
+            if problem is None:
+                continue
+            bad[ews_id] = f"archive copy missing/corrupt — {problem}; not deleted"
+            logger.error("archive delete skipped %s: %s", ews_id, bad[ews_id])
+            try:
+                # Back to `captured`: the verifier owns the decision about
+                # whether this capture is salvageable or must be redone.
+                self.store.demote_to_captured(ews_id)
+            except Exception as exc:  # noqa: BLE001 - never delete because of this
+                logger.error("could not demote %s to captured: %s: %s",
+                             ews_id, type(exc).__name__, exc)
+        return bad
+
+    def _copy_problem(self, row: dict[str, Any]) -> str | None:
+        sha = row.get("mime_sha256")
+        if not sha:
+            return "no mime_sha256 recorded"
+        path = files.mime_path(self.settings.data_dir, sha)
+        if not path.is_file():
+            return f"mime file missing at {path}"
+        if files.sha256_file(path) != sha:
+            return f"mime hash mismatch at {path}"
+        for att in self.store.attachments_for(row["ews_id"]):
+            if not att["sha256"]:
+                continue  # ItemAttachment — lives inside the verified MIME
+            blob = files.blob_path(self.settings.data_dir, att["sha256"])
+            if not blob.is_file():
+                return f"blob missing for {att['name']!r} at {blob}"
+            if att["size"] is not None and blob.stat().st_size != int(att["size"]):
+                return (f"blob size mismatch for {att['name']!r}: "
+                        f"{blob.stat().st_size} on disk vs {att['size']} recorded")
+        return None
 
     # Runs on the EWS pool (sync).
     # Returns (deleted_ids, {ews_id: latency_ms}, {ews_id: failure_reason}).

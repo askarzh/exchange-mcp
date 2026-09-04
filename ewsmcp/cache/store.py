@@ -478,6 +478,22 @@ class CacheStore:
                 (ews_id,))
         return cur.rowcount
 
+    def demote_to_captured(self, ews_id: str) -> int:
+        """A `verified` row failed the last-mile disk check in the deleter.
+
+        The verification is stale — the archive copy is gone or corrupt — so
+        the row goes BACK to `captured` (never straight to `live`: the bytes
+        may still be recoverable and the verifier is the only worker allowed
+        to decide that). `verified_at` is cleared so the next verify pass
+        picks it up and re-runs every check, resetting it to `live` for a
+        fresh capture if the copy really is unusable."""
+        with self.db.conn() as c:
+            cur = c.execute(
+                "UPDATE ews.messages SET archive_state = 'captured', "
+                "verified_at = NULL "
+                "WHERE ews_id = %s AND archive_state = 'verified'", (ews_id,))
+        return cur.rowcount
+
     def reset_to_live(self, ews_id: str) -> int:
         """Verification failed — forget the capture entirely so it is retried."""
         with self.db.conn() as c:

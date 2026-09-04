@@ -158,10 +158,17 @@ def test_grace_days_is_floored_at_one():
 
 
 def _verified(store, settings, n=3, verified_age_days=30):
+    """n verified rows with REAL .eml files on disk under settings.data_dir.
+
+    Real files matter: the deleter re-checks every archive copy against disk
+    right before it deletes (a `verified` row is at least ARCHIVE_GRACE_DAYS
+    old by then), so a fixture pointing at a nonexistent path would exercise
+    the "never delete" branch instead of the happy path."""
     store.upsert_messages([make_row(f"V{i}", date_ts=NOW - 300 * DAY)
                            for i in range(n)])
     for i in range(n):
-        store.mark_captured(f"V{i}", mime_sha256="a" * 64, mime_path="/x.eml",
+        sha, path = files.store_mime(settings.data_dir, f"RAW-MIME-V{i}".encode())
+        store.mark_captured(f"V{i}", mime_sha256=sha, mime_path=str(path),
                             changekey="CK")
         store.mark_verified(f"V{i}")
     with store.db.conn() as c:
@@ -380,3 +387,84 @@ def test_delete_reports_a_rowcount_shortfall_without_dropping_the_id(captured):
     assert result["remaining"] == 0
     assert all(i.deleted for i in items.values())
     _assert_invariant(result)
+
+
+# --- the last-mile disk check -------------------------------------------------
+
+
+def _mime_of(store, ews_id, settings):
+    return files.mime_path(settings.data_dir,
+                           store.get_message(ews_id)["mime_sha256"])
+
+
+def test_a_verified_row_whose_eml_vanished_is_never_deleted(captured):
+    """The gap between verification and deletion is at least
+    ARCHIVE_GRACE_DAYS long. If the archive copy disappeared in that window
+    the mail must stay in Exchange, and the row must go back to `captured`
+    so the verifier re-runs every check next cycle."""
+    store, settings, _s, _b = captured
+    _verified(store, settings, n=2)
+    _mime_of(store, "V0", settings).unlink()
+    items = {f"V{i}": DeletableItem(f"V{i}") for i in range(2)}
+    account = FakeAccount(items)
+    result = asyncio.run(_deleter(store, settings, account,
+                                  archive_delete_enabled=True).run(dry_run=False))
+    assert items["V0"].deleted is False
+    assert items["V1"].deleted is True
+    assert result["deleted"] == 1 and result["failed"] == 1
+    assert store.get_message("V0")["archive_state"] == "captured"
+    assert store.get_message("V0")["verified_at"] is None
+    assert "archive copy missing/corrupt" in result["reasons"][0]
+    _assert_invariant(result)
+
+
+def test_a_corrupted_eml_is_never_deleted(captured):
+    """Present but wrong bytes: the hash check, not just the existence
+    check, stands between a rotted archive copy and item.delete()."""
+    store, settings, _s, _b = captured
+    _verified(store, settings, n=1)
+    _mime_of(store, "V0", settings).write_bytes(b"TAMPERED")
+    items = {"V0": DeletableItem("V0")}
+    result = asyncio.run(_deleter(store, settings, FakeAccount(items),
+                                  archive_delete_enabled=True).run(dry_run=False))
+    assert items["V0"].deleted is False
+    assert result["deleted"] == 0 and result["failed"] == 1
+    assert store.get_message("V0")["archive_state"] == "captured"
+    assert "hash mismatch" in result["reasons"][0]
+    _assert_invariant(result)
+
+
+def test_a_missing_attachment_blob_is_never_deleted(captured):
+    """Every attachment row with a sha must still have its blob: the MIME
+    alone being intact is not enough to call the archive copy complete."""
+    store, settings, _s, blob_sha = captured
+    _verified(store, settings, n=1)
+    store.replace_attachments("V0", [
+        {"name": "q3.pdf", "content_type": "application/pdf", "size": 8,
+         "sha256": blob_sha, "is_inline": 0}])
+    files.blob_path(settings.data_dir, blob_sha).unlink()
+    items = {"V0": DeletableItem("V0")}
+    result = asyncio.run(_deleter(store, settings, FakeAccount(items),
+                                  archive_delete_enabled=True).run(dry_run=False))
+    assert items["V0"].deleted is False
+    assert result["failed"] == 1 and "blob missing" in result["reasons"][0]
+    assert store.get_message("V0")["archive_state"] == "captured"
+    _assert_invariant(result)
+
+
+def test_the_happy_path_still_deletes_with_real_files_on_disk(captured):
+    store, settings, _s, _b = captured
+    _verified(store, settings, n=2)
+    items = {f"V{i}": DeletableItem(f"V{i}") for i in range(2)}
+    result = asyncio.run(_deleter(store, settings, FakeAccount(items),
+                                  archive_delete_enabled=True).run(dry_run=False))
+    assert result["deleted"] == 2 and result["failed"] == 0
+    assert all(i.deleted for i in items.values())
+    assert store.get_message("V0")["archive_state"] == "deleted"
+    _assert_invariant(result)
+
+
+def test_demote_to_captured_only_touches_verified_rows(captured):
+    store, _settings, _s, _b = captured
+    assert store.demote_to_captured("CAP-1") == 0  # already `captured`
+    assert store.get_message("CAP-1")["archive_state"] == "captured"
