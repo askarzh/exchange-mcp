@@ -382,3 +382,19 @@ def test_external_sender_banner_and_invisible_marks_are_dropped():
     out = clean_body(text)["text"]
     assert out == "Джан, потрясающие идеи.\nДавайте сконцентрируемся на Кейсе 1 и 2."
     assert "\ufeff" not in out and "\u00a0" not in out
+
+
+def test_gmail_attribution_with_outlook_rendered_address_still_cuts_history():
+    """Outlook renders the quoted address as "<a@b<mailto:a@b>>", pushing the
+    "On … wrote:" line past 80 chars; the quoted chain must still be cut."""
+    text = (
+        "Please find attached the signed NDA from our side.\n"
+        "\n"
+        "On Thu, Aug 20, 2026 at 1:09 PM Saheli Maitra "
+        "<saheli.maitra@tuum.example<mailto:saheli.maitra@tuum.example>> wrote:\n"
+        "Dear Askar,\n"
+        "Thank you for the update.\n"
+    )
+    out = clean_body(text)
+    assert out["text"] == "Please find attached the signed NDA from our side."
+    assert out["quoted_blocks_stripped"] == 1

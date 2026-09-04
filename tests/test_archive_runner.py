@@ -112,6 +112,9 @@ def test_status_reports_the_cadence_and_the_last_cycle(tmp_path, db):
     assert st["policy"]["after_days"] == runner.settings.archive_after_days
     assert st["policy"]["grace_days"] >= 1
     assert st["policy"]["folders"] == ["f:inbox", "f:sent"]
+    assert st["next_cycle_in_s"] is None   # no cycle yet
+    runner.last_cycle_ts = time.time()
+    assert 295 <= runner.status()["next_cycle_in_s"] <= 300
 
 
 def test_the_background_loop_runs_a_cycle_and_can_be_stopped(tmp_path, db):

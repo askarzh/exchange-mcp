@@ -64,7 +64,9 @@ _FROM_EN_RE = re.compile(r"^from\s*:", re.IGNORECASE)
 _PAIR_EN_RE = re.compile(r"^(?:sent|date)\s*:", re.IGNORECASE)
 
 # Gmail-style EN attribution: "On Mon, Jun 1, 2026 ... <a@b> wrote:".
-_GMAIL_EN_RE = re.compile(r"^On .{4,80} wrote:\s*$", re.IGNORECASE)
+# Up to 200 chars: Outlook-rendered addresses ("<a@b<mailto:a@b>>") push the
+# attribution line well past 80.
+_GMAIL_EN_RE = re.compile(r"^On .{4,200} wrote:\s*$", re.IGNORECASE)
 
 # Minimum length of a run of '>'-prefixed lines treated as a quoted block.
 _MIN_QUOTE_RUN = 3

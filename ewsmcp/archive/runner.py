@@ -203,6 +203,13 @@ class ArchiveRunner:
             "cycle_seconds": int(self.settings.archive_cycle_seconds),
             "last_cycle_age_s": (int(time.time() - self.last_cycle_ts)
                                  if self.last_cycle_ts else None),
+            # Lets an observer tell "idle between cycles" from "stuck": the
+            # embed/capture lanes only move once per cycle, so a backlog
+            # that is flat for four minutes is the normal state, not a fault.
+            "next_cycle_in_s": (max(0, int(self.last_cycle_ts
+                                           + self.settings.archive_cycle_seconds
+                                           - time.time()))
+                                if self.last_cycle_ts else None),
             "last_run_id": self.last_run_id,
             "last_error": self.last_error,
             "delete_enabled": bool(self.settings.archive_delete_enabled),

@@ -18,6 +18,8 @@ this file starts from the point this repository was extracted.
 - `bodyclean` drops Russian forward/reply header lines (От/Дата/Кому/Копия/Тема, "Начало переадресованного письма") while keeping the forwarded text, so `find_similar` stops ranking every forward next to every other forward. `scripts/backfill_bodies.py --all` re-cleans existing rows.
 - `get_raw_message` names no longer contain `:` or other filesystem-unsafe characters ("Fwd: X" → "Fwd - X.eml"), so the curl hint works on Windows.
 - `bodyclean` removes the corporate "external sender" banner (KZ/RU/EN lines) and invisible code points (U+FEFF, zero-width spaces, NBSP) before storing and embedding; on this mailbox the banner sat on 15% of messages and made unrelated external mail look alike to `find_similar`.
+- Gmail-style "On … wrote:" attribution lines longer than 80 characters (Outlook renders the address as `<a@b<mailto:a@b>>`) did not cut quoted history; the cap is now 200.
+- `archive_status` runner block reports `next_cycle_in_s`, so a flat backlog between five-minute cycles is distinguishable from a stalled worker.
 
 ## [5.1.0a1] - 2026-09-04 (pre-release)
 
