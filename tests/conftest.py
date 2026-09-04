@@ -129,7 +129,8 @@ def seed_folders(store):
 def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
              sender_email="a@corp.example", sender_name="Ahmed",
              body="please review the numbers", date_ts=None, is_read=1,
-             has_attachments=0, conv="CONV-1", imid=None, to=None):
+             has_attachments=0, conv="CONV-1", imid=None, to=None,
+             categories=None):
     """One `CacheStore.upsert_messages` row."""
     return {
         "ews_id": ews_id,
@@ -145,7 +146,7 @@ def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
         "is_read": is_read,
         "has_attachments": has_attachments,
         "importance": None,
-        "categories_json": "[]",
+        "categories_json": json.dumps(categories or []),
         "body_clean": body,
         "internet_message_id": imid or f"<{ews_id}@corp.example>",
     }

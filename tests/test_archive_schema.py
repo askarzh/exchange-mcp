@@ -1,7 +1,5 @@
 """Migration 003: the archive tables, pgvector, and the indexes search needs."""
 
-import pytest
-
 from ewsmcp.db import SCHEMA_VERSION
 
 
@@ -40,7 +38,6 @@ def test_attachments_table_shape(db):
     assert "ix_att_name_tsv" in _indexes(db, "attachments")
 
 
-@pytest.mark.xfail(reason="replace_attachments lands in Task 4", strict=True)
 def test_attachments_cascade_when_a_live_row_is_dropped(db, store_with_message):
     store, ews_id = store_with_message
     store.replace_attachments(ews_id, [
