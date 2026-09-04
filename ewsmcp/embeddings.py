@@ -71,9 +71,13 @@ class GeminiEmbedder:
         self.max_attempts = max(1, int(max_attempts))
         self.base_delay = float(base_delay)
         self._sleep = sleep
-        # The key is a query parameter. It is never logged: error messages
-        # below quote the status and the response body, never the URL.
-        self.url = f"{GEMINI_ENDPOINT.format(model=model)}?key={api_key}"
+        # The key rides in the x-goog-api-key HEADER, never in the URL: a
+        # query string is the one part of a request that leaks by default —
+        # into proxy and access logs, Referer, error reports, and any
+        # exception that quotes the URL. Error messages below quote the
+        # status and the response body only.
+        self.url = GEMINI_ENDPOINT.format(model=model)
+        self._headers = {"x-goog-api-key": api_key}
         self._client = client or httpx.Client(timeout=timeout)
         self._owns_client = client is None
 
@@ -100,7 +104,8 @@ class GeminiEmbedder:
         last = ""
         for attempt in range(self.max_attempts):
             try:
-                resp = self._client.post(self.url, json=payload)
+                resp = self._client.post(self.url, json=payload,
+                                         headers=self._headers)
             except httpx.HTTPError as exc:
                 last = f"{type(exc).__name__}: {exc}"
                 if attempt == self.max_attempts - 1:

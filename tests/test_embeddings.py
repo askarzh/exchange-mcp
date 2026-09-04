@@ -58,11 +58,25 @@ def test_request_shape_matches_the_gemini_batch_contract():
     }
 
 
-def test_the_api_key_travels_in_the_query_string():
-    emb = GeminiEmbedder("SECRET")
-    assert emb.url.endswith("batchEmbedContents?key=SECRET")
-    assert GEMINI_MODEL in emb.url
-    emb.close()
+def test_the_api_key_travels_in_a_header_not_the_url():
+    """A query string is the one part of a request that leaks by default
+    (proxy/access logs, Referer, crash reports). The key goes in
+    x-goog-api-key instead, and the URL stays free of it."""
+    seen_requests = []
+
+    def handler(request):
+        seen_requests.append(request)
+        return _ok(1)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    emb = GeminiEmbedder("SECRET", client=client)
+    emb.embed(["alpha"])
+    request = seen_requests[0]
+    assert request.headers["x-goog-api-key"] == "SECRET"
+    assert "SECRET" not in str(request.url)
+    assert str(request.url).endswith("batchEmbedContents")
+    assert GEMINI_MODEL in str(request.url)
+    assert "SECRET" not in emb.url
 
 
 def test_batches_are_capped_at_100():

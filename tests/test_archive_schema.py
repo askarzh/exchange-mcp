@@ -25,9 +25,17 @@ def test_schema_version_is_three(db):
 
 
 def test_vector_extension_is_installed(db):
+    """...and in `public`. Production connects as role `ews` with a schema
+    of the same name, so a bare CREATE EXTENSION lands it in `ews`
+    ("$user" wins the search_path) and every later public.vector(768) /
+    <=> reference breaks. Migration 003 pins WITH SCHEMA public."""
     with db.conn() as c:
-        row = c.execute("SELECT 1 AS ok FROM pg_extension WHERE extname = 'vector'").fetchone()
+        row = c.execute(
+            "SELECT n.nspname AS schema FROM pg_extension e "
+            "JOIN pg_namespace n ON n.oid = e.extnamespace "
+            "WHERE e.extname = 'vector'").fetchone()
     assert row is not None
+    assert row["schema"] == "public"
 
 
 def test_messages_carries_the_captured_changekey_column(db):
