@@ -1,6 +1,7 @@
 """The four new tools: gates, envelopes, and what each one reads."""
 
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 
@@ -62,6 +63,12 @@ def test_archive_status_reports_states_runs_blobs_and_backlog(db, tmp_path):
     assert res["recent_runs"][0]["id"] == run_id
     assert res["policy"]["folders"] == ["f:inbox", "f:sent"]
     assert res["delete_enabled"] is False
+    # Regression: archive_runs timestamps are tz-aware datetimes from psycopg
+    # and used to make the whole envelope unserialisable over MCP.
+    run = res["recent_runs"][0]
+    assert isinstance(run["started_at"], str) and "T" in run["started_at"]
+    assert isinstance(run["finished_at"], str)
+    json.dumps(res)
 
 
 def test_archive_status_needs_no_exchange(db):

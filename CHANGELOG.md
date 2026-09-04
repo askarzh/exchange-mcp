@@ -4,6 +4,11 @@ Earlier history (the 4.0–4.5 lines) lives in the upstream
 [`azizmazrou/ews-mcp`](https://github.com/azizmazrou/ews-mcp) changelog;
 this file starts from the point this repository was extracted.
 
+## [Unreleased]
+
+### Fixed
+- `archive_status` failed with "Object of type datetime is not JSON serializable": `recent_runs` timestamps are now ISO-8601 strings.
+
 ## [5.1.0a1] - 2026-09-04 (pre-release)
 
 Phase 2: the mail archive. `ewsd` now moves old mail onto local disk with its

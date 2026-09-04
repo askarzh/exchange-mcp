@@ -122,6 +122,12 @@ async def _archive_run(ctx: Context, *, dry_run: bool = True, kind: str = "all",
 # --------------------------------------------------------------------------
 
 
+def _iso(value: Any) -> str | None:
+    """archive_runs timestamps come back from psycopg as tz-aware datetimes,
+    which json.dumps rejects; the envelope carries ISO-8601 strings."""
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
 async def _archive_status_core(ctx: Context) -> dict[str, Any]:
     """The Postgres-only body: every number here lives in the mirror, so
     this alone is safe for a process with no access to ewsd's filesystem
@@ -135,7 +141,8 @@ async def _archive_status_core(ctx: Context) -> dict[str, Any]:
             "states": cache.archive_state_counts(),
             "recent_runs": [
                 {"id": r["id"], "kind": r["kind"], "dry_run": bool(r["dry_run"]),
-                 "started_at": r["started_at"], "finished_at": r["finished_at"],
+                 "started_at": _iso(r["started_at"]),
+                 "finished_at": _iso(r["finished_at"]),
                  "captured": r["captured"], "verified": r["verified"],
                  "deleted": r["deleted"], "failed": r["failed"],
                  "error": r["error"]}
