@@ -27,6 +27,65 @@ def indexed(db):
     return store, index
 
 
+def test_replace_chunks_stamps_embedded_at_without_mark_embedded(db):
+    """`replace_chunks` alone must set `embedded_at` — no separate call needed,
+    and no window where chunks exist but the message still looks unembedded."""
+    store = CacheStore(db)
+    store.upsert_messages([make_row("M-DIRECT", subject="Direct", body="hello world")])
+    assert store.get_message("M-DIRECT")["embedded_at"] is None
+    store.replace_chunks("M-DIRECT", [{"seq": 0, "source": "body", "text": "hello world",
+                                       "embedding": [0.1] * 768}])
+    assert store.get_message("M-DIRECT")["embedded_at"] is not None
+
+
+def test_replace_chunks_with_zero_chunks_still_stamps_embedded_at(db):
+    """A message with nothing to embed (e.g. empty body) must still leave the
+    backlog — otherwise it is re-selected by `unembedded_messages` forever."""
+    store = CacheStore(db)
+    store.upsert_messages([make_row("M-EMPTY", subject="", body="")])
+    store.replace_chunks("M-EMPTY", [])
+    assert store.get_message("M-EMPTY")["embedded_at"] is not None
+
+
+def test_vector_search_uses_the_hnsw_index_when_unfiltered(db):
+    """The unfiltered (`archived="any"`, no exclude) shape of the ANN query
+    that `similar_message_ids` issues must be servable by `ix_chunks_embedding`
+    — a `GROUP BY ... ORDER BY MIN(...)` shape cannot use it at all. 300 rows
+    plus `enable_seqscan = off` inside the transaction removes any doubt that
+    the planner would just pick a seq scan on a tiny table anyway."""
+    from ewsmcp.cache.store import _vector_literal
+
+    store = CacheStore(db)
+    embedder = FakeEmbedder()
+    rows = [make_row(f"M-{i}", subject=f"Msg {i}",
+                     body=f"content varies {i} {i % 11} {i % 7}") for i in range(300)]
+    store.upsert_messages(rows)
+    with store.db.conn() as c:
+        payload = [{"message_ews_id": r["ews_id"], "seq": 0, "source": "body",
+                    "text": "x", "embedding": _vector_literal(
+                        embedder.embed([r["subject"] + "\n" + r["body_clean"]])[0])}
+                   for r in rows]
+        c.cursor().executemany(
+            "INSERT INTO ews.chunks (message_ews_id, seq, source, text, embedding) "
+            "VALUES (%(message_ews_id)s, %(seq)s, %(source)s, %(text)s, %(embedding)s::vector)",
+            payload)
+    query_vec = _vector_literal(embedder.embed(["content varies"])[0])
+    with store.db.conn() as c:
+        c.execute("SET LOCAL enable_seqscan = off")
+        plan_rows = c.execute(
+            "EXPLAIN SELECT cand.ews_id AS ews_id, cand.dist AS dist FROM ("
+            "  SELECT c.message_ews_id AS ews_id, "
+            "         (c.embedding <=> %s::vector) AS dist "
+            "  FROM ews.chunks c "
+            "  WHERE c.embedding IS NOT NULL "
+            "  ORDER BY c.embedding <=> %s::vector LIMIT %s"
+            ") cand JOIN ews.messages m ON m.ews_id = cand.ews_id "
+            "WHERE TRUE ORDER BY cand.dist ASC",
+            [query_vec, query_vec, 40]).fetchall()
+    plan_text = "\n".join(r["QUERY PLAN"] for r in plan_rows)
+    assert "ix_chunks_embedding" in plan_text
+
+
 def test_index_messages_writes_chunks_and_stamps_embedded_at(indexed):
     store, _index = indexed
     assert store.embedding_backlog() == 0

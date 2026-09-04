@@ -50,7 +50,10 @@ class SemanticIndex:
 
         Batching is by MESSAGE, never mid-message: ``replace_chunks`` is a full
         rewrite, so a message whose chunks straddled two API batches would have
-        its first half deleted by its second half.
+        its first half deleted by its second half. ``replace_chunks`` stamps
+        ``embedded_at`` itself, in the same transaction as the chunk rewrite,
+        so a crash mid-run never leaves fully-embedded chunks looking
+        unembedded to the backlog query.
         """
         planned: list[tuple[str, list[str]]] = [
             (r["ews_id"], chunk_text(r.get("subject") or "",
@@ -72,7 +75,6 @@ class SemanticIndex:
             pending_size += len(chunks)
         if pending:
             done.extend(self._flush(pending))
-        self.store.mark_embedded(done)
         return len(done)
 
     def _flush(self, pending: list[tuple[str, list[str]]]) -> list[str]:

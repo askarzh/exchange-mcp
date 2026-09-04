@@ -627,7 +627,15 @@ class CacheStore:
                 "LIMIT %s", (int(limit),)).fetchall()
 
     def replace_chunks(self, ews_id: str, chunks: list[dict[str, Any]]) -> None:
-        """Rewrite one message's chunks. `embedding` is a list[float]."""
+        """Rewrite one message's chunks and stamp `embedded_at`, atomically.
+
+        Both happen in the same transaction/connection so a crash between
+        writing chunks and marking the message embedded can never happen —
+        the backlog query (`embedded_at IS NULL`) either sees the old chunks
+        AND no stamp, or the new chunks AND the stamp, never the fully-priced
+        embeddings with an unset stamp that would make the backlog re-pay for
+        them.
+        """
         with self.db.conn() as c:
             c.execute("DELETE FROM ews.chunks WHERE message_ews_id = %s", (ews_id,))
             if chunks:
@@ -639,8 +647,14 @@ class CacheStore:
                       "source": ch.get("source", "body"), "text": ch["text"],
                       "embedding": _vector_literal(ch.get("embedding"))}
                      for ch in chunks])
+            c.execute("UPDATE ews.messages SET embedded_at = now() "
+                      "WHERE ews_id = %s", (ews_id,))
 
     def mark_embedded(self, ews_ids: list[str]) -> None:
+        """Stamp `embedded_at` directly. `replace_chunks` already does this per
+        message, so callers normally don't need this — kept as a standalone,
+        idempotent helper (e.g. for backfills that don't go through chunking).
+        """
         if not ews_ids:
             return
         with self.db.conn() as c:
@@ -661,20 +675,47 @@ class CacheStore:
                             archived: str = "any",
                             exclude_ews_id: str | None = None
                             ) -> list[tuple[str, float]]:
-        """Nearest messages by cosine distance, MIN over each message's chunks."""
+        """Nearest messages by cosine distance, best distance per message.
+
+        The ANN part (`ORDER BY <=> ... LIMIT`) runs in an inner subquery
+        against `ews.chunks` ALONE, with no join, so pgvector's HNSW index
+        (`ix_chunks_embedding`) drives it as an index scan with an early
+        stopping condition — verified via EXPLAIN. Joining `ews.messages`
+        (needed for the `archived` filter) at that same query level defeats
+        the index: Postgres then has to weigh the join against the ORDER BY
+        and picks a full join-then-sort plan instead (also verified via
+        EXPLAIN). The join to apply `archived`/`exclude_ews_id` therefore
+        happens OUTSIDE the inner subquery, over its already-small candidate
+        set (`min(limit * 4, 400)` chunk rows). Multiple chunks can name the
+        same message, so results are deduped to the best (first, since rows
+        already arrive dist-ascending) row per message in Python, then
+        truncated to `limit` messages.
+        """
         clause = _ARCHIVED.get(archived, "TRUE")
-        params: list[Any] = [_vector_literal(embedding)]
-        extra = ""
+        candidate_limit = min(max(int(limit), 1) * 4, 400)
+        vector = _vector_literal(embedding)
+        params: list[Any] = [vector]
+        inner_extra = ""
         if exclude_ews_id:
-            extra = "AND c.message_ews_id <> %s "
+            inner_extra = "AND c.message_ews_id <> %s "
             params.append(exclude_ews_id)
-        params.append(int(limit))
+        params.extend([vector, candidate_limit])
         with self.db.conn() as c:
             rows = c.execute(
-                "SELECT c.message_ews_id AS ews_id, "
-                "MIN(c.embedding <=> %s::vector) AS dist "
-                "FROM ews.chunks c JOIN ews.messages m ON m.ews_id = c.message_ews_id "
-                f"WHERE c.embedding IS NOT NULL AND {clause} {extra}"
-                "GROUP BY c.message_ews_id ORDER BY dist ASC LIMIT %s",
+                "SELECT cand.ews_id AS ews_id, cand.dist AS dist FROM ("
+                "  SELECT c.message_ews_id AS ews_id, "
+                "         (c.embedding <=> %s::vector) AS dist "
+                "  FROM ews.chunks c "
+                f"  WHERE c.embedding IS NOT NULL {inner_extra}"
+                "  ORDER BY c.embedding <=> %s::vector LIMIT %s"
+                ") cand JOIN ews.messages m ON m.ews_id = cand.ews_id "
+                f"WHERE {clause} ORDER BY cand.dist ASC",
                 params).fetchall()
-        return [(r["ews_id"], float(r["dist"])) for r in rows]
+        best: dict[str, float] = {}
+        order: list[str] = []
+        for r in rows:
+            ews_id = r["ews_id"]
+            if ews_id not in best:             # rows arrive dist-ascending,
+                best[ews_id] = float(r["dist"])  # so the first hit is the best
+                order.append(ews_id)
+        return [(i, best[i]) for i in order[:int(limit)]]
