@@ -329,3 +329,35 @@ def test_html_to_text_link_label_equals_href():
 def test_html_to_text_empty_inputs():
     assert html_to_text("") == ""
     assert html_to_text(None) == ""
+
+
+def test_russian_forward_header_lines_are_dropped_but_content_stays():
+    """A Russian forward (Apple Mail / Outlook RU) is not quoted history:
+    the forwarded text is often the only copy in the mailbox and must
+    survive — only the boilerplate header lines go, so embeddings stop
+    matching every forward to every other forward."""
+    text = (
+        "Для работы\n"
+        "Покажите мне перед отправкой\n"
+        "\n"
+        "Начало переадресованного письма:\n"
+        "От: Ильясова Асем <assem@bank.example>\n"
+        "Дата: 3 сентября 2026 г. в 19:39:00 GMT+5\n"
+        "Кому: Енсебаев Руслан <ruslan@bank.example>\n"
+        "Копия: Овсянникова Анастасия <a@bank.example>\n"
+        "Тема: Прогноз - инвестиции в ДО\n"
+        "\n"
+        "Добрый день, коллеги!\n"
+        "Просим предоставить прогнозы по докапитализации ваших ДО.\n"
+    )
+    out = clean_body(text)["text"]
+    assert out == (
+        "Для работы\n"
+        "Покажите мне перед отправкой\n"
+        "\n"
+        "Добрый день, коллеги!\n"
+        "Просим предоставить прогнозы по докапитализации ваших ДО."
+    )
+    # A body line that merely starts with one of the words is not a header.
+    assert clean_body("Тема встречи обсуждалась вчера.")["text"] == (
+        "Тема встречи обсуждалась вчера.")

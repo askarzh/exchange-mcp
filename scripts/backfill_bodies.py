@@ -11,6 +11,7 @@ pipe the script in:
 
     docker exec -i ewsd python - < scripts/backfill_bodies.py               # all rows
     docker exec -i ewsd python - --limit 200 < scripts/backfill_bodies.py
+    docker exec -i ewsd python - --all < scripts/backfill_bodies.py   # re-clean all
 
 Idempotent: it only touches rows whose body is still empty and that are not
 in the `deleted` archive state. Rows Exchange no longer returns are left as
@@ -45,11 +46,30 @@ class _Ref:
         self.text_body, self.to_recipients = None, None
 
 
+_ALL_ROWS: list[dict] | None = None
+
+
+def _all_rows(store: CacheStore) -> list[dict]:
+    """Every row GetItem can still reach, newest first (fetched once)."""
+    global _ALL_ROWS
+    if _ALL_ROWS is None:
+        with store.db.conn() as c:
+            _ALL_ROWS = c.execute(
+                "SELECT ews_id, changekey FROM ews.messages "
+                "WHERE archive_state <> 'deleted' "
+                "ORDER BY date_ts DESC NULLS LAST").fetchall()
+    return _ALL_ROWS
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--limit", type=int, default=None,
                     help="stop after this many rows (default: all)")
     ap.add_argument("--batch", type=int, default=200)
+    ap.add_argument("--all", action="store_true",
+                    help="re-fetch and re-clean EVERY row still on Exchange (e.g. after "
+                         "a bodyclean change); rows whose cleaned body is unchanged keep "
+                         "their embedding")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
@@ -65,8 +85,11 @@ def main(argv: list[str] | None = None) -> int:
         want = args.batch if args.limit is None else min(args.batch, args.limit - done)
         if want <= 0:
             break
-        rows = [r for r in store.messages_missing_body(want + len(seen))
-                if r["ews_id"] not in seen][:want]
+        if args.all:
+            rows = [r for r in _all_rows(store) if r["ews_id"] not in seen][:want]
+        else:
+            rows = [r for r in store.messages_missing_body(want + len(seen))
+                    if r["ews_id"] not in seen][:want]
         if not rows:
             break
         refs = [_Ref(r["ews_id"], r["changekey"]) for r in rows]

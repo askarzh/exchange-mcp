@@ -224,6 +224,21 @@ _TRUNC_SUFFIX = "… [truncated]"
 # 3+ consecutive blank lines (possibly whitespace-only) -> a single blank.
 _BLANK_RUN_RE = re.compile(r"\n(?:[ \t]*\n){3,}")
 
+# Russian-localised forward/reply header lines (Outlook, Apple Mail). Unlike
+# the English "From:/Sent:" block these do NOT mark quoted history — a
+# forwarded message's content is often the only copy in the mailbox and must
+# stay — but the header lines themselves are boilerplate that dominates
+# embedding similarity ("every forward looks like every other forward"), so
+# they are dropped line by line.
+_RU_HEADER_LINE_RE = re.compile(
+    r"^\s*(?:начало переадресованного письма|от|отправлено|дата|кому|копия|тема)"
+    r"\s*:.*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def strip_header_lines(text: str) -> str:
+    return _RU_HEADER_LINE_RE.sub("", text)
+
 
 def clean_body(text: str, max_chars: int = 4000) -> dict:
     """Full cleaning pipeline for an email body.
@@ -235,6 +250,7 @@ def clean_body(text: str, max_chars: int = 4000) -> dict:
     original_chars = len(raw)
     t = _normalize_newlines(raw)
     t, quoted_blocks = strip_quoted_history(t)
+    t = strip_header_lines(t)
     t = strip_signature(t)
     t = _BLANK_RUN_RE.sub("\n\n", t)
     t = t.rstrip()

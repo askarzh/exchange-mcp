@@ -157,7 +157,7 @@ def test_get_raw_message_returns_a_capability_url(db, tmp_path):
     assert res["download_url"].startswith("https://ews.example.com/download/")
     # The real subject, not the ASCII reduction ("Fwd_ _ - _.eml") — the
     # download itself serves it through filename*.
-    assert res["name"] == "Fwd: Прогноз - инвестиции.eml"
+    assert res["name"] == "Fwd - Прогноз - инвестиции.eml"   # no ":" (Windows)
     assert res["name"] in res["curl"]
     assert res["size_bytes"] == len(b"RAW-MIME")
     assert res["expires_in_minutes"] == 15

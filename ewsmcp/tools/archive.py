@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 KINDS = ("capture", "verify", "delete", "embed", "all")
 ARCHIVED_MODES = ("any", "only", "exclude")
+# Characters no common filesystem accepts in a name (Windows is the strict
+# one: ':' from "Fwd: …" makes `curl -o` fail there). Replaced by " - ".
+_FS_UNSAFE_RE = re.compile(r'\s*[:/\\*?"<>|]+\s*')
 
 
 def _policy_dict(policy: ArchivePolicy) -> dict[str, Any]:
@@ -240,6 +244,9 @@ async def _get_raw_message(ctx: Context, *, id: str,
             files.store_mime, ctx.settings.data_dir, mime)
     ttl = max(1, min(int(ttl_minutes), 1440))
     subject = (row["subject"] or "message").strip() or "message"
+    # Keep the subject readable (Cyrillic survives) but drop what no
+    # filesystem accepts: ':' alone breaks `curl -o` on Windows.
+    subject = _FS_UNSAFE_RE.sub(" - ", subject).strip(" -.") or "message"
     name = f"{subject[:60]}.eml"
     rec = downloads.mint(ctx.settings.data_dir, path=str(path), name=name,
                          content_type="message/rfc822", ttl_seconds=ttl * 60)
