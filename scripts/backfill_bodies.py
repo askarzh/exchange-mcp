@@ -86,9 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         # is cheap and correct.
         filled += store.update_bodies(bodies)
         done += len(rows)
-        log.info("backfilled %d/%d rows so far (%d not returned by Exchange)",
+        log.info("backfilled %d/%d rows so far (%d with no text body on Exchange)",
                  filled, done, missing)
-    log.info("done: %d rows fetched, %d bodies written, %d missing on Exchange; "
+    log.info("done: %d rows fetched, %d bodies written, %d with no text body on Exchange; "
              "embed worker will re-chunk them (backlog=%d)",
              done, filled, missing, store.embedding_backlog())
     return 0
