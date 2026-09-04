@@ -11,6 +11,7 @@ from typing import Any
 import jsonschema
 
 from . import __version__, downloads, uploads
+from .archive.runner import KINDS as ARCHIVE_KINDS
 from .errors import HTTP_BY_CODE
 from .server import start_connection_manager
 from .tools.base import dispatch, validator_for
@@ -83,6 +84,21 @@ def _metrics_text(ctx) -> str:
             lines.append(f"ewsmcp_sync_last_cycle_age_seconds {age}")
         lines.append("# TYPE ewsmcp_sync_degraded gauge")
         lines.append(f"ewsmcp_sync_degraded {1 if status.get('last_error') else 0}")
+    if ctx.archive is not None:
+        status = ctx.archive.status()
+        lines.append("# TYPE ewsmcp_archive_cycles_total counter")
+        lines.append(f"ewsmcp_archive_cycles_total {status.get('cycles', 0)}")
+        lines.append("# TYPE ewsmcp_archive_degraded gauge")
+        lines.append(f"ewsmcp_archive_degraded {1 if status.get('last_error') else 0}")
+        if ctx.cache is not None:
+            try:
+                lines.append("# TYPE ewsmcp_archive_messages gauge")
+                for state, n in ctx.cache.archive_state_counts().items():
+                    lines.append(f'ewsmcp_archive_messages{{state="{state}"}} {n}')
+                lines.append("# TYPE ewsmcp_archive_embedding_backlog gauge")
+                lines.append(f"ewsmcp_archive_embedding_backlog {ctx.cache.embedding_backlog()}")
+            except Exception:
+                pass
     return "\n".join(lines) + "\n"
 
 
@@ -246,6 +262,39 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
 
         if path == "/v1/status" and method == "GET":
             return await _send_json(send, 200, await _get_server_status(ctx))
+
+        if path == "/v1/archive/run" and method == "POST":
+            body = await _read_json_body(receive, send)
+            if body is None:
+                return
+            if not isinstance(body, dict):
+                return await _send_json(send, 400, {"ok": False, "error": {
+                    "code": "validation",
+                    "message": "request body must be a JSON object"}})
+            kind = str(body.get("kind", "all"))
+            if kind not in ARCHIVE_KINDS:
+                return await _send_json(send, 400, {"ok": False, "error": {
+                    "code": "validation",
+                    "message": f"kind must be one of {', '.join(ARCHIVE_KINDS)}"}})
+            if getattr(ctx, "archive", None) is None:
+                return await _send_json(send, 503, {"ok": False, "error": {
+                    "code": "upstream_unavailable",
+                    "message": "the archive runner is not started"}})
+            result = await ctx.archive.run_once(
+                kind=kind, dry_run=bool(body.get("dry_run", True)),
+                before=body.get("before"), folders=body.get("folders"))
+            return await _send_json(send, 200, result)
+
+        if path.startswith("/v1/archive/runs/") and method == "GET":
+            raw = path.removeprefix("/v1/archive/runs/")
+            if not raw.isdigit():
+                return await _send_json(send, 400, {"ok": False, "error": {
+                    "code": "validation", "message": "run id must be an integer"}})
+            row = ctx.cache.get_run(int(raw)) if ctx.cache is not None else None
+            if row is None:
+                return await _send_json(send, 404, {"ok": False, "error": {
+                    "code": "not_found", "message": f"no archive run {raw}"}})
+            return await _send_json(send, 200, {"ok": True, **dict(row)})
 
         if path == "/metrics" and method == "GET":
             body = _metrics_text(ctx).encode()

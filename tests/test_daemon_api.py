@@ -126,3 +126,69 @@ def test_unknown_download_tokens_are_an_opaque_404(db):
     app = build_daemon_app(ctx, ctx.settings)
     assert _drive_raw(app, "/download/" + "0" * 64)[0] == 404
     assert _drive_raw(app, "/download/nonsense")[0] == 404
+
+
+class _Runner:
+    def __init__(self):
+        self.calls = []
+
+    async def run_once(self, *, kind, dry_run, before, folders):
+        self.calls.append((kind, dry_run, before, folders))
+        return {"ok": True, "run_id": 11, "kind": kind, "dry_run": dry_run,
+                "candidates": 5, "captured": 0, "verified": 0, "reset": 0,
+                "deleted": 0, "eligible": 0, "embedded": 0, "failed": 0,
+                "blocked": None, "stopped": None, "error": None, "sample": []}
+
+
+def test_archive_run_route_needs_the_bearer(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _Runner()
+    app = build_daemon_app(ctx, ctx.settings)
+    assert _drive(app, "/v1/archive/run", "POST", {})[0] == 401
+
+
+def test_archive_run_route_defaults_to_a_dry_run(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _Runner()
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, "/v1/archive/run", "POST", {}, headers=AUTH)
+    assert status == 200 and body["run_id"] == 11
+    assert ctx.archive.calls == [("all", True, None, None)]
+
+
+def test_archive_run_route_passes_the_arguments_through(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _Runner()
+    app = build_daemon_app(ctx, ctx.settings)
+    _drive(app, "/v1/archive/run", "POST",
+           {"kind": "capture", "dry_run": False, "before": "2026-01-01",
+            "folders": ["inbox"]}, headers=AUTH)
+    assert ctx.archive.calls == [("capture", False, "2026-01-01", ["inbox"])]
+
+
+def test_archive_run_route_rejects_an_unknown_kind(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _Runner()
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, "/v1/archive/run", "POST", {"kind": "nuke"},
+                          headers=AUTH)
+    assert status == 400 and body["error"]["code"] == "validation"
+
+
+def test_archive_run_route_without_a_runner_is_503(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = None
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, "/v1/archive/run", "POST", {}, headers=AUTH)
+    assert status == 503 and body["error"]["code"] == "upstream_unavailable"
+
+
+def test_archive_run_status_route(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    run_id = ctx.cache.start_run("capture", dry_run=True, policy={})
+    ctx.cache.finish_run(run_id, captured=2)
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, f"/v1/archive/runs/{run_id}", headers=AUTH)
+    assert status == 200 and body["captured"] == 2 and body["kind"] == "capture"
+    assert _drive(app, "/v1/archive/runs/999999", headers=AUTH)[0] == 404
+    assert _drive(app, "/v1/archive/runs/abc", headers=AUTH)[0] == 400

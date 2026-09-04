@@ -452,7 +452,7 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
             cache_block["error"] = str(exc)
     if ctx.sync is not None:
         cache_block["sync"] = ctx.sync.status()
-    return {
+    out = {
         "ok": True,
         "version": __version__,
         "uptime_s": int(time.time() - ctx.started_at),
@@ -464,6 +464,16 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
         "alias_stats": ctx.aliaser.stats(),
         "cache": cache_block,
     }
+    if ctx.archive is not None:
+        archive_block = dict(ctx.archive.status())
+        if ctx.cache is not None:
+            try:
+                archive_block["state_counts"] = ctx.cache.archive_state_counts()
+                archive_block["embedding_backlog"] = ctx.cache.embedding_backlog()
+            except Exception as exc:
+                archive_block["error"] = str(exc)
+        out["archive"] = archive_block
+    return out
 
 
 # ---------------------------------------------------------------- specs
