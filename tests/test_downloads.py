@@ -57,9 +57,51 @@ def test_malformed_tokens_never_reach_the_filesystem(tmp_path, token):
 def test_a_link_pointing_outside_data_dir_is_refused(tmp_path):
     outside = tmp_path.parent / "secret.txt"
     outside.write_bytes(b"nope")
-    token = downloads.mint(str(tmp_path), path=str(outside), name="x")["token"]
+    with pytest.raises(ValueError):
+        downloads.mint(str(tmp_path), path=str(outside), name="x")
+
+
+def test_a_path_under_audit_is_refused_at_mint(tmp_path):
+    audit = Path(tmp_path) / "audit" / "log.json"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    audit.write_bytes(b"x")
+    with pytest.raises(ValueError):
+        downloads.mint(str(tmp_path), path=str(audit), name="log.json")
+
+
+def test_a_path_under_audit_is_refused_at_redeem(tmp_path):
+    # Simulate a record that bypassed mint()'s containment check (e.g. a
+    # stale/tampered record file) — redeem() must narrow the same way.
+    audit = Path(tmp_path) / "audit" / "log.json"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    audit.write_bytes(b"x")
+    links = Path(tmp_path) / "download-links"
+    links.mkdir(parents=True, exist_ok=True)
+    token = "a" * 64
+    record = {"path": str(audit.resolve()), "name": "log.json",
+              "content_type": "application/octet-stream",
+              "expires_at": time.time() + 60, "used": False}
+    (links / f"{token}.json").write_text(json.dumps(record))
     with pytest.raises(downloads.DownloadRejected):
         downloads.redeem(str(tmp_path), token)
+
+
+def test_header_injection_in_name_is_stripped(tmp_path):
+    path = _file(tmp_path)
+    rec = downloads.mint(str(tmp_path), path=str(path),
+                         name="evil.eml\r\nX-Injected: 1")
+    assert "\r" not in rec["name"] and "\n" not in rec["name"]
+    got = downloads.redeem(str(tmp_path), rec["token"])
+    assert "\r" not in got["name"] and "\n" not in got["name"]
+
+
+def test_bad_content_type_falls_back_to_octet_stream(tmp_path):
+    path = _file(tmp_path)
+    rec = downloads.mint(str(tmp_path), path=str(path), name="x",
+                         content_type="text/plain\r\nX: y")
+    assert rec["content_type"] == "application/octet-stream"
+    got = downloads.redeem(str(tmp_path), rec["token"])
+    assert got["content_type"] == "application/octet-stream"
 
 
 def test_a_vanished_file_is_refused(tmp_path):

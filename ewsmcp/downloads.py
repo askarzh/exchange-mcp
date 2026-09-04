@@ -26,7 +26,16 @@ TOKEN_BYTES = 32
 DEFAULT_TTL_SECONDS = 15 * 60
 MAX_TTL_SECONDS = 24 * 60 * 60
 
+MIME_DIRNAME = "mime"
+BLOB_DIRNAME = "blobs"
+
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32,128}$")
+# Header values ride verbatim into `content-disposition`/`content-type` in
+# http.py, and the name/type here are ultimately attacker-influenced (mail
+# subjects, attachment filenames). Keep only what's safe on an HTTP header
+# line — no CR/LF, no quote, no control characters.
+_NAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+_CONTENT_TYPE_RE = re.compile(r"^[\w.+-]+/[\w.+-]+$")
 
 
 class DownloadRejected(Exception):
@@ -37,20 +46,50 @@ def _links_dir(data_dir: str) -> Path:
     return Path(data_dir) / "download-links"
 
 
+def safe_header_name(name: str) -> str:
+    """Reduce a caller-supplied name to something safe to embed in a
+    `content-disposition` header — no path separators, no CR/LF, no quotes."""
+    base = Path(str(name or "")).name           # strips any directory part
+    cleaned = _NAME_RE.sub("_", base).strip("._ ")
+    return cleaned or "download.bin"
+
+
+def safe_content_type(content_type: str) -> str:
+    """Reduce a caller-supplied content type to a bare `type/subtype` token,
+    or fall back to a safe default — no header-injection payloads survive."""
+    ct = str(content_type or "")
+    return ct if _CONTENT_TYPE_RE.match(ct) else "application/octet-stream"
+
+
+def _allowed_root(data_dir: str, target: Path) -> bool:
+    """A download may only ever hand out a file that lives under
+    ``{DATA_DIR}/mime/`` or ``{DATA_DIR}/blobs/`` — never audit logs,
+    upload/download link records, or anything else under DATA_DIR."""
+    root = Path(data_dir).resolve()
+    mime_root = root / MIME_DIRNAME
+    blob_root = root / BLOB_DIRNAME
+    return target.is_relative_to(mime_root) or target.is_relative_to(blob_root)
+
+
 def mint(data_dir: str, *, path: str, name: str,
          content_type: str = "application/octet-stream",
          ttl_seconds: int = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
+    target = Path(path).resolve()
+    if not _allowed_root(data_dir, target):
+        raise ValueError("download path must live under mime/ or blobs/")
     ttl = min(int(ttl_seconds), MAX_TTL_SECONDS)
     token = secrets.token_hex(TOKEN_BYTES)
-    record = {"path": str(Path(path).resolve()),
-              "name": Path(str(name or "download.bin")).name,
-              "content_type": content_type,
+    safe_name = safe_header_name(name)
+    safe_ct = safe_content_type(content_type)
+    record = {"path": str(target),
+              "name": safe_name,
+              "content_type": safe_ct,
               "expires_at": time.time() + ttl, "used": False}
     links = _links_dir(data_dir)
     links.mkdir(parents=True, exist_ok=True)
     (links / f"{token}.json").write_text(json.dumps(record))
-    return {"token": token, "name": record["name"],
-            "content_type": content_type, "expires_at": record["expires_at"]}
+    return {"token": token, "name": safe_name,
+            "content_type": safe_ct, "expires_at": record["expires_at"]}
 
 
 def redeem(data_dir: str, token: str) -> dict[str, Any]:
@@ -71,16 +110,18 @@ def redeem(data_dir: str, token: str) -> dict[str, Any]:
         raise DownloadRejected("expired")
 
     target = Path(str(record.get("path", ""))).resolve()
-    root = Path(data_dir).resolve()
-    # Containment: a link may only ever hand out something inside DATA_DIR.
-    if not target.is_relative_to(root) or not target.is_file():
+    # Containment: a link may only ever hand out something under mime/ or
+    # blobs/ — never audit/, upload-links/, download-links/, etc.
+    if not _allowed_root(data_dir, target) or not target.is_file():
         raise DownloadRejected("not servable")
 
     record["used"] = True
     record_path.write_text(json.dumps(record))
-    return {"path": str(target), "name": record.get("name") or target.name,
-            "content_type": record.get("content_type")
-            or "application/octet-stream"}
+    # Defense in depth: re-sanitize on the way out too, in case a record was
+    # ever written by a path that bypassed mint()'s sanitizing.
+    return {"path": str(target),
+            "name": safe_header_name(record.get("name") or target.name),
+            "content_type": safe_content_type(record.get("content_type"))}
 
 
 def sweep(data_dir: str) -> int:

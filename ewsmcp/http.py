@@ -211,21 +211,33 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
             except (downloads.DownloadRejected, OSError):
                 return await _send_json(send, 404, {"ok": False, "error": {
                     "code": "not_found", "message": "not found"}})
-            disposition = f'attachment; filename="{rec["name"]}"'.encode()
+            # Defense in depth: re-sanitize the header values here too, even
+            # though downloads.redeem() already did — these ride verbatim
+            # into HTTP headers and are ultimately attacker-influenced
+            # (mail-derived names/types).
+            safe_name = downloads.safe_header_name(rec["name"])
+            safe_ct = downloads.safe_content_type(rec["content_type"])
+            disposition = f'attachment; filename="{safe_name}"'.encode()
             await send({"type": "http.response.start", "status": 200, "headers": [
-                [b"content-type", rec["content_type"].encode()],
+                [b"content-type", safe_ct.encode()],
                 [b"content-length", str(size).encode()],
                 [b"content-disposition", disposition],
             ]})
-            with file_path.open("rb") as fh:
-                chunk = fh.read(_DOWNLOAD_CHUNK)
-                while True:
-                    nxt = fh.read(_DOWNLOAD_CHUNK)
-                    await send({"type": "http.response.body", "body": chunk,
-                                "more_body": bool(nxt)})
-                    if not nxt:
-                        break
-                    chunk = nxt
+            try:
+                with file_path.open("rb") as fh:
+                    chunk = fh.read(_DOWNLOAD_CHUNK)
+                    while True:
+                        nxt = fh.read(_DOWNLOAD_CHUNK)
+                        await send({"type": "http.response.body", "body": chunk,
+                                    "more_body": bool(nxt)})
+                        if not nxt:
+                            break
+                        chunk = nxt
+            except Exception:
+                # The client hung up mid-stream (broken pipe / connection
+                # reset). Nothing left to serve — stop quietly rather than
+                # raising into the ASGI server.
+                logger.debug("download %s: client disconnected mid-stream", token)
             return None
 
         if key and not _authorized(scope.get("headers"), key):
