@@ -412,13 +412,15 @@ class CacheStore:
         AND NOT EXISTS (
             SELECT 1 FROM jsonb_array_elements_text(
                 COALESCE(NULLIF(m.categories_json, ''), '[]')::jsonb) AS cat
-            WHERE lower(cat) = ANY(%(exclude_categories)s))
+            WHERE lower(btrim(cat)) = ANY(%(exclude_categories)s))
     """
 
     def _candidate_params(self, folder_ids, before_ts, exclude_categories):
         return {
             "before_ts": int(before_ts),
-            "folder_ids": list(folder_ids) if folder_ids else None,
+            # None means "every folder"; [] must mean "no folder" — do not
+            # collapse an explicit empty list into None.
+            "folder_ids": None if folder_ids is None else list(folder_ids),
             "exclude_categories": [c.strip().lower()
                                    for c in (exclude_categories or []) if c.strip()],
         }
@@ -445,12 +447,14 @@ class CacheStore:
                 f"WHERE {self._CANDIDATE_WHERE}", params).fetchone()["n"])
 
     def mark_captured(self, ews_id: str, *, mime_sha256: str,
-                      mime_path: str) -> None:
+                      mime_path: str) -> int:
         with self.db.conn() as c:
-            c.execute(
+            cur = c.execute(
                 "UPDATE ews.messages SET archive_state = 'captured', "
                 "archived_at = now(), mime_sha256 = %s, mime_path = %s "
-                "WHERE ews_id = %s", (mime_sha256, mime_path, ews_id))
+                "WHERE ews_id = %s AND archive_state = 'live'",
+                (mime_sha256, mime_path, ews_id))
+        return cur.rowcount
 
     def captured_rows(self, limit: int) -> list[dict[str, Any]]:
         with self.db.conn() as c:
@@ -458,20 +462,25 @@ class CacheStore:
                 "SELECT * FROM ews.messages WHERE archive_state = 'captured' "
                 "ORDER BY archived_at ASC LIMIT %s", (int(limit),)).fetchall()
 
-    def mark_verified(self, ews_id: str) -> None:
+    def mark_verified(self, ews_id: str) -> int:
         with self.db.conn() as c:
-            c.execute("UPDATE ews.messages SET archive_state = 'verified', "
-                      "verified_at = now() WHERE ews_id = %s", (ews_id,))
+            cur = c.execute(
+                "UPDATE ews.messages SET archive_state = 'verified', "
+                "verified_at = now() WHERE ews_id = %s AND archive_state = 'captured'",
+                (ews_id,))
+        return cur.rowcount
 
-    def reset_to_live(self, ews_id: str) -> None:
+    def reset_to_live(self, ews_id: str) -> int:
         """Verification failed — forget the capture entirely so it is retried."""
         with self.db.conn() as c:
-            c.execute(
+            cur = c.execute(
                 "UPDATE ews.messages SET archive_state = 'live', archived_at = NULL, "
                 "verified_at = NULL, mime_sha256 = NULL, mime_path = NULL "
-                "WHERE ews_id = %s", (ews_id,))
-            c.execute("DELETE FROM ews.attachments WHERE message_ews_id = %s",
-                      (ews_id,))
+                "WHERE ews_id = %s AND archive_state = 'captured'", (ews_id,))
+            if cur.rowcount:
+                c.execute("DELETE FROM ews.attachments WHERE message_ews_id = %s",
+                          (ews_id,))
+        return cur.rowcount
 
     def deletable_rows(self, *, before_ts: int, verified_before: int,
                        limit: int) -> list[dict[str, Any]]:
@@ -491,7 +500,8 @@ class CacheStore:
         with self.db.conn() as c:
             cur = c.execute(
                 "UPDATE ews.messages SET archive_state = 'deleted', "
-                "deleted_at = now() WHERE ews_id = ANY(%s)", (list(ews_ids),))
+                "deleted_at = now() WHERE ews_id = ANY(%s) "
+                "AND archive_state = 'verified'", (list(ews_ids),))
         return cur.rowcount
 
     def apply_server_deletes(self, ews_ids: list[str]) -> tuple[int, int]:

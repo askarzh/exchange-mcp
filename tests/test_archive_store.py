@@ -60,13 +60,14 @@ def test_candidates_across_all_folders_when_folder_ids_is_none(store_with_messag
 
 def test_capture_verify_delete_state_machine(store_with_message):
     store, ews_id = store_with_message
-    store.mark_captured(ews_id, mime_sha256="b" * 64, mime_path="/data/mime/b.eml")
+    assert store.mark_captured(ews_id, mime_sha256="b" * 64,
+                               mime_path="/data/mime/b.eml") == 1
     row = store.get_message(ews_id)
     assert row["archive_state"] == "captured" and row["mime_sha256"] == "b" * 64
     assert row["archived_at"] is not None
     assert [r["ews_id"] for r in store.captured_rows(10)] == [ews_id]
 
-    store.mark_verified(ews_id)
+    assert store.mark_verified(ews_id) == 1
     assert store.get_message(ews_id)["archive_state"] == "verified"
     assert store.get_message(ews_id)["verified_at"] is not None
 
@@ -80,11 +81,68 @@ def test_capture_verify_delete_state_machine(store_with_message):
 def test_reset_to_live_clears_the_capture_fields(store_with_message):
     store, ews_id = store_with_message
     store.mark_captured(ews_id, mime_sha256="c" * 64, mime_path="/x.eml")
-    store.reset_to_live(ews_id)
+    assert store.reset_to_live(ews_id) == 1
     row = store.get_message(ews_id)
     assert row["archive_state"] == "live"
     assert row["mime_sha256"] is None and row["mime_path"] is None
     assert row["archived_at"] is None
+
+
+def test_state_transitions_are_guarded_by_the_current_archive_state(store_with_message):
+    store, ews_id = store_with_message
+
+    # mark_verified on a live row: no-op
+    assert store.mark_verified(ews_id) == 0
+    assert store.get_message(ews_id)["archive_state"] == "live"
+
+    # mark_deleted on a live row: no-op
+    assert store.mark_deleted([ews_id]) == 0
+    assert store.get_message(ews_id)["archive_state"] == "live"
+
+    store.mark_captured(ews_id, mime_sha256="g" * 64, mime_path="/x.eml")
+    store.mark_verified(ews_id)
+    store.mark_deleted([ews_id])
+    assert store.get_message(ews_id)["archive_state"] == "deleted"
+
+    # mark_captured on a deleted row: no-op, row stays deleted, no capture fields touched
+    assert store.mark_captured(ews_id, mime_sha256="h" * 64, mime_path="/y.eml") == 0
+    row = store.get_message(ews_id)
+    assert row["archive_state"] == "deleted"
+    assert row["mime_sha256"] == "g" * 64
+
+    # reset_to_live on a deleted row: no-op, its attachments and mime columns survive
+    store.replace_attachments(ews_id, [
+        {"name": "keep.pdf", "content_type": "application/pdf", "size": 1,
+         "sha256": "i" * 64, "is_inline": 0}])
+    assert store.reset_to_live(ews_id) == 0
+    row = store.get_message(ews_id)
+    assert row["archive_state"] == "deleted"
+    assert row["mime_sha256"] == "g" * 64
+    assert len(store.attachments_for(ews_id)) == 1
+
+
+def test_candidates_with_an_empty_folder_id_list_select_nothing(store_with_message):
+    store, _ = store_with_message
+    _folders(store)
+    store.upsert_messages([make_row("OLD-IN", folder_id="FID-INBOX",
+                                    date_ts=NOW - 300 * DAY)])
+    cutoff = NOW - 180 * DAY
+    assert store.archive_candidates(folder_ids=[], before_ts=cutoff,
+                                    exclude_categories=[], limit=25) == []
+    assert store.archive_candidate_count(folder_ids=[], before_ts=cutoff,
+                                         exclude_categories=[]) == 0
+    # None (not an empty list) is what means "every folder"
+    assert store.archive_candidate_count(folder_ids=None, before_ts=cutoff,
+                                         exclude_categories=[]) == 1
+
+
+def test_candidates_exclude_categories_regardless_of_case_and_whitespace(store_with_message):
+    store, _ = store_with_message
+    store.upsert_messages([make_row("OLD-KEEP", date_ts=NOW - 300 * DAY,
+                                    categories=[" Keep "])])
+    rows = store.archive_candidates(folder_ids=None, before_ts=NOW - 180 * DAY,
+                                    exclude_categories=["keep"], limit=25)
+    assert "OLD-KEEP" not in {r["ews_id"] for r in rows}
 
 
 def test_deletable_rows_need_verified_plus_grace(store_with_message):
