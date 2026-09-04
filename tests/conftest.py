@@ -182,3 +182,30 @@ def make_context(db, gateway=None, cache=True, audit_dir=None, **overrides):
                   cache=CacheStore(db) if cache else None, db=db)
     build_registry(ctx)
     return ctx
+
+
+class FakeEmbedder:
+    """Deterministic, offline stand-in for GeminiEmbedder.
+
+    Hashes each whitespace token into one of `dims` buckets, so texts that
+    share vocabulary land near each other under cosine distance and the same
+    text always yields the same vector. No network, ever.
+    """
+
+    def __init__(self, dims: int = 768):
+        self.dims = dims
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        import hashlib
+        import math
+        self.calls.append(list(texts))
+        out = []
+        for text in texts:
+            vec = [0.0] * self.dims
+            for token in (text or "").lower().split():
+                h = int(hashlib.sha256(token.encode()).hexdigest()[:8], 16)
+                vec[h % self.dims] += 1.0
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            out.append([v / norm for v in vec])
+        return out
