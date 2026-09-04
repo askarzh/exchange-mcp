@@ -36,12 +36,12 @@ def _run(ctx, name, **kwargs):
 
 def test_registry_counts_per_tier_and_semantic(tmp_path, db):
     full = _ctx(tmp_path, db, ews_capability_tier="full")
-    assert len(full.registry) == 31
-    assert "find_similar" not in full.registry  # semantic tier removed
+    assert len(full.registry) == 35
+    assert "find_similar" in full.registry  # the semantic tier is back, Gemini-backed
     draft = _ctx(tmp_path, db, ews_capability_tier="draft")
-    assert len(draft.registry) == 26
+    assert len(draft.registry) == 29
     read = _ctx(tmp_path, db, ews_capability_tier="read")
-    assert len(read.registry) == 15
+    assert len(read.registry) == 18
 
 
 # --- tasks pack ---------------------------------------------------------------

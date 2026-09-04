@@ -66,9 +66,9 @@ def _run(ctx, name, **kw):
 
 
 def test_registry_matches_daemon_counts(db):
-    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="full").registry) == 31
-    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="draft").registry) == 26
-    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="read").registry) == 15
+    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="full").registry) == 35
+    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="draft").registry) == 29
+    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="read").registry) == 18
     ctx = _mcp_ctx(db, DeadDaemon(), ews_capability_tier="full")
     assert LOCAL_TOOLS <= set(ctx.registry)
     assert "confirm_token" in ctx.registry["send_draft"].input_schema["properties"]

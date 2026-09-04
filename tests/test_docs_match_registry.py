@@ -28,7 +28,7 @@ def test_version_is_50_line():
     assert f'version = "{mod.__version__}"' in pyproject
 
 
-FORBIDDEN = ["SQLite", "FTS5", "700×", "700x", "find_similar", "norm_text",
+FORBIDDEN = ["SQLite", "FTS5", "700×", "700x", "norm_text",
              "sender_sigs", "EWS_CACHE_FOLDERS", "EWS_CACHE_WINDOW_DAYS",
              "Arabic", "bilingual"]
 
@@ -44,11 +44,11 @@ def test_docs_do_not_describe_removed_behaviour():
 
 
 def test_semantic_mode_is_still_the_registry_truth():
-    """The generated enum follows the registry; the prose must not promise
-    a tool the registry does not have."""
+    """The generated enum follows the registry; the prose must match what the
+    registry actually has, in either direction."""
     text = (V5_ROOT / "docs" / "API.md").read_text(encoding="utf-8")
-    assert "semantic" in text          # mode='semantic' is still a reserved enum value
-    assert "find_similar" not in text  # ...but the tool does not exist
+    assert "semantic" in text      # mode='semantic' is still a reserved enum value
+    assert "find_similar" in text  # ...and the tool now exists (Gemini-backed)
 
 
 def test_code_comments_do_not_mention_sqlite():

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 
-from ..tools import calendar_people, mail_read, tasks, writes
+from ..tools import archive, calendar_people, mail_read, tasks, writes
 from ..tools.base import CLASS_TIER, TIER_RANK, Context, ToolSpec
 from . import local
 
@@ -22,7 +22,8 @@ def _proxy(name: str):
 def build_mcp_registry(ctx: Context) -> dict[str, ToolSpec]:
     tier = ctx.settings.ews_capability_tier
     registry: dict[str, ToolSpec] = {}
-    for spec in [*mail_read.TOOLS, *calendar_people.TOOLS, *tasks.TOOLS, *writes.TOOLS]:
+    for spec in [*mail_read.TOOLS, *calendar_people.TOOLS, *tasks.TOOLS, *writes.TOOLS,
+                 *archive.TOOLS]:
         need = CLASS_TIER.get(spec.side_effect_class, "draft")
         if TIER_RANK[need] > TIER_RANK.get(tier, 2):
             continue

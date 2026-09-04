@@ -3,13 +3,13 @@ by boot smokes and the generated docs — change it DELIBERATELY."""
 
 from typing import Dict
 
-from . import calendar_people, mail_read, tasks, writes
+from . import archive, calendar_people, mail_read, tasks, writes
 from .base import CLASS_TIER, TIER_RANK, Context, ToolSpec
 
 
 def build_registry(ctx: Context) -> Dict[str, ToolSpec]:
     specs = [*mail_read.TOOLS, *calendar_people.TOOLS, *tasks.TOOLS,
-             *writes.TOOLS]
+             *writes.TOOLS, *archive.TOOLS]
     tier = ctx.settings.ews_capability_tier
     registry: Dict[str, ToolSpec] = {}
     for spec in specs:
