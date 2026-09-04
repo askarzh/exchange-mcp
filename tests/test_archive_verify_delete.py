@@ -45,7 +45,7 @@ def captured(db, tmp_path):
     store.replace_attachments("CAP-1", [
         {"name": "q3.pdf", "content_type": "application/pdf", "size": 8,
          "sha256": blob_sha, "is_inline": 0}])
-    store.mark_captured("CAP-1", mime_sha256=sha, mime_path=str(path))
+    store.mark_captured("CAP-1", mime_sha256=sha, mime_path=str(path), changekey="CK")
     return store, settings, sha, blob_sha
 
 
@@ -106,6 +106,53 @@ def test_a_vanished_item_is_a_failure_not_a_promotion(captured):
     assert store.get_message("CAP-1")["archive_state"] == "captured"
 
 
+def test_verify_never_promotes_when_no_changekey_was_captured(db, tmp_path):
+    """Row 8-1: the changekey check fails CLOSED — no `captured_changekey`
+    snapshot must reset, never silently promote, even if the live item looks
+    fine in every other respect."""
+    settings = make_settings(data_dir=str(tmp_path / "data"))
+    store = CacheStore(db)
+    store.upsert_messages([make_row("CAP-2", date_ts=NOW - 300 * DAY)])
+    sha, path = files.store_mime(settings.data_dir, b"RAW-MIME")
+    store.mark_captured("CAP-2", mime_sha256=sha, mime_path=str(path))  # no changekey
+    account = FakeAccount({"CAP-2": FakeItem("CAP-2", changekey="CK")})
+    result = asyncio.run(Verifier(settings, FakeGatewayFor(account), store).run())
+    assert result["verified"] == 0 and result["reset"] == 1
+    assert "changekey" in result["reasons"][0]["reason"]
+    assert store.get_message("CAP-2")["archive_state"] == "live"
+
+
+def test_verify_never_promotes_when_the_live_item_has_no_changekey(captured):
+    store, settings, _sha, _blob = captured
+    account = FakeAccount({"CAP-1": FakeItem("CAP-1", changekey=None)})
+    result = asyncio.run(Verifier(settings, FakeGatewayFor(account), store).run())
+    assert result["verified"] == 0 and result["reset"] == 1
+    assert "changekey" in result["reasons"][0]["reason"]
+    assert store.get_message("CAP-1")["archive_state"] == "live"
+
+
+def test_a_poisoned_row_fails_without_aborting_the_pass(captured):
+    store, settings, _sha, _blob = captured
+    # mime_sha256 that isn't a valid hex sha256 blows up files.mime_path.
+    with store.db.conn() as c:
+        c.execute("UPDATE ews.messages SET mime_sha256 = 'not-a-sha' "
+                  "WHERE ews_id = 'CAP-1'")
+    account = FakeAccount({"CAP-1": FakeItem("CAP-1")})
+    result = asyncio.run(Verifier(settings, FakeGatewayFor(account), store).run())
+    assert result["failed"] == 1 and result["verified"] == 0 and result["reset"] == 0
+    assert store.get_message("CAP-1")["archive_state"] == "captured"
+
+
+# --- policy -------------------------------------------------------------------
+
+
+def test_grace_days_is_floored_at_one():
+    policy = ArchivePolicy.from_settings(make_settings(archive_grace_days=0))
+    assert policy.grace_days == 1
+    policy = ArchivePolicy.from_settings(make_settings(archive_grace_days=-5))
+    assert policy.grace_days == 1
+
+
 # --- deleter ------------------------------------------------------------------
 
 
@@ -113,7 +160,8 @@ def _verified(store, settings, n=3, verified_age_days=30):
     store.upsert_messages([make_row(f"V{i}", date_ts=NOW - 300 * DAY)
                            for i in range(n)])
     for i in range(n):
-        store.mark_captured(f"V{i}", mime_sha256="a" * 64, mime_path="/x.eml")
+        store.mark_captured(f"V{i}", mime_sha256="a" * 64, mime_path="/x.eml",
+                            changekey="CK")
         store.mark_verified(f"V{i}")
     with store.db.conn() as c:
         c.execute("UPDATE ews.messages SET verified_at = now() - %s * interval '1 day' "
@@ -202,5 +250,23 @@ def test_one_failed_delete_does_not_mark_the_row(captured):
     result = asyncio.run(_deleter(store, settings, account,
                                   archive_delete_enabled=True).run(dry_run=False))
     assert result["deleted"] == 1 and result["failed"] == 1
+    assert store.get_message("V0")["archive_state"] == "verified"
+    assert store.get_message("V1")["archive_state"] == "deleted"
+
+
+def test_delete_skips_an_item_whose_changekey_moved_since_capture(captured):
+    """Rail check re-done right before deletion: a live changekey that no
+    longer matches the snapshot taken at capture means the item changed
+    after verification — it must never be deleted on a stale verification."""
+    store, settings, _s, _b = captured
+    _verified(store, settings, n=2)
+    items = {"V0": DeletableItem("V0", changekey="CK-MOVED"),
+             "V1": DeletableItem("V1")}
+    account = FakeAccount(items)
+    result = asyncio.run(_deleter(store, settings, account,
+                                  archive_delete_enabled=True).run(dry_run=False))
+    assert result["deleted"] == 1 and result["failed"] == 1
+    assert items["V0"].deleted is False
+    assert items["V1"].deleted is True
     assert store.get_message("V0")["archive_state"] == "verified"
     assert store.get_message("V1")["archive_state"] == "deleted"

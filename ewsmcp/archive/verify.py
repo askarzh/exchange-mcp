@@ -9,6 +9,13 @@ pass. A row the server no longer has (`ErrorItemNotFound` or similar on
 re-fetch) is a `failed` outcome, not a reset — it stays `captured` and is
 retried next cycle; only `apply_server_deletes` (driven by sync, not the
 verifier) may move a captured row to `deleted`.
+
+The changekey check fails CLOSED: a row with no `captured_changekey` snapshot
+(the capturer always writes one; only a corrupted row would lack it) or an
+item whose live changekey cannot be read is treated as unverifiable and
+reset, never silently promoted. A row that raises while being evaluated (a
+poisoned `mime_sha256`/`sha256` that isn't a valid hex sha, for instance) is
+counted `failed` rather than aborting the whole batch.
 """
 
 from __future__ import annotations
@@ -47,12 +54,32 @@ class Verifier:
                 result["failed"] += 1
                 logger.warning("verify could not re-fetch %s: %s", ews_id, item)
                 continue
-            reason = self._mismatch(row, item)
+            try:
+                reason = self._mismatch(row, item)
+            except Exception as exc:  # noqa: BLE001 - a poisoned row must not abort the pass
+                result["failed"] += 1
+                logger.warning("verify could not evaluate %s: %s: %s",
+                               ews_id, type(exc).__name__, exc)
+                continue
             if reason is None:
-                self.store.mark_verified(ews_id)
+                changed = self.store.mark_verified(ews_id)
+                if not changed:
+                    # Row moved out from under us (concurrent run, race with
+                    # delete) between the read and this write — this is not a
+                    # promotion that actually happened.
+                    result["failed"] += 1
+                    logger.warning(
+                        "verify: %s no longer captured when promoting", ews_id)
+                    continue
                 result["verified"] += 1
             else:
-                self.store.reset_to_live(ews_id)
+                changed = self.store.reset_to_live(ews_id)
+                if not changed:
+                    result["failed"] += 1
+                    logger.warning(
+                        "verify: %s no longer captured when resetting (%s)",
+                        ews_id, reason)
+                    continue
                 result["reset"] += 1
                 result["reasons"].append({"ews_id": ews_id, "reason": reason})
                 logger.warning("verify reset %s to live: %s", ews_id, reason)
@@ -60,12 +87,12 @@ class Verifier:
 
     def _mismatch(self, row: dict[str, Any], item: Any) -> str | None:
         live_ck = getattr(item, "changekey", None)
-        # Prefer the changekey snapshotted at capture time — `messages.changekey`
-        # is overwritten by the ordinary sync loop, so comparing against it
-        # would just compare the live item to itself. A legacy row with no
-        # snapshot falls back to the synced value.
-        captured_ck = row.get("captured_changekey") or row.get("changekey")
-        if captured_ck and live_ck and live_ck != captured_ck:
+        captured_ck = row.get("captured_changekey")
+        # Fails CLOSED: no snapshot, or an item that failed to report a
+        # changekey, means the check cannot be trusted — never promote.
+        if not captured_ck or not live_ck:
+            return "changekey unavailable (no captured snapshot or no live value)"
+        if live_ck != captured_ck:
             return (f"changekey changed since capture "
                     f"({captured_ck} → {live_ck})")
         path = files.mime_path(self.settings.data_dir, row["mime_sha256"] or "")

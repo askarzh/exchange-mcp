@@ -58,7 +58,11 @@ class ArchivePolicy:
                 c.strip().lower()
                 for c in (settings.archive_exclude_categories or "").split(",")
                 if c.strip()),
-            grace_days=int(settings.archive_grace_days),
+            # Floored at 1: a grace period of 0 (or negative, via a stray
+            # override) would let something just marked verified become
+            # immediately deletable — the whole point of the grace period is
+            # a minimum cooling-off window.
+            grace_days=max(1, int(settings.archive_grace_days)),
             delete_enabled=bool(settings.archive_delete_enabled),
             max_delete_per_run=int(settings.archive_max_delete_per_run),
             min_free_gb=float(settings.archive_min_free_gb),

@@ -496,7 +496,8 @@ class CacheStore:
         """Rail 3: verified, older than the cutoff, and verified long enough ago."""
         with self.db.conn() as c:
             return c.execute(
-                "SELECT ews_id, internet_message_id, mime_sha256, subject, date_iso "
+                "SELECT ews_id, internet_message_id, mime_sha256, subject, date_iso, "
+                "captured_changekey "
                 "FROM ews.messages WHERE archive_state = 'verified' "
                 "AND date_ts IS NOT NULL AND date_ts <= %s "
                 "AND verified_at IS NOT NULL AND verified_at <= to_timestamp(%s) "
