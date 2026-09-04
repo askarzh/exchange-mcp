@@ -126,7 +126,10 @@ class Deleter:
         ids = list(by_id)
         deleted_count = 0
         failed_count = 0
-        processed_upto = 0  # index into `ids`: how much we actually attempted
+        # How many of `ids` already have a verdict (deleted or failed).
+        # Usually an index into `ids`, but on an early stop it also counts the
+        # stopped chunk's disk-check failures, which ARE accounted for.
+        processed_upto = 0
         for start in range(0, len(ids), BATCH_SIZE):
             chunk = ids[start:start + BATCH_SIZE]
             # Last-mile rail: re-check the archive copy against disk for the
@@ -148,6 +151,12 @@ class Deleter:
                 result["error"] = f"{type(exc).__name__}: {exc}"
                 logger.error("archive delete batch failed, stopping run: %s",
                             result["error"])
+                # This chunk's disk-check failures were already counted in
+                # `failed`; only the ids we never attempted are `remaining`.
+                # Without this they would be counted twice and the
+                # deleted + failed + remaining == eligible invariant would
+                # break on exactly the path that is hardest to reason about.
+                processed_upto = start + len(unusable)
                 break
             processed_upto = start + len(chunk)
             for raw_id, reason in reasons.items():

@@ -468,3 +468,37 @@ def test_demote_to_captured_only_touches_verified_rows(captured):
     store, _settings, _s, _b = captured
     assert store.demote_to_captured("CAP-1") == 0  # already `captured`
     assert store.get_message("CAP-1")["archive_state"] == "captured"
+
+
+def test_the_invariant_holds_when_a_gateway_failure_follows_a_disk_failure(
+        captured, monkeypatch):
+    """The stopped chunk's disk-check failures are already counted in
+    `failed`; counting them again in `remaining` (by not advancing the
+    accounting past them) would double-count on exactly the path that is
+    hardest to reason about."""
+    store, settings, _s, _b = captured
+    monkeypatch.setattr(delete_module, "BATCH_SIZE", 3)
+    _verified(store, settings, n=3)
+    _mime_of(store, "V0", settings).unlink()          # one unusable copy
+
+    class Exploding:
+        def __init__(self):
+            self.calls = 0
+
+        async def call(self, fn):
+            self.calls += 1
+            raise RuntimeError("exchange exploded")
+
+    gateway = Exploding()
+    policy = ArchivePolicy.from_settings(make_settings(archive_delete_enabled=True))
+    deleter = Deleter(settings, gateway, store, policy, RecordingAudit())
+    result = asyncio.run(deleter.run(dry_run=False))
+
+    assert result["eligible"] == 3
+    assert result["deleted"] == 0
+    assert result["failed"] == 1                      # the unusable copy
+    assert result["remaining"] == 2                   # never attempted
+    assert "exchange exploded" in result["error"]
+    assert gateway.calls == 1
+    assert store.get_message("V0")["archive_state"] == "captured"
+    _assert_invariant(result)

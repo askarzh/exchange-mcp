@@ -7,6 +7,13 @@ import logging
 from .annotations import ANNOTATIONS as ANNOTATIONS
 from .audit import AuditLog, NullAudit
 from .cache import CacheStore
+
+# Eagerly, at module top: cache/__init__ exports SyncEngine lazily now
+# (the thin MCP must not load exchangelib), and resolving it inside
+# on_warm's swallowing try would turn an exchangelib drift into a
+# green boot that silently never syncs. ewsd owns Exchange, so this
+# import belongs here; the MCP never calls build_context.
+from .cache.sync import SyncEngine
 from .config import Settings
 from .db import Database
 from .gateway.client import EWSGateway
@@ -70,7 +77,6 @@ async def start_connection_manager(ctx: Context) -> None:
         # its own cycles degrade gracefully).
         if ctx.cache is not None and ctx.sync is None:
             try:
-                from .cache import SyncEngine
                 ctx.sync = SyncEngine(ctx.settings, ctx.gateway, ctx.cache)
                 await ctx.sync.start()
             except Exception as exc:  # noqa: BLE001 - sync is best-effort; cache stays stale
