@@ -30,6 +30,11 @@ def test_vector_extension_is_installed(db):
     assert row is not None
 
 
+def test_messages_carries_the_captured_changekey_column(db):
+    cols = _cols(db, "messages")
+    assert cols["captured_changekey"][0] == "text"
+
+
 def test_attachments_table_shape(db):
     cols = _cols(db, "attachments")
     assert set(cols) == {"id", "message_ews_id", "name", "content_type", "size",

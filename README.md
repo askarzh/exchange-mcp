@@ -167,7 +167,7 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `EWS_TZ` | `Asia/Riyadh` | Server timezone for date grammar + display |
 | `GEMINI_API_KEY` | — | Daemon-only; `ewsmcp` must never hold it. Semantic search stays keyword-only (`semantic_enabled()` is `False`) until this is set |
 | `EMBED_DIMS` | `768` | Fixed by migration 003's `vector(768)` column; any other value fails to boot |
-| `ARCHIVE_FOLDERS` | `inbox,sent` | Well-known folder keys the archive pipeline captures; never calendar/contacts/tasks |
+| `ARCHIVE_FOLDERS` | `inbox,sent` | Well-known folder keys the archive pipeline captures; never calendar/contacts/tasks. Fail-closed: set to empty and the pipeline captures NOTHING, not every folder |
 | `ARCHIVE_AFTER_DAYS` | `180` | Age cutoff (days) before a message becomes eligible for archival |
 | `ARCHIVE_EXCLUDE_CATEGORIES` | — | Comma-separated categories excluded from archival |
 | `ARCHIVE_GRACE_DAYS` | `7` | Extra days past the cutoff a `verified` row must age before it is eligible for deletion |

@@ -454,13 +454,14 @@ class CacheStore:
                 f"WHERE {self._CANDIDATE_WHERE}", params).fetchone()["n"])
 
     def mark_captured(self, ews_id: str, *, mime_sha256: str,
-                      mime_path: str) -> int:
+                      mime_path: str, changekey: str | None = None) -> int:
         with self.db.conn() as c:
             cur = c.execute(
                 "UPDATE ews.messages SET archive_state = 'captured', "
-                "archived_at = now(), mime_sha256 = %s, mime_path = %s "
+                "archived_at = now(), mime_sha256 = %s, mime_path = %s, "
+                "captured_changekey = %s "
                 "WHERE ews_id = %s AND archive_state = 'live'",
-                (mime_sha256, mime_path, ews_id))
+                (mime_sha256, mime_path, changekey, ews_id))
         return cur.rowcount
 
     def captured_rows(self, limit: int) -> list[dict[str, Any]]:
@@ -482,7 +483,8 @@ class CacheStore:
         with self.db.conn() as c:
             cur = c.execute(
                 "UPDATE ews.messages SET archive_state = 'live', archived_at = NULL, "
-                "verified_at = NULL, mime_sha256 = NULL, mime_path = NULL "
+                "verified_at = NULL, mime_sha256 = NULL, mime_path = NULL, "
+                "captured_changekey = NULL "
                 "WHERE ews_id = %s AND archive_state = 'captured'", (ews_id,))
             if cur.rowcount:
                 c.execute("DELETE FROM ews.attachments WHERE message_ews_id = %s",

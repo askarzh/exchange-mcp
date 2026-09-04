@@ -5,6 +5,12 @@ carries nested ItemAttachments that have no standalone bytes. Attachment blobs
 are stored SEPARATELY as well, deduplicated by hash, so `get_attachment` on
 archived mail costs one file read instead of a MIME parse.
 
+The `attachments` projection returns Attachment objects (id, name, metadata)
+but NOT file bytes: each `FileAttachment.content` access below is its own
+GetAttachment round-trip to EWS. A batch of 25 messages with several
+attachments each is therefore several times that many EWS calls, not one —
+worth remembering before raising BATCH_SIZE.
+
 Failure posture: one bad item is logged and skipped (its row stays `live` and
 is retried next cycle); a full disk stops the whole run before any fetch.
 """
@@ -14,13 +20,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from exchangelib.attachments import FileAttachment
+
 from . import files
 from .policy import ArchivePolicy
 
 logger = logging.getLogger(__name__)
 
 # Never fetch the full item: without a projection exchangelib pulls every
-# field, and `attachments` alone already carries the bytes we want.
+# field. `attachments` here is the metadata list (see module docstring) and
+# `changekey` is recorded so the verifier can detect a post-capture edit.
 CAPTURE_FIELDS = ["mime_content", "changekey", "attachments", "has_attachments"]
 BATCH_SIZE = 25
 
@@ -64,7 +73,10 @@ class Capturer:
         captured = failed = 0
         fetched = account.fetch(ids=[(i, None) for i in ids],
                                 only_fields=CAPTURE_FIELDS)
-        for raw_id, item in zip(ids, fetched):
+        # zip(strict=True): a `fetched` shorter than `ids` (a malformed
+        # double, or exchangelib silently dropping a bogus id) must not
+        # silently skip the tail — every id gets a captured/failed verdict.
+        for raw_id, item in zip(ids, fetched, strict=True):
             try:
                 if isinstance(item, Exception):
                     raise item
@@ -86,13 +98,10 @@ class Capturer:
         for att in list(getattr(item, "attachments", None) or []):
             name = getattr(att, "name", None) or "attachment"
             inline = 1 if getattr(att, "is_inline", False) else 0
-            # A FileAttachment always carries its bytes on `.content`; an
-            # ItemAttachment (a nested message) never does. isinstance()
-            # against the real exchangelib class would also work in
-            # production but excludes any FileAttachment-shaped double in
-            # tests, so key off the shape instead.
-            if hasattr(att, "content"):
-                content = getattr(att, "content", None)
+            if isinstance(att, FileAttachment):
+                # `.content` is a lazy property: with an attachment_id it is
+                # its own GetAttachment round-trip (see module docstring).
+                content = att.content
                 if not isinstance(content, (bytes, bytearray)):
                     raise ValueError(f"attachment {name!r} of {raw_id} has no bytes")
                 blob_sha, _blob_path = files.store_blob(data_dir, bytes(content))
@@ -113,9 +122,18 @@ class Capturer:
         # own. The mime/blob bytes already written are harmless: they are
         # content-addressed and deduplicated, so nothing is left dangling in
         # a way that costs space or corrupts another row.
-        changed = self.store.mark_captured(raw_id, mime_sha256=sha, mime_path=str(path))
+        changekey = getattr(item, "changekey", None)
+        changed = self.store.mark_captured(raw_id, mime_sha256=sha, mime_path=str(path),
+                                           changekey=changekey)
         if not changed:
             raise RuntimeError(
                 f"{raw_id} was no longer live when capture finished (state "
                 "changed underneath) — skipped")
-        self.store.replace_attachments(raw_id, rows)
+        try:
+            self.store.replace_attachments(raw_id, rows)
+        except Exception:
+            # The row is already flipped to `captured` with no attachment
+            # inventory — undo that so it is retried whole next cycle rather
+            # than stranded `captured` with nothing to show for it.
+            self.store.reset_to_live(raw_id)
+            raise

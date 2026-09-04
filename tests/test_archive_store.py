@@ -61,10 +61,12 @@ def test_candidates_across_all_folders_when_folder_ids_is_none(store_with_messag
 def test_capture_verify_delete_state_machine(store_with_message):
     store, ews_id = store_with_message
     assert store.mark_captured(ews_id, mime_sha256="b" * 64,
-                               mime_path="/data/mime/b.eml") == 1
+                               mime_path="/data/mime/b.eml",
+                               changekey="CK-CAPTURED") == 1
     row = store.get_message(ews_id)
     assert row["archive_state"] == "captured" and row["mime_sha256"] == "b" * 64
     assert row["archived_at"] is not None
+    assert row["captured_changekey"] == "CK-CAPTURED"
     assert [r["ews_id"] for r in store.captured_rows(10)] == [ews_id]
 
     assert store.mark_verified(ews_id) == 1
@@ -80,12 +82,14 @@ def test_capture_verify_delete_state_machine(store_with_message):
 
 def test_reset_to_live_clears_the_capture_fields(store_with_message):
     store, ews_id = store_with_message
-    store.mark_captured(ews_id, mime_sha256="c" * 64, mime_path="/x.eml")
+    store.mark_captured(ews_id, mime_sha256="c" * 64, mime_path="/x.eml",
+                        changekey="CK-1")
     assert store.reset_to_live(ews_id) == 1
     row = store.get_message(ews_id)
     assert row["archive_state"] == "live"
     assert row["mime_sha256"] is None and row["mime_path"] is None
     assert row["archived_at"] is None
+    assert row["captured_changekey"] is None
 
 
 def test_state_transitions_are_guarded_by_the_current_archive_state(store_with_message):

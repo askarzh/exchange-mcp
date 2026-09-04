@@ -2,10 +2,10 @@
 
 import asyncio
 import time
-from types import SimpleNamespace
 
 import pytest
 from conftest import make_row, make_settings
+from exchangelib.attachments import FileAttachment, ItemAttachment
 
 from ewsmcp.archive import files
 from ewsmcp.archive.capture import CAPTURE_FIELDS, Capturer
@@ -16,16 +16,14 @@ NOW = int(time.time())
 DAY = 86400
 
 
-class FakeAttachment:
-    """Stands in for exchangelib.FileAttachment."""
-
-    def __init__(self, name, content, content_type="application/pdf",
-                 is_inline=False):
-        self.name = name
-        self.content = content
-        self.content_type = content_type
-        self.size = len(content)
-        self.is_inline = is_inline
+def _file_attachment(name, content, content_type="application/pdf",
+                     is_inline=False):
+    """A REAL exchangelib.FileAttachment, constructed without an account:
+    `attachment_id` stays None, so `.content` returns the local `_content`
+    it was built with instead of round-tripping to EWS (see
+    FileAttachment.content in exchangelib.attachments)."""
+    return FileAttachment(name=name, content=content, content_type=content_type,
+                          is_inline=is_inline)
 
 
 class FakeItem:
@@ -118,6 +116,15 @@ def test_folder_ids_resolve_through_the_folders_table(seeded):
     assert _policy(settings).folder_ids(store) == ["FID-INBOX"]
 
 
+def test_empty_archive_folders_selects_nothing_fail_closed(seeded):
+    """An explicitly blanked-out ARCHIVE_FOLDERS must never widen a run to
+    every mirrored folder — it selects nothing."""
+    store, _settings = seeded
+    policy = ArchivePolicy.from_settings(make_settings(archive_folders=""))
+    assert policy.folders == ()
+    assert policy.folder_ids(store) == []
+
+
 # --- capture ------------------------------------------------------------------
 
 
@@ -137,7 +144,7 @@ def test_capture_writes_mime_blobs_and_rows(seeded):
     pdf = b"%PDF-1.4 quarterly"
     account = FakeAccount({
         "OLD-1": FakeItem("OLD-1", mime=b"RAW-MIME-1",
-                          attachments=[FakeAttachment("q3.pdf", pdf)]),
+                          attachments=[_file_attachment("q3.pdf", pdf)]),
         "OLD-2": FakeItem("OLD-2", mime=b"RAW-MIME-2"),
     })
     cap = Capturer(settings, FakeGatewayFor(account), store, _policy(settings))
@@ -166,7 +173,7 @@ def test_capture_projects_only_the_fields_it_needs(seeded):
 
 def test_item_attachments_are_recorded_without_a_blob(seeded):
     store, settings = seeded
-    nested = SimpleNamespace(name="Fwd: contract", is_inline=False, size=900)
+    nested = ItemAttachment(name="Fwd: contract", is_inline=False, size=900)
     account = FakeAccount({
         "OLD-1": FakeItem("OLD-1", attachments=[nested]),
         "OLD-2": FakeItem("OLD-2"),
@@ -195,7 +202,7 @@ def test_one_bad_item_is_skipped_not_fatal(seeded):
 def test_capture_is_idempotent(seeded):
     store, settings = seeded
     account = FakeAccount({
-        "OLD-1": FakeItem("OLD-1", attachments=[FakeAttachment("a.pdf", b"AAA")]),
+        "OLD-1": FakeItem("OLD-1", attachments=[_file_attachment("a.pdf", b"AAA")]),
         "OLD-2": FakeItem("OLD-2"),
     })
     cap = Capturer(settings, FakeGatewayFor(account), store, _policy(settings))
@@ -203,6 +210,47 @@ def test_capture_is_idempotent(seeded):
     store.reset_to_live("OLD-1")
     asyncio.run(cap.run(dry_run=False))
     assert len(store.attachments_for("OLD-1")) == 1
+
+
+class _FlakyAttachmentsStore:
+    """Delegates to a real CacheStore, but `replace_attachments` raises once.
+    Stands in for a DB hiccup (or a constraint violation) landing AFTER
+    `mark_captured` already flipped the row."""
+
+    def __init__(self, store, fail_ews_id):
+        self._store = store
+        self._fail_ews_id = fail_ews_id
+        self._raised = False
+
+    def replace_attachments(self, ews_id, rows):
+        if ews_id == self._fail_ews_id and not self._raised:
+            self._raised = True
+            raise RuntimeError("db hiccup")
+        return self._store.replace_attachments(ews_id, rows)
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+
+def test_a_failure_after_mark_captured_does_not_strand_the_row(seeded):
+    """If replace_attachments raises after mark_captured already flipped the
+    row to `captured`, the row must not be left `captured` with no
+    attachment inventory — it is reset to `live` so the whole item is
+    retried whole next cycle."""
+    store, settings = seeded
+    flaky = _FlakyAttachmentsStore(store, fail_ews_id="OLD-1")
+    account = FakeAccount({
+        "OLD-1": FakeItem("OLD-1", attachments=[_file_attachment("a.pdf", b"AAA")]),
+        "OLD-2": FakeItem("OLD-2"),
+    })
+    result = asyncio.run(Capturer(settings, FakeGatewayFor(account), flaky,
+                                  _policy(settings)).run(dry_run=False))
+    assert result["captured"] == 1 and result["failed"] == 1
+    row = store.get_message("OLD-1")
+    assert row["archive_state"] == "live"
+    assert row["mime_sha256"] is None and row["mime_path"] is None
+    assert store.attachments_for("OLD-1") == []
+    assert store.get_message("OLD-2")["archive_state"] == "captured"
 
 
 def test_low_disk_stops_the_run_before_fetching(seeded, monkeypatch):

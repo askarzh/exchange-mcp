@@ -9,7 +9,7 @@ apply one policy and half another.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from ..dates import parse_when
@@ -67,7 +67,6 @@ class ArchivePolicy:
     def with_overrides(self, *, before: str | None = None,
                        folders: list[str] | None = None,
                        tz: str = "UTC") -> "ArchivePolicy":
-        from dataclasses import replace
         changes: dict[str, Any] = {}
         if folders:
             changes["folders"] = _normalise(folders)
@@ -95,11 +94,14 @@ class ArchivePolicy:
 
     # ------------------------------------------------------------- folders
 
-    def folder_ids(self, store: Any) -> list[str] | None:
-        """None means 'every mirrored folder' (no ARCHIVE_FOLDERS configured)."""
-        if not self.folders:
-            return None
-        return store.folder_ids_for_wk(list(self.folders))
+    def folder_ids(self, store: Any) -> list[str]:
+        """Fail-closed: an EMPTY ``folders`` (ARCHIVE_FOLDERS explicitly set to
+        "", or overridden to an empty list) selects NOTHING — never every
+        folder. `CacheStore.archive_candidates` distinguishes `[]` ("no
+        folder") from `None` ("every folder"); the policy never returns
+        `None` here, so a misconfigured/blanked-out ARCHIVE_FOLDERS cannot
+        silently widen a run to the whole mailbox."""
+        return store.folder_ids_for_wk(list(self.folders)) if self.folders else []
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

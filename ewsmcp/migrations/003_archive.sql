@@ -9,6 +9,10 @@
 -- `vector(768)` / `<=>` reference below fails with "type does not exist".
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 
+-- changekey observed by the capture fetch; the verifier compares it, sync
+-- never overwrites it.
+ALTER TABLE ews.messages ADD COLUMN captured_changekey text;
+
 CREATE TABLE ews.attachments (
     id             bigserial PRIMARY KEY,
     message_ews_id text NOT NULL REFERENCES ews.messages(ews_id) ON DELETE CASCADE,
