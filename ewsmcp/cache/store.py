@@ -33,6 +33,13 @@ _ARCHIVED = {"any": "TRUE", "only": "m.archive_state <> 'live'",
              "exclude": "m.archive_state = 'live'"}
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
+
+def _vector_literal(values: Any) -> str:
+    """pgvector's text input format: '[0.1,0.2,…]'. psycopg casts it with ::vector."""
+    if values is None:
+        return "[]"
+    return "[" + ",".join(f"{float(v):.7g}" for v in values) + "]"
+
 # Well-known folder ids resolved in SQL, so no Python-side lookup is needed
 # and a missing folders row degrades to "matches nothing" rather than an error.
 _INBOX_ID = "(SELECT ews_id FROM ews.folders WHERE wk = 'f:inbox' LIMIT 1)"
@@ -609,3 +616,65 @@ class CacheStore:
             return c.execute(
                 "SELECT * FROM ews.archive_runs ORDER BY started_at DESC, id DESC "
                 "LIMIT %s", (int(limit),)).fetchall()
+
+    # -------------------------------------------------------------- chunks
+
+    def unembedded_messages(self, limit: int) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT ews_id, subject, body_clean FROM ews.messages "
+                "WHERE embedded_at IS NULL ORDER BY date_ts DESC NULLS LAST "
+                "LIMIT %s", (int(limit),)).fetchall()
+
+    def replace_chunks(self, ews_id: str, chunks: list[dict[str, Any]]) -> None:
+        """Rewrite one message's chunks. `embedding` is a list[float]."""
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.chunks WHERE message_ews_id = %s", (ews_id,))
+            if chunks:
+                c.cursor().executemany(
+                    "INSERT INTO ews.chunks (message_ews_id, seq, source, text, "
+                    "embedding) VALUES (%(message_ews_id)s, %(seq)s, %(source)s, "
+                    "%(text)s, %(embedding)s::vector)",
+                    [{"message_ews_id": ews_id, "seq": int(ch["seq"]),
+                      "source": ch.get("source", "body"), "text": ch["text"],
+                      "embedding": _vector_literal(ch.get("embedding"))}
+                     for ch in chunks])
+
+    def mark_embedded(self, ews_ids: list[str]) -> None:
+        if not ews_ids:
+            return
+        with self.db.conn() as c:
+            c.execute("UPDATE ews.messages SET embedded_at = now() "
+                      "WHERE ews_id = ANY(%s)", (list(ews_ids),))
+
+    def embedding_backlog(self) -> int:
+        with self.db.conn() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM ews.messages "
+                                 "WHERE embedded_at IS NULL").fetchone()["n"])
+
+    def embedded_count(self) -> int:
+        with self.db.conn() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM ews.messages "
+                                 "WHERE embedded_at IS NOT NULL").fetchone()["n"])
+
+    def similar_message_ids(self, embedding: list[float], *, limit: int,
+                            archived: str = "any",
+                            exclude_ews_id: str | None = None
+                            ) -> list[tuple[str, float]]:
+        """Nearest messages by cosine distance, MIN over each message's chunks."""
+        clause = _ARCHIVED.get(archived, "TRUE")
+        params: list[Any] = [_vector_literal(embedding)]
+        extra = ""
+        if exclude_ews_id:
+            extra = "AND c.message_ews_id <> %s "
+            params.append(exclude_ews_id)
+        params.append(int(limit))
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT c.message_ews_id AS ews_id, "
+                "MIN(c.embedding <=> %s::vector) AS dist "
+                "FROM ews.chunks c JOIN ews.messages m ON m.ews_id = c.message_ews_id "
+                f"WHERE c.embedding IS NOT NULL AND {clause} {extra}"
+                "GROUP BY c.message_ews_id ORDER BY dist ASC LIMIT %s",
+                params).fetchall()
+        return [(r["ews_id"], float(r["dist"])) for r in rows]
