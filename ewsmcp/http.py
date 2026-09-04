@@ -5,11 +5,12 @@ the only module that speaks MCP over Streamable HTTP."""
 import hmac
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import jsonschema
 
-from . import __version__, uploads
+from . import __version__, downloads, uploads
 from .errors import HTTP_BY_CODE
 from .server import start_connection_manager
 from .tools.base import dispatch, validator_for
@@ -18,6 +19,7 @@ from .tools.calendar_people import _get_server_status
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1_048_576  # 1 MiB — tool arguments, not attachments
+_DOWNLOAD_CHUNK = 1024 * 1024  # stream files in 1 MiB chunks, not whole into memory
 
 
 def _authorized(headers, api_key: str) -> bool:
@@ -194,6 +196,37 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
                 return await _send_json(send, 404, {"ok": False, "error": {
                     "code": "not_found", "message": "not found"}})
             return await _send_json(send, 200, {"ok": True, **out})
+
+        # Capability-URL download: GET /download/<token>. Same model as
+        # /upload — deliberately ahead of the bearer gate, single use, and
+        # every failure is an identical opaque 404. The file is streamed in
+        # chunks rather than read whole into memory, since blobs may be
+        # tens of MB.
+        if path.startswith("/download/") and method == "GET":
+            token = path[len("/download/"):]
+            try:
+                rec = downloads.redeem(settings.data_dir, token)
+                file_path = Path(rec["path"])
+                size = file_path.stat().st_size
+            except (downloads.DownloadRejected, OSError):
+                return await _send_json(send, 404, {"ok": False, "error": {
+                    "code": "not_found", "message": "not found"}})
+            disposition = f'attachment; filename="{rec["name"]}"'.encode()
+            await send({"type": "http.response.start", "status": 200, "headers": [
+                [b"content-type", rec["content_type"].encode()],
+                [b"content-length", str(size).encode()],
+                [b"content-disposition", disposition],
+            ]})
+            with file_path.open("rb") as fh:
+                chunk = fh.read(_DOWNLOAD_CHUNK)
+                while True:
+                    nxt = fh.read(_DOWNLOAD_CHUNK)
+                    await send({"type": "http.response.body", "body": chunk,
+                                "more_body": bool(nxt)})
+                    if not nxt:
+                        break
+                    chunk = nxt
+            return None
 
         if key and not _authorized(scope.get("headers"), key):
             return await _send_json(send, 401, {"ok": False, "error": {

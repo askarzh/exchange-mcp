@@ -27,6 +27,27 @@ def _drive(app, path, method="GET", body=None, headers=()):
     return status, json.loads(raw or b"{}")
 
 
+def _drive_raw(app, path, method="GET", headers=()):
+    """Like _drive but returns (status, headers, raw bytes) — the download
+    route answers with file bytes, not JSON."""
+    scope = {"type": "http", "path": path, "method": method,
+             "headers": [(k.encode(), v.encode()) for k, v in headers]}
+    msgs = [{"type": "http.request", "body": b"", "more_body": False}]
+    sent = []
+
+    async def receive():
+        return msgs.pop(0)
+
+    async def send(m):
+        sent.append(m)
+
+    asyncio.run(app(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    raw = b"".join(m.get("body", b"") for m in sent
+                   if m["type"] == "http.response.body")
+    return start["status"], [tuple(h) for h in start["headers"]], raw
+
+
 AUTH = [("authorization", "Bearer k")]
 
 
@@ -77,3 +98,31 @@ def test_no_mcp_route_on_daemon(db):
     ctx = make_context(db, ewsd_api_key="k")
     app = build_daemon_app(ctx, ctx.settings)
     assert _drive(app, "/mcp", "POST", {}, headers=AUTH)[0] == 404
+
+
+def test_download_route_serves_the_file_ahead_of_the_bearer_gate(db, tmp_path):
+    from pathlib import Path
+
+    from ewsmcp import downloads
+
+    ctx = make_context(db, ewsd_api_key="k")
+    mime = Path(ctx.settings.data_dir) / "mime"
+    mime.mkdir(parents=True, exist_ok=True)
+    (mime / "m.eml").write_bytes(b"RAW-MIME")
+    token = downloads.mint(ctx.settings.data_dir, path=str(mime / "m.eml"),
+                           name="m.eml", content_type="message/rfc822")["token"]
+    app = build_daemon_app(ctx, ctx.settings)
+    status, headers, body = _drive_raw(app, f"/download/{token}")   # NO bearer
+    assert status == 200 and body == b"RAW-MIME"
+    assert (b"content-type", b"message/rfc822") in headers
+    assert any(b"attachment" in v for k, v in headers
+               if k == b"content-disposition")
+    # single use
+    assert _drive_raw(app, f"/download/{token}")[0] == 404
+
+
+def test_unknown_download_tokens_are_an_opaque_404(db):
+    ctx = make_context(db, ewsd_api_key="k")
+    app = build_daemon_app(ctx, ctx.settings)
+    assert _drive_raw(app, "/download/" + "0" * 64)[0] == 404
+    assert _drive_raw(app, "/download/nonsense")[0] == 404
