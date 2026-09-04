@@ -246,3 +246,46 @@ def test_validation_rejects_unknown_arguments_before_forwarding(db):
     res = _run(ctx, "create_draft", subject="hi", nonsense=1)
     assert res["ok"] is False and res["error"]["code"] == "validation"
     assert daemon.calls == []
+
+
+def test_archive_status_is_answered_locally_with_the_daemon_down(db):
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    ctx.cache.mark_captured("RAW-1", mime_sha256="a" * 64, mime_path="/x.eml")
+    res = _run(ctx, "archive_status")
+    assert res["ok"] is True
+    assert res["states"]["captured"] == 1
+    assert "archive_status" in LOCAL_TOOLS
+
+
+def test_the_mcp_never_holds_the_gemini_key(db):
+    """find_similar and mode=semantic are FORWARDED: only ewsd embeds."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon, ews_capability_tier="full")
+    _seed(ctx)
+    assert "find_similar" not in LOCAL_TOOLS
+
+    res = _run(ctx, "find_similar", text="budget")
+    assert res["proxied"] == "find_similar"
+
+    res = _run(ctx, "search_messages", query="budget", mode="semantic")
+    assert res["proxied"] == "search_messages"
+    assert daemon.calls[-1][1]["mode"] == "semantic"
+
+
+def test_keyword_search_stays_local_and_honours_archived(db):
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    ctx.cache.mark_captured("RAW-1", mime_sha256="a" * 64, mime_path="/x.eml")
+    res = _run(ctx, "search_messages", query="budget", archived="only")
+    assert res["source"] == "cache"
+    assert [i["archive_state"] for i in res["items"]] == ["captured"]
+    assert daemon.calls == []
+
+
+def test_archive_run_and_get_raw_message_proxy_to_the_daemon(db):
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon, ews_capability_tier="full")
+    assert _run(ctx, "archive_run", dry_run=True)["proxied"] == "archive_run"
+    assert _run(ctx, "get_raw_message", id="RAW-1")["proxied"] == "get_raw_message"

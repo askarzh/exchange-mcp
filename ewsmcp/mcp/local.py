@@ -201,6 +201,22 @@ async def waiting_on(ctx: Context, **kw) -> dict[str, Any]:
                          hint="Check DATABASE_URL.", retry_after_s=15) from exc
 
 
+async def archive_status(ctx: Context, **kw) -> dict[str, Any]:
+    """Every number archive_status reports lives in Postgres (plus a cheap
+    filesystem stat for blob_store_bytes/free_gb), so the MCP can answer it
+    while ewsd is down — which is exactly when you want to ask. The import
+    is deliberately inside the function: tools/archive.py pulls in
+    ewsmcp.archive.files, and keeping the MCP's module graph free of the
+    archive package at import time keeps test_no_lazy_imports honest about
+    what the MCP touches (it imports no exchangelib either way)."""
+    from ..tools.archive import _archive_status
+    try:
+        return await _archive_status(ctx)
+    except (psycopg.Error, RuntimeError) as exc:
+        raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
+                         hint="Check DATABASE_URL.", retry_after_s=15) from exc
+
+
 async def get_server_status(ctx: Context, **kw) -> dict[str, Any]:
     cache_block: dict[str, Any] = {"ready": ctx.cache is not None}
     try:
@@ -225,4 +241,5 @@ HANDLERS = {
     "get_message": get_message, "get_thread": get_thread,
     "get_mailbox_overview": get_mailbox_overview, "list_tasks": list_tasks,
     "waiting_on": waiting_on, "get_server_status": get_server_status,
+    "archive_status": archive_status,
 }
