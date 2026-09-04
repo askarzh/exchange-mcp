@@ -104,13 +104,16 @@ def test_status_answers_cold(db):
 
 
 class _StatusRunner:
-    """A fake ArchiveRunner exposing only .status() — status/metrics never
-    call run_once."""
+    """A fake ArchiveRunner exposing only .status()/.disk_stats() —
+    status/metrics never call run_once."""
 
     def status(self):
         return {"running": True, "cycles": 4, "cycle_seconds": 300,
                 "last_cycle_age_s": 12, "last_run_id": 7,
                 "last_error": "boom: disk full", "delete_enabled": False}
+
+    async def disk_stats(self):
+        return {"blob_store_bytes": 4096, "free_gb": 12.5}
 
 
 def test_status_route_includes_the_archive_block(db):
@@ -127,6 +130,28 @@ def test_status_route_includes_the_archive_block(db):
     assert archive["state_counts"] == {"live": 1, "captured": 1, "verified": 0,
                                        "deleted": 0}
     assert archive["embedding_backlog"] == 2
+    # blob_store_bytes/free_gb come from THIS process's DATA_DIR (ewsd's own)
+    # via ArchiveRunner.disk_stats() — never computed by the MCP.
+    assert archive["blob_store_bytes"] == 4096
+    assert archive["free_gb"] == 12.5
+
+
+def test_status_route_omits_disk_stats_when_the_runner_lacks_them(db):
+    """A runner stub without disk_stats() (older/fake) must not crash the
+    status route — the archive block simply lacks blob_store_bytes/free_gb."""
+    class _RunnerNoDisk:
+        def status(self):
+            return {"running": True, "cycles": 1, "cycle_seconds": 300,
+                    "last_cycle_age_s": None, "last_run_id": None,
+                    "last_error": None, "delete_enabled": False}
+
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _RunnerNoDisk()
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, "/v1/status", headers=AUTH)
+    assert status == 200
+    assert "blob_store_bytes" not in body["archive"]
+    assert "free_gb" not in body["archive"]
 
 
 def test_metrics_route_includes_the_archive_gauges(db):

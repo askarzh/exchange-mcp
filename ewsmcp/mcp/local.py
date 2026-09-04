@@ -201,20 +201,43 @@ async def waiting_on(ctx: Context, **kw) -> dict[str, Any]:
                          hint="Check DATABASE_URL.", retry_after_s=15) from exc
 
 
+_ARCHIVE_RUNNER_KEYS_TO_DROP = ("state_counts", "embedding_backlog",
+                               "blob_store_bytes", "free_gb")
+
+
 async def archive_status(ctx: Context, **kw) -> dict[str, Any]:
-    """Every number archive_status reports lives in Postgres (plus a cheap
-    filesystem stat for blob_store_bytes/free_gb), so the MCP can answer it
-    while ewsd is down — which is exactly when you want to ask. The import
-    is deliberately inside the function: tools/archive.py pulls in
+    """Every number in the core body lives in Postgres, so the MCP answers
+    it locally even while ewsd is down — which is exactly when you want to
+    ask. `blob_store_bytes`/`free_gb` are NOT computed here: they live under
+    ewsd's DATA_DIR, which may not even be the same disk as the MCP's own
+    container, so this handler never touches its own filesystem. When ewsd
+    is reachable those two numbers (and its runner block) are copied
+    verbatim out of its `GET /v1/status` `archive` block; when ewsd is down
+    they are simply omitted, with `disk_stats` noting why. The import is
+    deliberately inside the function: tools/archive.py pulls in
     ewsmcp.archive.files, and keeping the MCP's module graph free of the
     archive package at import time keeps test_no_lazy_imports honest about
     what the MCP touches (it imports no exchangelib either way)."""
-    from ..tools.archive import _archive_status
+    from ..tools.archive import _archive_status_core
     try:
-        return await _archive_status(ctx)
+        out = await _archive_status_core(ctx)
     except (psycopg.Error, RuntimeError) as exc:
         raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
                          hint="Check DATABASE_URL.", retry_after_s=15) from exc
+    try:
+        status = await ctx.daemon.status()
+    except ToolError:
+        out["disk_stats"] = "unavailable — ewsd unreachable"
+        return out
+    archive_block = status.get("archive") or {}
+    for key in ("blob_store_bytes", "free_gb"):
+        if key in archive_block:
+            out[key] = archive_block[key]
+    runner_keys = {k: v for k, v in archive_block.items()
+                   if k not in _ARCHIVE_RUNNER_KEYS_TO_DROP}
+    if runner_keys:
+        out["runner"] = runner_keys
+    return out
 
 
 async def get_server_status(ctx: Context, **kw) -> dict[str, Any]:

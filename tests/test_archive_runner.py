@@ -195,3 +195,32 @@ def test_start_run_failure_does_not_kill_the_background_loop(tmp_path, db):
     assert calls["n"] >= 1
     assert runner.cycles >= 1
     assert runner.last_error is not None and "db is on fire" in runner.last_error
+
+
+def test_disk_stats_reports_this_process_own_data_dir_and_is_cached(tmp_path, db):
+    """ArchiveRunner.disk_stats() is the ONLY place blob_store_bytes/free_gb
+    are computed on the daemon side of the status/metrics path — cached for
+    ~60s so a status poller never re-walks the blob store on every call."""
+    from ewsmcp.archive import files
+
+    runner, _ = _runner(db, tmp_path)
+    files.store_blob(runner.settings.data_dir, b"x" * 250)
+
+    first = asyncio.run(runner.disk_stats())
+    assert first["blob_store_bytes"] == 250
+    assert isinstance(first["free_gb"], float)
+
+    calls = {"n": 0}
+    orig = files.blob_store_bytes
+
+    def counting(data_dir):
+        calls["n"] += 1
+        return orig(data_dir)
+
+    files.blob_store_bytes = counting
+    try:
+        second = asyncio.run(runner.disk_stats())
+    finally:
+        files.blob_store_bytes = orig
+    assert second == first
+    assert calls["n"] == 0  # served from the 60s cache, not recomputed

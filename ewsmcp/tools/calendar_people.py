@@ -466,6 +466,12 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
     }
     if ctx.archive is not None:
         archive_block = dict(ctx.archive.status())
+        disk_stats = getattr(ctx.archive, "disk_stats", None)
+        if disk_stats is not None:
+            try:
+                archive_block.update(await disk_stats())
+            except Exception as exc:
+                archive_block["error"] = str(exc)
         if ctx.cache is not None:
             try:
                 archive_block["state_counts"] = ctx.cache.archive_state_counts()

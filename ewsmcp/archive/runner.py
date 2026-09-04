@@ -22,6 +22,7 @@ import logging
 import time
 from typing import Any
 
+from . import files
 from .capture import Capturer
 from .delete import Deleter
 from .embed import EmbedWorker
@@ -49,6 +50,8 @@ class ArchiveRunner:
         self._task: asyncio.Task | None = None
         self._stopped = False
         self._lock = asyncio.Lock()
+        self._disk_cache: dict[str, Any] | None = None
+        self._disk_cache_ts: float = 0.0
 
     # ------------------------------------------------------------ one pass
 
@@ -188,3 +191,20 @@ class ArchiveRunner:
             "last_error": self.last_error,
             "delete_enabled": bool(self.settings.archive_delete_enabled),
         }
+
+    _DISK_STATS_TTL_S = 60
+
+    async def disk_stats(self) -> dict[str, Any]:
+        """Blob-store size and free space under THIS process's DATA_DIR —
+        only ewsd calls this (the MCP never touches its own filesystem for
+        archive_status). Cached for ~60s so a status/metrics poller never
+        pays for a directory walk plus statvfs on every request."""
+        now = time.time()
+        if self._disk_cache is not None and now - self._disk_cache_ts < self._DISK_STATS_TTL_S:
+            return self._disk_cache
+        data_dir = self.settings.data_dir
+        blob_bytes = await asyncio.to_thread(files.blob_store_bytes, data_dir)
+        free = await asyncio.to_thread(files.free_gb, data_dir)
+        self._disk_cache = {"blob_store_bytes": blob_bytes, "free_gb": round(free, 2)}
+        self._disk_cache_ts = now
+        return self._disk_cache

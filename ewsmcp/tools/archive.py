@@ -122,7 +122,12 @@ async def _archive_run(ctx: Context, *, dry_run: bool = True, kind: str = "all",
 # --------------------------------------------------------------------------
 
 
-async def _archive_status(ctx: Context) -> dict[str, Any]:
+async def _archive_status_core(ctx: Context) -> dict[str, Any]:
+    """The Postgres-only body: every number here lives in the mirror, so
+    this alone is safe for a process with no access to ewsd's filesystem
+    (the MCP) to compute for itself. No `files.*` calls, no `ctx.archive`
+    runner — those are ewsd's alone (see `_archive_status` below and
+    `mcp/local.py::archive_status`)."""
     cache = _require_cache(ctx)
 
     def read() -> dict[str, Any]:
@@ -141,17 +146,25 @@ async def _archive_status(ctx: Context) -> dict[str, Any]:
         }
 
     out = await asyncio.to_thread(read)
-    out["blob_store_bytes"] = await asyncio.to_thread(
-        files.blob_store_bytes, ctx.settings.data_dir)
-    out["free_gb"] = round(await asyncio.to_thread(
-        files.free_gb, ctx.settings.data_dir), 2)
     policy = ArchivePolicy.from_settings(ctx.settings)
     out["policy"] = _policy_dict(policy)
     out["delete_enabled"] = policy.delete_enabled
     out["semantic_enabled"] = ctx.settings.semantic_enabled()
+    out["ok"] = True
+    return out
+
+
+async def _archive_status(ctx: Context) -> dict[str, Any]:
+    """The daemon-side tool handler: the Postgres-only core plus THIS
+    process's own disk figures (ewsd owns DATA_DIR/the blob store) and, if
+    the runner is live, its status."""
+    out = await _archive_status_core(ctx)
+    out["blob_store_bytes"] = await asyncio.to_thread(
+        files.blob_store_bytes, ctx.settings.data_dir)
+    out["free_gb"] = round(await asyncio.to_thread(
+        files.free_gb, ctx.settings.data_dir), 2)
     if ctx.archive is not None:
         out["runner"] = ctx.archive.status()
-    out["ok"] = True
     return out
 
 

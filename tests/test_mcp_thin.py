@@ -258,6 +258,49 @@ def test_archive_status_is_answered_locally_with_the_daemon_down(db):
     assert "archive_status" in LOCAL_TOOLS
 
 
+def test_archive_status_disk_figures_come_from_the_daemon_never_the_mcps_own_disk(
+        db, monkeypatch):
+    """blob_store_bytes/free_gb live under ewsd's DATA_DIR, which may not
+    even be the same disk as the MCP's container -- so the MCP must copy
+    them out of the daemon's status response and never touch its own
+    filesystem to compute them."""
+    from ewsmcp.archive import files
+
+    def boom(data_dir):
+        raise AssertionError("MCP must never compute blob_store_bytes itself")
+
+    monkeypatch.setattr(files, "blob_store_bytes", boom)
+    monkeypatch.setattr(files, "free_gb", boom)
+
+    class StatusWithArchive(RecordingDaemon):
+        async def status(self):
+            return {"ok": True, "archive": {
+                "running": True, "cycles": 9, "blob_store_bytes": 12345,
+                "free_gb": 3.5, "state_counts": {"live": 1},
+                "embedding_backlog": 0,
+            }}
+
+    ctx = _mcp_ctx(db, StatusWithArchive())
+    _seed(ctx)
+    res = _run(ctx, "archive_status")
+    assert res["ok"] is True
+    assert res["blob_store_bytes"] == 12345
+    assert res["free_gb"] == 3.5
+    assert res["runner"]["cycles"] == 9
+    assert "state_counts" not in res["runner"]  # already reported as res["states"]
+    assert "disk_stats" not in res
+
+
+def test_archive_status_omits_disk_figures_with_the_daemon_down(db):
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    res = _run(ctx, "archive_status")
+    assert res["ok"] is True
+    assert "blob_store_bytes" not in res
+    assert "free_gb" not in res
+    assert res["disk_stats"] == "unavailable — ewsd unreachable"
+
+
 def test_the_mcp_never_holds_the_gemini_key(db):
     """find_similar and mode=semantic are FORWARDED: only ewsd embeds."""
     daemon = RecordingDaemon()
