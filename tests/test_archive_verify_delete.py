@@ -7,6 +7,7 @@ import pytest
 from conftest import make_row, make_settings
 from test_archive_capture import FakeAccount, FakeAttachment, FakeGatewayFor, FakeItem
 
+from ewsmcp.archive import delete as delete_module
 from ewsmcp.archive import files
 from ewsmcp.archive.delete import Deleter
 from ewsmcp.archive.policy import ArchivePolicy
@@ -270,3 +271,48 @@ def test_delete_skips_an_item_whose_changekey_moved_since_capture(captured):
     assert items["V1"].deleted is True
     assert store.get_message("V0")["archive_state"] == "verified"
     assert store.get_message("V1")["archive_state"] == "deleted"
+    assert len(result["reasons"]) == 1
+    assert "V0" in result["reasons"][0] and "changed since capture" in result["reasons"][0]
+
+
+class _RaisesOnFirstMarkDeleted:
+    """Wraps a real CacheStore, delegating everything except `mark_deleted`,
+    which raises once (simulating a DB outage right after Exchange already
+    hard-deleted the batch) and then behaves normally."""
+
+    def __init__(self, store):
+        self._store = store
+        self.mark_deleted_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def mark_deleted(self, ids):
+        self.mark_deleted_calls += 1
+        if self.mark_deleted_calls == 1:
+            raise RuntimeError("db outage")
+        return self._store.mark_deleted(ids)
+
+
+def test_a_persist_failure_after_a_successful_delete_is_never_silently_dropped(
+        captured, monkeypatch):
+    """The mail is genuinely gone from Exchange the moment item.delete()
+    returns without raising — if the store then can't record that, the ids
+    must show up somewhere, the run must stop (no second gateway call while
+    persistence is failing), and `error` must say why."""
+    store, settings, _s, _b = captured
+    monkeypatch.setattr(delete_module, "BATCH_SIZE", 1)
+    _verified(store, settings, n=2)
+    items = {f"V{i}": DeletableItem(f"V{i}") for i in range(2)}
+    account = FakeAccount(items)
+    wrapped = _RaisesOnFirstMarkDeleted(store)
+    policy = ArchivePolicy.from_settings(make_settings(archive_delete_enabled=True))
+    deleter = Deleter(settings, FakeGatewayFor(account), wrapped, policy,
+                      RecordingAudit())
+    result = asyncio.run(deleter.run(dry_run=False))
+    assert result["error"] is not None
+    assert result["deleted_unrecorded"] == ["V0"]
+    assert result["deleted"] == 0
+    assert len(account.fetch_calls) == 1, "must stop, not attempt the second batch"
+    assert items["V0"].deleted is True  # Exchange delete DID happen
+    assert items["V1"].deleted is False  # second batch never attempted

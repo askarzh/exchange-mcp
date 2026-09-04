@@ -14,18 +14,31 @@ is issued:
 On top of that, right before each item is actually deleted: the changekey
 re-fetched from Exchange must still match `captured_changekey` (the snapshot
 taken at capture/verify time). A mismatch — or either side missing — means
-the item changed after it was verified and is skipped, never deleted; it
-counts as `failed` with a reason, not silently dropped.
+the item changed after it was verified and is skipped, never deleted; it is
+counted in `failed` and gets a line in `reasons`, not silently dropped.
 
-Deletes go to Exchange in batches of `BATCH_SIZE`, and `mark_deleted` plus
-one destructive-class audit record per successfully deleted item are written
-IMMEDIATELY after each batch — not accumulated and written only at the end —
-so a failure fetching/deleting a later batch (a network blip, an EWS 5xx)
-never loses the record of what an earlier batch already did to Exchange.
+Deletes go to Exchange in batches of `BATCH_SIZE`. `mark_deleted` plus one
+destructive-class audit record per successfully deleted item are written
+IMMEDIATELY after each batch — never accumulated and written only at the
+end — for two independent reasons:
+
+- an exception fetching/deleting a LATER batch (`gateway.call` itself
+  raising) must not lose the record of what an EARLIER batch already did;
+- the persist step (mark + audit) for THIS batch is itself wrapped in its
+  own try/except: if it raises (a DB outage right after Exchange already
+  hard-deleted the batch) the batch's ids are mail that is genuinely gone
+  from the mailbox with nothing recorded about it yet. Those ids are never
+  silently dropped — they land in `result["deleted_unrecorded"]`, `error` is
+  set, and the run stops making further deletions while persistence is
+  failing (a store that can't record deletions cannot be trusted to record
+  the next batch's either).
+
 `mark_deleted` is only ever called with ids whose `item.delete()` did not
 raise; its rowcount is checked against what was asked for, and any shortfall
-(a concurrent state change raced us) is reported as `unmarked` rather than
-silently assumed.
+(a concurrent state change raced us — the row was still deleted from Exchange
+but didn't transition in the store) is resolved to exact ids via
+`messages_by_ids` and reported through `unmarked` and `deleted_unrecorded`
+rather than silently assumed complete.
 """
 
 from __future__ import annotations
@@ -52,9 +65,11 @@ class Deleter:
 
     async def run(self, *, dry_run: bool = True,
                   run_id: int | None = None) -> dict[str, Any]:
-        result: dict[str, Any] = {"eligible": 0, "deleted": 0, "failed": 0,
-                                  "unmarked": 0, "blocked": None, "error": None,
-                                  "sample": []}
+        result: dict[str, Any] = {
+            "eligible": 0, "deleted": 0, "failed": 0, "remaining": 0,
+            "unmarked": 0, "deleted_unrecorded": [], "reasons": [],
+            "blocked": None, "error": None, "sample": [],
+        }
         if not self.policy.delete_enabled:
             result["blocked"] = (
                 "ARCHIVE_DELETE_ENABLED=false — nothing is deleted from Exchange. "
@@ -72,28 +87,40 @@ class Deleter:
         by_id = {r["ews_id"]: r for r in rows}
         ids = list(by_id)
         deleted_count = 0
+        failed_count = 0
+        processed_upto = 0  # index into `ids`: how much we actually attempted
         for start in range(0, len(ids), BATCH_SIZE):
             batch = ids[start:start + BATCH_SIZE]
             try:
-                deleted, timings = await self.gateway.call(
+                deleted, timings, reasons = await self.gateway.call(
                     lambda account, b=batch: self._delete_batch(account, b, by_id))
             except Exception as exc:  # noqa: BLE001 - stop, but keep what we already persisted
                 result["error"] = f"{type(exc).__name__}: {exc}"
                 logger.error("archive delete batch failed, stopping run: %s",
                             result["error"])
                 break
-            # Persisted IMMEDIATELY, one batch at a time: an exception in a
-            # LATER batch must never lose the record of what THIS batch did.
-            if deleted:
+            processed_upto = start + len(batch)
+            for raw_id, reason in reasons.items():
+                result["reasons"].append(f"{raw_id}: {reason}")
+            failed_count += len(reasons)
+            if not deleted:
+                continue
+            # Persisted IMMEDIATELY, one batch at a time (see module docstring).
+            try:
                 marked = self.store.mark_deleted(deleted)
+                unmarked_ids: list[str] = []
                 if marked != len(deleted):
-                    shortfall = len(deleted) - marked
-                    result["unmarked"] += shortfall
+                    after = self.store.messages_by_ids(deleted)
+                    unmarked_ids = [i for i in deleted
+                                    if after.get(i, {}).get("archive_state") != "deleted"]
+                    result["unmarked"] += len(unmarked_ids)
+                    result["deleted_unrecorded"].extend(unmarked_ids)
                     logger.warning(
                         "archive delete: %d item(s) deleted from Exchange but "
                         "not marked deleted in the store (state changed "
-                        "concurrently) — %s", shortfall, deleted)
-                for ews_id in deleted:
+                        "concurrently) — %s", len(unmarked_ids), unmarked_ids)
+                recorded = [i for i in deleted if i not in unmarked_ids]
+                for ews_id in recorded:
                     row = by_id[ews_id]
                     self.audit.record(
                         tool="archive_delete", side_effect_class="destructive",
@@ -103,16 +130,28 @@ class Deleter:
                                 "internet_message_id": row.get("internet_message_id"),
                                 "mime_sha256": row.get("mime_sha256"),
                                 "run_id": run_id})
-                deleted_count += len(deleted)
+                deleted_count += len(recorded)
+            except Exception as exc:  # noqa: BLE001 - mail is gone; record it or stop trying
+                result["deleted_unrecorded"].extend(deleted)
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                logger.error(
+                    "archive delete: %d item(s) were hard-deleted from Exchange "
+                    "but could NOT be recorded (mark/audit failed) — %s: %s",
+                    len(deleted), deleted, result["error"])
+                break
         result["deleted"] = deleted_count
-        result["failed"] = len(rows) - deleted_count
+        result["failed"] = failed_count
+        result["remaining"] = len(ids) - processed_upto
         return result
 
-    # Runs on the EWS pool (sync). Returns (deleted_ids, {ews_id: latency_ms}).
-    def _delete_batch(self, account: Any, ids: list[str],
-                      by_id: dict[str, Any]) -> tuple[list[str], dict[str, int]]:
+    # Runs on the EWS pool (sync).
+    # Returns (deleted_ids, {ews_id: latency_ms}, {ews_id: failure_reason}).
+    def _delete_batch(
+        self, account: Any, ids: list[str], by_id: dict[str, Any]
+    ) -> tuple[list[str], dict[str, int], dict[str, str]]:
         done: list[str] = []
         timings: dict[str, int] = {}
+        reasons: dict[str, str] = {}
         started = time.time()
         fetched = account.fetch(ids=[(i, None) for i in ids],
                                 only_fields=["id", "changekey"])
@@ -136,8 +175,9 @@ class Deleter:
                 done.append(raw_id)
                 timings[raw_id] = int((time.time() - item_started) * 1000)
             except Exception as exc:  # noqa: BLE001 - one failure never stops the batch
-                logger.warning("archive delete failed for %s: %s: %s",
-                               raw_id, type(exc).__name__, exc)
+                reason = f"{type(exc).__name__}: {exc}"
+                reasons[raw_id] = reason
+                logger.warning("archive delete failed for %s: %s", raw_id, reason)
         logger.info("archive deleted %d/%d items in %.1fs",
                     len(done), len(ids), time.time() - started)
-        return done, timings
+        return done, timings, reasons
