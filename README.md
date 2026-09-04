@@ -98,12 +98,21 @@ confirmed, same as `send_draft`), `archive_status`, `get_raw_message`
 (a single-use download link for the original .eml) and `find_similar`
 (meaning-based search). `search_messages(mode="semantic")` and
 `find_similar` both need `GEMINI_API_KEY` set on `ewsd` — `ewsmcp` never
-holds that key, so both are always forwarded to the daemon, and both
-degrade to keyword results (`meta.degraded=true`) rather than fail when
-no key is configured. **Rollout default:** capture, verify and embed run
-continuously out of the box; deletion from Exchange stays off until you
-flip `ARCHIVE_DELETE_ENABLED=true` — run `archive_status` first to see
-what a real pass would touch.
+holds that key, so both are always forwarded to the daemon. Without a key
+they part ways: `search_messages(mode="semantic")` degrades to keyword
+results (`meta.degraded=true`) rather than fail, while `find_similar`
+returns a `validation` error — a keyword list is not an answer to "find
+mail that means this".
+
+**Rollout default:** capture, verify and embed run continuously out of
+the box; deletion from Exchange stays off, twice over. It needs
+`ARCHIVE_DELETE_ENABLED=true` (every deletion, including tool-driven
+ones) and, for the unattended background cycle only,
+`ARCHIVE_DELETE_AUTO=true` as well. Left at the defaults, mail leaves
+Exchange only when you ask for it, one confirmed call at a time:
+`archive_run(kind="delete", dry_run=false)`. Run `archive_status` first
+to see what a real pass would touch. Note that `SEND_ENABLED` does not
+gate deletion — it is the send kill-switch, nothing more.
 
 **4. HTTP mode** — when `ewsmcp` runs where the client isn't (a home
 server, claude.ai connector, etc.):
@@ -191,14 +200,15 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `EWS_CACHE_SYNC_SECONDS` | `45` | Delta cadence |
 | `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence. The folder walk clears exchangelib's cached tree and re-fetches it this often (not every cycle), so a new or deleted folder and fresh unread counts show up within this window while mail keeps syncing every `EWS_CACHE_SYNC_SECONDS`. |
 | `EWS_TZ` | `Asia/Riyadh` | Server timezone for date grammar + display |
-| `GEMINI_API_KEY` | — | **Daemon-only** — `ewsmcp` never holds it; `find_similar` and `mode="semantic"` are always forwarded to `ewsd`. Semantic search stays keyword-only (`semantic_enabled()` is `False`, results carry `meta.degraded=true`) until this is set |
+| `GEMINI_API_KEY` | — | A **Google-issued** API key (Google AI Studio), not a secret you invent; sent to Gemini as the `x-goog-api-key` header. **Daemon-only** — `ewsmcp` never holds it; `find_similar` and `mode="semantic"` are always forwarded to `ewsd`. Until it is set, `search_messages(mode="semantic")` stays keyword-only (`semantic_enabled()` is `False`, results carry `meta.degraded=true`) and `find_similar` returns a `validation` error |
 | `EMBED_DIMS` | `768` | Fixed by migration 003's `vector(768)` column; any other value fails to boot |
 | `ARCHIVE_FOLDERS` | `inbox,sent` | Well-known folder keys the archive pipeline captures; never calendar/contacts/tasks. Fail-closed: set to empty and the pipeline captures NOTHING, not every folder |
 | `ARCHIVE_AFTER_DAYS` | `180` | Age cutoff (days) before a message becomes eligible for archival |
 | `ARCHIVE_EXCLUDE_CATEGORIES` | — | Comma-separated categories excluded from archival |
 | `ARCHIVE_GRACE_DAYS` | `7` | Extra days past the cutoff a `verified` row must age before it is eligible for deletion; floored at 1 |
-| `ARCHIVE_DELETE_ENABLED` | `false` | **The rollout switch.** Capture, verify and embed run regardless; this is rail 1 of 3 for the Exchange delete itself — OFF by default, deletion also needs tier `full` (plus a confirm token) and the per-run cap |
-| `ARCHIVE_MAX_DELETE_PER_RUN` | `200` | Deletion rail 2 of 3 — per-run cap |
+| `ARCHIVE_DELETE_ENABLED` | `false` | **The rollout switch.** Capture, verify and embed run regardless; this is rail 1 of 3 for the Exchange delete itself — OFF by default, deletion also needs tier `full` (plus a confirm token) and the per-run cap. `SEND_ENABLED` does NOT gate deletion: it is the send kill-switch only |
+| `ARCHIVE_DELETE_AUTO` | `false` | Whether the BACKGROUND cycle may delete. Off, deletion is manual: `archive_run(kind="delete", dry_run=false)`, confirm-gated. On (and with `ARCHIVE_DELETE_ENABLED=true`), the loop hard-deletes up to `ARCHIVE_MAX_DELETE_PER_RUN` messages every `ARCHIVE_CYCLE_SECONDS`, unattended |
+| `ARCHIVE_MAX_DELETE_PER_RUN` | `200` | Deletion rail 2 of 3 — the cap on ONE pass, whether that pass is a manual `archive_run` or a background cycle |
 | `ARCHIVE_MIN_FREE_GB` | `2.0` | Minimum free disk space required before each archive batch |
 | `ARCHIVE_CYCLE_SECONDS` | `300` | Archive pipeline run cadence |
 

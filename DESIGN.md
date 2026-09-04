@@ -98,10 +98,12 @@ Five packs:
 `exclude`, default `any`) and a working `mode="semantic"` — both are §Archive
 work now, not a reserved placeholder. `mode="semantic"` and `find_similar`
 are forwarded from `ewsmcp` to `ewsd` unconditionally (the MCP process
-never holds `GEMINI_API_KEY`) and degrade to keyword ranking with
-`meta.degraded=true`/`meta.reason` set when no embedder is configured, so a
-mailbox search never goes dark because a remote API is unavailable or
-rate-limiting. Every card carries `archive_state` — but ONLY when it is not
+never holds `GEMINI_API_KEY`). With no embedder configured
+`search_messages(mode="semantic")` degrades to keyword ranking with
+`meta.degraded=true`/`meta.reason` set, so a mailbox search never goes dark
+because a remote API is unavailable or rate-limiting; `find_similar` does
+NOT degrade — keyword hits are not an answer to "find mail that means
+this", so it returns a `validation` error naming `GEMINI_API_KEY`. Every card carries `archive_state` — but ONLY when it is not
 `live`, to keep the common case (all-live results) at its old token cost.
 
 Every list-shaped result ships exactly the canonical envelope
@@ -289,11 +291,21 @@ idempotent workers, each driven by `messages.archive_state`, run every
   confirm token on `archive_run(dry_run=false)`), and verified older than
   the cutoff plus `ARCHIVE_GRACE_DAYS` (floored at 1 day, so a
   misconfigured 0 can never make freshly-verified mail immediately
-  deletable) — capped at `ARCHIVE_MAX_DELETE_PER_RUN` per pass. The
-  `captured_changekey` snapshot taken at capture time is verified twice —
-  once by the verifier, and again immediately before each item's delete
-  call — so mail that changed after verification is skipped, not deleted
-  on stale trust. One audit record per deletion carries `ews_id`,
+  deletable) — capped at `ARCHIVE_MAX_DELETE_PER_RUN` per pass. Deletion
+  is MANUAL by default: `ARCHIVE_DELETE_ENABLED` gates every deletion, but
+  the unattended background cycle skips the delete lane entirely unless
+  `ARCHIVE_DELETE_AUTO=true` as well, so out of the box mail leaves
+  Exchange only through a confirmed `archive_run(kind="delete",
+  dry_run=false)`. (`SEND_ENABLED` is unrelated — it gates sending, not
+  deletion.) Two checks are re-done immediately before each batch, because
+  a `verified` row is at least `ARCHIVE_GRACE_DAYS` old by then: the
+  `captured_changekey` snapshot taken at capture time must still match
+  (mail that changed after verification is skipped, not deleted on stale
+  trust), and the archive copy is re-read FROM DISK — the `.eml` must
+  still hash to `mime_sha256` and every attachment blob must exist at its
+  recorded size. A row failing the disk check is never deleted; it is
+  demoted `verified → captured` so the verifier re-runs every check next
+  cycle. One audit record per deletion carries `ews_id`,
   `internet_message_id`, `mime_sha256` and the run id; deletes that
   succeeded against Exchange but could not be recorded afterward (a DB
   hiccup right after the hard-delete) surface in `deleted_unrecorded`
@@ -342,10 +354,16 @@ with exponential backoff on 429/5xx.
 
 `search_messages(mode="semantic")` fuses the tsvector ranking and the
 vector ranking with Reciprocal Rank Fusion (k=60); `find_similar(id|text)`
-is pure vector search. Both cover live and archived mail. If the embedder
-or the vector query fails, the answer degrades to keyword results with
-`meta.degraded=true`/`meta.reason` set — a mailbox search never goes dark
-because a remote API is rate-limiting us. The MCP process deliberately
-holds no `GEMINI_API_KEY`: `find_similar` and `mode="semantic"` are
-forwarded to `ewsd` unconditionally, whether or not an embedder is
-actually configured there.
+is pure vector search. Both cover live and archived mail, and both read a
+capped vector candidate set (`limit * 4` chunks, at most 400) before the
+`archived`/structured filters are applied — a very selective filter can
+therefore under-fill a page.
+
+Only `search_messages(mode="semantic")` DEGRADES: if the embedder or the
+vector query fails it answers with keyword results and sets
+`meta.degraded=true`/`meta.reason`, so a mailbox search never goes dark
+because a remote API is rate-limiting us. `find_similar` errors instead
+(`validation`, naming `GEMINI_API_KEY`): a keyword list returned under the
+name "find similar" would be trusted as a semantic answer. The MCP process
+deliberately holds no `GEMINI_API_KEY`: both are forwarded to `ewsd`
+unconditionally, whether or not an embedder is actually configured there.
