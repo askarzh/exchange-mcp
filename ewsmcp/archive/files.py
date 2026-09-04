@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import shutil
 from pathlib import Path
@@ -22,10 +23,21 @@ from pathlib import Path
 MIME_DIRNAME = "mime"
 BLOB_DIRNAME = "blobs"
 _READ_CHUNK = 1024 * 1024
+_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class DiskFull(RuntimeError):
     """Free space fell below ARCHIVE_MIN_FREE_GB — the run must stop."""
+
+
+def _check_sha(sha: str) -> None:
+    """Choke point: every sha that becomes part of a filesystem path passes
+    through here first. Callers eventually include DB-sourced values
+    (``attachments.sha256``, ``messages.mime_sha256``) that nothing else
+    constrains, so this is what keeps a bad row from becoming a path-traversal
+    or wrong-shard write."""
+    if not _SHA_RE.match(sha):
+        raise ValueError("invalid sha256")
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -44,10 +56,12 @@ def sha256_file(path: Path) -> str:
 
 
 def mime_path(data_dir: str, sha: str) -> Path:
+    _check_sha(sha)
     return Path(data_dir) / MIME_DIRNAME / f"{sha}.eml"
 
 
 def blob_path(data_dir: str, sha: str) -> Path:
+    _check_sha(sha)
     return Path(data_dir) / BLOB_DIRNAME / sha[:2] / sha
 
 
@@ -81,7 +95,7 @@ def store_blob(data_dir: str, data: bytes) -> tuple[str, Path]:
 
 def free_gb(data_dir: str) -> float:
     root = Path(data_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)  # intentional: ensure data_dir exists before stat
     return shutil.disk_usage(str(root))[2] / 1024**3
 
 

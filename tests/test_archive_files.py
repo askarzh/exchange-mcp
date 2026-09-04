@@ -55,6 +55,22 @@ def test_ensure_free_space_passes_when_above_the_floor(tmp_path, monkeypatch):
     files.ensure_free_space(str(tmp_path), 2.0)  # no raise
 
 
+def test_mime_path_rejects_a_non_hex_sha(tmp_path):
+    with pytest.raises(ValueError, match="invalid sha256"):
+        files.mime_path(str(tmp_path), "../etc/passwd")
+
+
+def test_blob_path_rejects_a_short_sha(tmp_path):
+    with pytest.raises(ValueError, match="invalid sha256"):
+        files.blob_path(str(tmp_path), "ABCD")
+
+
+def test_a_valid_sha_still_resolves_to_the_documented_layout(tmp_path):
+    sha = "a" * 64
+    assert files.mime_path(str(tmp_path), sha) == tmp_path / "mime" / f"{sha}.eml"
+    assert files.blob_path(str(tmp_path), sha) == tmp_path / "blobs" / sha[:2] / sha
+
+
 def test_blob_store_bytes_sums_mime_and_blobs(tmp_path):
     files.store_mime(str(tmp_path), b"a" * 10)
     files.store_blob(str(tmp_path), b"b" * 25)
