@@ -39,6 +39,23 @@ raise; its rowcount is checked against what was asked for, and any shortfall
 but didn't transition in the store) is resolved to exact ids via
 `messages_by_ids` and reported through `unmarked` and `deleted_unrecorded`
 rather than silently assumed complete.
+
+**Result accounting.** `deleted`, `failed` and `remaining` partition the
+`eligible` rows and always satisfy the invariant
+``deleted + failed + remaining == eligible``:
+
+- `deleted` = ids whose Exchange `item.delete()` call SUCCEEDED — the mail is
+  gone from the mailbox — regardless of what happened to the store record of
+  that afterwards. `deleted_unrecorded` (persist raised) and the `unmarked`
+  ids (a rowcount shortfall) are both SUBSETS of `deleted`, not separate
+  buckets: the item was still deleted, only the bookkeeping about it is
+  incomplete or missing, which is exactly why those ids are surfaced rather
+  than silently folded into a generic failure count.
+- `failed` = ids from an ATTEMPTED batch (its `gateway.call` returned) whose
+  deletion was skipped (stale changekey) or raised — each has its own line in
+  `reasons`.
+- `remaining` = eligible ids never attempted at all, because the run stopped
+  early (a `gateway.call` or persist failure) or never started (`dry_run`).
 """
 
 from __future__ import annotations
@@ -83,6 +100,10 @@ class Deleter:
         result["sample"] = [{"ews_id": r["ews_id"], "subject": r.get("subject"),
                              "date": r.get("date_iso")} for r in rows[:10]]
         if dry_run or not rows:
+            # Nothing was attempted — every eligible row is `remaining`, so
+            # the deleted + failed + remaining == eligible invariant holds
+            # even for a preview run.
+            result["remaining"] = len(rows)
             return result
         by_id = {r["ews_id"]: r for r in rows}
         ids = list(by_id)
@@ -105,6 +126,11 @@ class Deleter:
             failed_count += len(reasons)
             if not deleted:
                 continue
+            # Counted as `deleted` the moment Exchange's item.delete() has
+            # succeeded — the mail is gone either way; deleted_unrecorded/
+            # unmarked below only track how completely that fact got
+            # recorded, they do not change whether it happened.
+            deleted_count += len(deleted)
             # Persisted IMMEDIATELY, one batch at a time (see module docstring).
             try:
                 marked = self.store.mark_deleted(deleted)
@@ -130,7 +156,6 @@ class Deleter:
                                 "internet_message_id": row.get("internet_message_id"),
                                 "mime_sha256": row.get("mime_sha256"),
                                 "run_id": run_id})
-                deleted_count += len(recorded)
             except Exception as exc:  # noqa: BLE001 - mail is gone; record it or stop trying
                 result["deleted_unrecorded"].extend(deleted)
                 result["error"] = f"{type(exc).__name__}: {exc}"

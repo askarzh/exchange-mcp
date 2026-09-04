@@ -176,6 +176,14 @@ def _deleter(store, settings, account, audit=None, **over):
                    audit or RecordingAudit())
 
 
+def _assert_invariant(result):
+    """deleted, failed and remaining partition eligible — always, in every
+    outcome (blocked, dry-run, a clean pass, a partial failure, an early
+    stop). See the accounting section of ewsmcp/archive/delete.py's module
+    docstring."""
+    assert result["deleted"] + result["failed"] + result["remaining"] == result["eligible"]
+
+
 def test_deletion_is_blocked_unless_explicitly_enabled(captured):
     store, settings, _s, _b = captured
     _verified(store, settings)
@@ -185,6 +193,7 @@ def test_deletion_is_blocked_unless_explicitly_enabled(captured):
     assert result["deleted"] == 0
     assert "ARCHIVE_DELETE_ENABLED" in result["blocked"]
     assert account.fetch_calls == []
+    _assert_invariant(result)
 
 
 def test_dry_run_reports_eligibility_without_deleting(captured):
@@ -196,6 +205,7 @@ def test_dry_run_reports_eligibility_without_deleting(captured):
     assert result["eligible"] == 3 and result["deleted"] == 0
     assert len(result["sample"]) == 3
     assert account.fetch_calls == []
+    _assert_invariant(result)
 
 
 def test_grace_period_protects_freshly_verified_mail(captured):
@@ -206,6 +216,7 @@ def test_grace_period_protects_freshly_verified_mail(captured):
                                   archive_delete_enabled=True,
                                   archive_grace_days=7).run(dry_run=True))
     assert result["eligible"] == 0
+    _assert_invariant(result)
 
 
 def test_the_per_run_cap_is_enforced(captured):
@@ -219,6 +230,7 @@ def test_the_per_run_cap_is_enforced(captured):
     assert result["deleted"] == 2
     assert sum(1 for i in items.values() if i.deleted) == 2
     assert store.archive_state_counts()["deleted"] == 2
+    _assert_invariant(result)
 
 
 def test_delete_hard_deletes_marks_the_row_and_audits_each_one(captured):
@@ -237,6 +249,7 @@ def test_delete_hard_deletes_marks_the_row_and_audits_each_one(captured):
     assert set(detail) >= {"ews_id", "internet_message_id", "mime_sha256", "run_id"}
     assert detail["run_id"] == 42
     assert audit.records[0]["side_effect_class"] == "destructive"
+    _assert_invariant(result)
 
 
 def test_one_failed_delete_does_not_mark_the_row(captured):
@@ -253,6 +266,7 @@ def test_one_failed_delete_does_not_mark_the_row(captured):
     assert result["deleted"] == 1 and result["failed"] == 1
     assert store.get_message("V0")["archive_state"] == "verified"
     assert store.get_message("V1")["archive_state"] == "deleted"
+    _assert_invariant(result)
 
 
 def test_delete_skips_an_item_whose_changekey_moved_since_capture(captured):
@@ -273,6 +287,7 @@ def test_delete_skips_an_item_whose_changekey_moved_since_capture(captured):
     assert store.get_message("V1")["archive_state"] == "deleted"
     assert len(result["reasons"]) == 1
     assert "V0" in result["reasons"][0] and "changed since capture" in result["reasons"][0]
+    _assert_invariant(result)
 
 
 class _RaisesOnFirstMarkDeleted:
@@ -312,7 +327,56 @@ def test_a_persist_failure_after_a_successful_delete_is_never_silently_dropped(
     result = asyncio.run(deleter.run(dry_run=False))
     assert result["error"] is not None
     assert result["deleted_unrecorded"] == ["V0"]
-    assert result["deleted"] == 0
+    # V0 counts as `deleted`: item.delete() DID succeed against Exchange.
+    # deleted_unrecorded is a SUBSET of deleted, not a separate bucket — see
+    # the accounting section of delete.py's module docstring.
+    assert result["deleted"] == 1
+    assert result["remaining"] == 1  # V1's batch was never attempted
     assert len(account.fetch_calls) == 1, "must stop, not attempt the second batch"
     assert items["V0"].deleted is True  # Exchange delete DID happen
     assert items["V1"].deleted is False  # second batch never attempted
+    _assert_invariant(result)
+
+
+class _RaceOnFirstMarkDeleted:
+    """Wraps a real CacheStore: `mark_deleted` marks everything normally,
+    then simulates a concurrent process flipping the FIRST id's row back to
+    `verified` right after the commit — a rowcount shortfall with no
+    exception, the "raced us" case rather than the "store is down" case."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def mark_deleted(self, ids):
+        marked = self._store.mark_deleted(ids)
+        if ids:
+            with self._store.db.conn() as c:
+                c.execute("UPDATE ews.messages SET archive_state = 'verified' "
+                          "WHERE ews_id = %s", (ids[0],))
+            marked -= 1
+        return marked
+
+
+def test_delete_reports_a_rowcount_shortfall_without_dropping_the_id(captured):
+    """A shortfall with no exception (a race, not an outage) still lands the
+    raced id in deleted_unrecorded/unmarked — and it STILL counts as
+    `deleted`, because Exchange's item.delete() succeeded regardless."""
+    store, settings, _s, _b = captured
+    _verified(store, settings, n=2)
+    items = {f"V{i}": DeletableItem(f"V{i}") for i in range(2)}
+    account = FakeAccount(items)
+    wrapped = _RaceOnFirstMarkDeleted(store)
+    policy = ArchivePolicy.from_settings(make_settings(archive_delete_enabled=True))
+    deleter = Deleter(settings, FakeGatewayFor(account), wrapped, policy,
+                      RecordingAudit())
+    result = asyncio.run(deleter.run(dry_run=False))
+    assert result["unmarked"] == 1
+    assert len(result["deleted_unrecorded"]) == 1
+    assert result["deleted"] == 2  # both hard-deleted from Exchange
+    assert result["failed"] == 0
+    assert result["remaining"] == 0
+    assert all(i.deleted for i in items.values())
+    _assert_invariant(result)
