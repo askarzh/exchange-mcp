@@ -3,14 +3,15 @@
 A Postgres-backed, two-process Exchange server: `ewsd` owns the Exchange
 session, the sync mirror, uploads, the audit chain, and every safety
 gate; `ewsmcp` is a thin MCP server that reads Postgres directly for
-fast lookups and forwards everything else to `ewsd`. **31 tools**,
-alias-only ids, token-lean DTOs, a Postgres mirror with full-text
-search, and a two-phase confirm flow that makes autonomous sending
+fast lookups and forwards everything else to `ewsd`. **35 tools**,
+alias-only ids, token-lean DTOs, a Postgres mirror with full-text and
+semantic search, a durable mail archive with attachments, and a
+two-phase confirm flow that makes autonomous sending (and deleting)
 tamper-evident. This is a personal fork-off of
 [`azizmazrou/ews-mcp`](https://github.com/azizmazrou/ews-mcp) 4.5,
 released under the same MIT license.
 
-> The release line is **5.0.x** (pre-release, `5.0.0a1`). Architecture:
+> The release line is **5.1.x** (pre-release, `5.1.0a1`). Architecture:
 > [DESIGN.md](DESIGN.md). Full API reference: [docs/API.md](docs/API.md).
 
 ## Quick start
@@ -64,9 +65,11 @@ the directory you launch from — it auto-loads for both `ewsd` and
 `ewsmcp`.
 
 That is the whole setup. The defaults are safe: capability tier `draft`
-(26 read + draft tools registered; nothing can send), `SEND_ENABLED=false`
-until you flip it, and `ewsd`'s mail-at-rest (audit chain; local blob
-storage in later phases) goes to `~/.ewsmcp`. `ewsd` **refuses
+(29 read + draft tools registered; nothing can send), `SEND_ENABLED=false`
+until you flip it, `ARCHIVE_DELETE_ENABLED=false` until you flip that too
+(the archive still captures, verifies and embeds mail with it off — only
+the Exchange delete is gated), and `ewsd`'s mail-at-rest (audit chain,
+archived MIME + attachment blobs) goes to `~/.ewsmcp`. `ewsd` **refuses
 cloud-synced folders** for that data — if your home directory lives in
 OneDrive/Dropbox/iCloud, set `DATA_DIR` to a plain local path.
 
@@ -81,6 +84,35 @@ OneDrive/Dropbox/iCloud, set `DATA_DIR` to a plain local path.
 
 Ids like `m3` / `e1` are the server's short aliases — the assistant uses
 them exactly as returned; raw Exchange ids never appear.
+
+**Archive and semantic search.** `ewsd` also runs a background archive
+pipeline: old mail (default: inbox/sent older than 180 days) is captured
+to local disk with its attachments, verified, embedded and — only once
+you explicitly set `ARCHIVE_DELETE_ENABLED=true` — deleted from Exchange.
+Archived mail stays fully readable and searchable through the same tools
+(`search_messages`'s `archived` argument selects `any`/`only`/`exclude`;
+`list_folders` rows carry an `archived` count; `get_attachment` serves
+archived attachments straight from disk). Four tools cover it:
+`archive_run` (dry-run by default; `dry_run=false` is two-phase
+confirmed, same as `send_draft`), `archive_status`, `get_raw_message`
+(a single-use download link for the original .eml) and `find_similar`
+(meaning-based search). `search_messages(mode="semantic")` and
+`find_similar` both need `GEMINI_API_KEY` set on `ewsd` — `ewsmcp` never
+holds that key, so both are always forwarded to the daemon. Without a key
+they part ways: `search_messages(mode="semantic")` degrades to keyword
+results (`meta.degraded=true`) rather than fail, while `find_similar`
+returns a `validation` error — a keyword list is not an answer to "find
+mail that means this".
+
+**Rollout default:** capture, verify and embed run continuously out of
+the box; deletion from Exchange stays off, twice over. It needs
+`ARCHIVE_DELETE_ENABLED=true` (every deletion, including tool-driven
+ones) and, for the unattended background cycle only,
+`ARCHIVE_DELETE_AUTO=true` as well. Left at the defaults, mail leaves
+Exchange only when you ask for it, one confirmed call at a time:
+`archive_run(kind="delete", dry_run=false)`. Run `archive_status` first
+to see what a real pass would touch. Note that `SEND_ENABLED` does not
+gate deletion — it is the send kill-switch, nothing more.
 
 **4. HTTP mode** — when `ewsmcp` runs where the client isn't (a home
 server, claude.ai connector, etc.):
@@ -97,11 +129,14 @@ MCP_TRANSPORT=http MCP_PORT=8000 MCP_API_KEY=<long-random-string> ewsmcp
   `EWSD_API_KEY`; it never talks to Exchange itself.
 
 `ewsd`'s own HTTP surface (`GET /v1/tools`, `POST /v1/tools/<name>`,
-`GET /v1/status`, `/metrics`, `/openapi.json` behind `EWSD_API_KEY`;
-`/livez`, `/readyz`, `/health`, `/version` always public; `PUT|POST
-/upload/<token>` deliberately ahead of the bearer gate) is separate — it
-is what `ewsmcp` calls for writes, not something a client talks to
-directly. See DESIGN.md §Processes.
+`GET /v1/status`, `/metrics`, `/openapi.json`, `POST /v1/archive/run`
+(alias of `POST /v1/tools/archive_run`) and `GET /v1/archive/runs/<id>`
+behind `EWSD_API_KEY`; `/livez`, `/readyz`, `/health`, `/version` always
+public; `PUT|POST /upload/<token>` and `GET /download/<token>`
+deliberately ahead of the bearer gate, single-use, served only out of
+`{DATA_DIR}/mime/` and `{DATA_DIR}/blobs/`) is separate — it is what
+`ewsmcp` calls for writes, not something a client talks to directly. See
+DESIGN.md §Processes.
 
 Full dev stack (Postgres + `ewsd` + `ewsmcp` in HTTP mode), see
 [`docker-compose.yml`](docker-compose.yml):
@@ -165,6 +200,17 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `EWS_CACHE_SYNC_SECONDS` | `45` | Delta cadence |
 | `EWS_CACHE_HIERARCHY_SECONDS` | `600` | Folder tree / calendar / tasks refresh cadence. The folder walk clears exchangelib's cached tree and re-fetches it this often (not every cycle), so a new or deleted folder and fresh unread counts show up within this window while mail keeps syncing every `EWS_CACHE_SYNC_SECONDS`. |
 | `EWS_TZ` | `Asia/Riyadh` | Server timezone for date grammar + display |
+| `GEMINI_API_KEY` | — | A **Google-issued** API key (Google AI Studio), not a secret you invent; sent to Gemini as the `x-goog-api-key` header. **Daemon-only** — `ewsmcp` never holds it; `find_similar` and `mode="semantic"` are always forwarded to `ewsd`. Until it is set, `search_messages(mode="semantic")` stays keyword-only (`semantic_enabled()` is `False`, results carry `meta.degraded=true`) and `find_similar` returns a `validation` error |
+| `EMBED_DIMS` | `768` | Fixed by migration 003's `vector(768)` column; any other value fails to boot |
+| `ARCHIVE_FOLDERS` | `inbox,sent` | Well-known folder keys the archive pipeline captures; never calendar/contacts/tasks. Fail-closed: set to empty and the pipeline captures NOTHING, not every folder |
+| `ARCHIVE_AFTER_DAYS` | `180` | Age cutoff (days) before a message becomes eligible for archival |
+| `ARCHIVE_EXCLUDE_CATEGORIES` | — | Comma-separated categories excluded from archival |
+| `ARCHIVE_GRACE_DAYS` | `7` | Extra days past the cutoff a `verified` row must age before it is eligible for deletion; floored at 1 |
+| `ARCHIVE_DELETE_ENABLED` | `false` | **The rollout switch.** Capture, verify and embed run regardless; this is rail 1 of 3 for the Exchange delete itself — OFF by default, deletion also needs tier `full` (plus a confirm token) and the per-run cap. `SEND_ENABLED` does NOT gate deletion: it is the send kill-switch only |
+| `ARCHIVE_DELETE_AUTO` | `false` | Whether the BACKGROUND cycle may delete. Off, deletion is manual: `archive_run(kind="delete", dry_run=false)`, confirm-gated. On (and with `ARCHIVE_DELETE_ENABLED=true`), the loop hard-deletes up to `ARCHIVE_MAX_DELETE_PER_RUN` messages every `ARCHIVE_CYCLE_SECONDS`, unattended |
+| `ARCHIVE_MAX_DELETE_PER_RUN` | `200` | Deletion rail 2 of 3 — the cap on ONE pass, whether that pass is a manual `archive_run` or a background cycle |
+| `ARCHIVE_MIN_FREE_GB` | `2.0` | Minimum free disk space required before each archive batch |
+| `ARCHIVE_CYCLE_SECONDS` | `300` | Archive pipeline run cadence |
 
 ## The send flow (two-phase, content-bound)
 

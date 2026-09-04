@@ -1,3 +1,3 @@
-"""ews-mcp v5 package (release line 4.5.x) — architecture in DESIGN.md."""
+"""ews-mcp v5 package (release line 5.1.x) — architecture in DESIGN.md."""
 
-__version__ = "5.0.0a1"
+__version__ = "5.1.0a1"

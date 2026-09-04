@@ -36,12 +36,12 @@ def _run(ctx, name, **kwargs):
 
 def test_registry_counts_per_tier_and_semantic(tmp_path, db):
     full = _ctx(tmp_path, db, ews_capability_tier="full")
-    assert len(full.registry) == 31
-    assert "find_similar" not in full.registry  # semantic tier removed
+    assert len(full.registry) == 35
+    assert "find_similar" in full.registry  # the semantic tier is back, Gemini-backed
     draft = _ctx(tmp_path, db, ews_capability_tier="draft")
-    assert len(draft.registry) == 26
+    assert len(draft.registry) == 29
     read = _ctx(tmp_path, db, ews_capability_tier="read")
-    assert len(read.registry) == 15
+    assert len(read.registry) == 18
 
 
 # --- tasks pack ---------------------------------------------------------------
@@ -193,11 +193,14 @@ def _sem_store(db):
     return store
 
 
-def test_semantic_mode_is_a_clear_validation_error(tmp_path, db):
+def test_semantic_mode_degrades_to_keyword_without_an_embedder(tmp_path, db):
+    """No GEMINI_API_KEY -> ctx.semantic is None -> degrade to keyword
+    results, never a hard error (Task 13)."""
     ctx = _ctx(tmp_path, db, cache=_sem_store(db))
     res = _run(ctx, "search_messages", query="vendor", mode="semantic")
-    assert res["error"]["code"] == "validation"
-    assert "keyword" in res["error"]["hint"]
+    assert res["ok"] is True
+    assert res["meta"]["degraded"] is True
+    assert "GEMINI_API_KEY" in res["meta"]["reason"]
 
 
 # --- /metrics --------------------------------------------------------------------

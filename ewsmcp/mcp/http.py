@@ -6,7 +6,7 @@ from typing import Any
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from .. import __version__
-from ..http import _authorized, _send_json
+from ..httputil import _authorized, _send_json
 from .server import build_mcp_context, build_mcp_server
 
 logger = logging.getLogger(__name__)

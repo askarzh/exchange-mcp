@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ewsmcp.tools import calendar_people, mail_read, tasks, writes  # noqa: E402
+from ewsmcp.tools import archive, calendar_people, mail_read, tasks, writes  # noqa: E402
 from ewsmcp.tools.base import CLASS_TIER  # noqa: E402
 
 API_MD = Path(__file__).resolve().parents[1] / "docs" / "API.md"
@@ -33,6 +33,7 @@ def _packs():
         ("calendar / people / status", calendar_people.TOOLS),
         ("tasks / waiting-on", tasks.TOOLS),
         ("writes", writes.TOOLS),
+        ("archive / semantic", archive.TOOLS),
     ]
 
 

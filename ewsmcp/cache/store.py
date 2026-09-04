@@ -33,6 +33,13 @@ _ARCHIVED = {"any": "TRUE", "only": "m.archive_state <> 'live'",
              "exclude": "m.archive_state = 'live'"}
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
+
+def _vector_literal(values: Any) -> str:
+    """pgvector's text input format: '[0.1,0.2,…]'. psycopg casts it with ::vector."""
+    if values is None:
+        return "[]"
+    return "[" + ",".join(f"{float(v):.7g}" for v in values) + "]"
+
 # Well-known folder ids resolved in SQL, so no Python-side lookup is needed
 # and a missing folders row degrades to "matches nothing" rather than an error.
 _INBOX_ID = "(SELECT ews_id FROM ews.folders WHERE wk = 'f:inbox' LIMIT 1)"
@@ -113,7 +120,10 @@ class CacheStore:
             c.execute("DELETE FROM ews.messages WHERE ews_id = ANY(%s)", (list(ews_ids),))
         return len(ews_ids)
 
-    tombstone_messages = delete_messages_by_id
+    # tombstone_messages is set below, after apply_server_deletes is defined,
+    # so a server-side delete becomes a state transition for archived rows
+    # instead of a hard delete (delete_messages_by_id stays for callers that
+    # genuinely want the row gone, e.g. a vanished folder).
 
     def set_read_flag(self, ews_ids: list[str], is_read: bool) -> None:
         if not ews_ids:
@@ -389,3 +399,342 @@ class CacheStore:
                                     AND i.date_ts > s.date_ts)
                 ORDER BY s.date_ts DESC LIMIT %s
                 """, (cutoff, int(limit))).fetchall()
+
+    # --------------------------------------------------------- archive state
+
+    def folder_ids_for_wk(self, wk_keys: list[str]) -> list[str]:
+        """Well-known keys (f:inbox, …) → EWS folder ids, via ews.folders."""
+        if not wk_keys:
+            return []
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT ews_id FROM ews.folders WHERE wk = ANY(%s)",
+                (list(wk_keys),)).fetchall()
+        return [r["ews_id"] for r in rows]
+
+    _CANDIDATE_WHERE = """
+        m.archive_state = 'live'
+        AND m.date_ts IS NOT NULL AND m.date_ts <= %(before_ts)s
+        AND (%(folder_ids)s::text[] IS NULL OR m.folder_id = ANY(%(folder_ids)s))
+        AND NOT EXISTS (
+            SELECT 1 FROM jsonb_array_elements_text(
+                COALESCE(NULLIF(m.categories_json, ''), '[]')::jsonb) AS cat
+            WHERE lower(btrim(cat)) = ANY(%(exclude_categories)s))
+    """
+
+    def _candidate_params(self, folder_ids, before_ts, exclude_categories):
+        return {
+            "before_ts": int(before_ts),
+            # None means "every folder"; [] must mean "no folder" — do not
+            # collapse an explicit empty list into None.
+            "folder_ids": None if folder_ids is None else list(folder_ids),
+            "exclude_categories": [c.strip().lower()
+                                   for c in (exclude_categories or []) if c.strip()],
+        }
+
+    def archive_candidates(self, *, folder_ids: list[str] | None, before_ts: int,
+                           exclude_categories: list[str],
+                           limit: int) -> list[dict[str, Any]]:
+        params = self._candidate_params(folder_ids, before_ts, exclude_categories)
+        params["limit"] = int(limit)
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT m.ews_id, m.changekey, m.folder_id, m.subject, m.date_iso, "
+                "m.date_ts, m.internet_message_id, m.has_attachments "
+                f"FROM ews.messages m WHERE {self._CANDIDATE_WHERE} "
+                "ORDER BY m.date_ts ASC LIMIT %(limit)s", params).fetchall()
+
+    def archive_candidate_count(self, *, folder_ids: list[str] | None,
+                                before_ts: int,
+                                exclude_categories: list[str]) -> int:
+        params = self._candidate_params(folder_ids, before_ts, exclude_categories)
+        with self.db.conn() as c:
+            return int(c.execute(
+                "SELECT COUNT(*) AS n FROM ews.messages m "
+                f"WHERE {self._CANDIDATE_WHERE}", params).fetchone()["n"])
+
+    def mark_captured(self, ews_id: str, *, mime_sha256: str,
+                      mime_path: str, changekey: str | None = None) -> int:
+        with self.db.conn() as c:
+            cur = c.execute(
+                "UPDATE ews.messages SET archive_state = 'captured', "
+                "archived_at = now(), mime_sha256 = %s, mime_path = %s, "
+                "captured_changekey = %s "
+                "WHERE ews_id = %s AND archive_state = 'live'",
+                (mime_sha256, mime_path, changekey, ews_id))
+        return cur.rowcount
+
+    def captured_rows(self, limit: int) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT * FROM ews.messages WHERE archive_state = 'captured' "
+                "ORDER BY archived_at ASC LIMIT %s", (int(limit),)).fetchall()
+
+    def mark_verified(self, ews_id: str) -> int:
+        with self.db.conn() as c:
+            cur = c.execute(
+                "UPDATE ews.messages SET archive_state = 'verified', "
+                "verified_at = now() WHERE ews_id = %s AND archive_state = 'captured'",
+                (ews_id,))
+        return cur.rowcount
+
+    def demote_to_captured(self, ews_id: str) -> int:
+        """A `verified` row failed the last-mile disk check in the deleter.
+
+        The verification is stale — the archive copy is gone or corrupt — so
+        the row goes BACK to `captured` (never straight to `live`: the bytes
+        may still be recoverable and the verifier is the only worker allowed
+        to decide that). `verified_at` is cleared so the next verify pass
+        picks it up and re-runs every check, resetting it to `live` for a
+        fresh capture if the copy really is unusable."""
+        with self.db.conn() as c:
+            cur = c.execute(
+                "UPDATE ews.messages SET archive_state = 'captured', "
+                "verified_at = NULL "
+                "WHERE ews_id = %s AND archive_state = 'verified'", (ews_id,))
+        return cur.rowcount
+
+    def reset_to_live(self, ews_id: str) -> int:
+        """Verification failed — forget the capture entirely so it is retried."""
+        with self.db.conn() as c:
+            cur = c.execute(
+                "UPDATE ews.messages SET archive_state = 'live', archived_at = NULL, "
+                "verified_at = NULL, mime_sha256 = NULL, mime_path = NULL, "
+                "captured_changekey = NULL "
+                "WHERE ews_id = %s AND archive_state = 'captured'", (ews_id,))
+            if cur.rowcount:
+                c.execute("DELETE FROM ews.attachments WHERE message_ews_id = %s",
+                          (ews_id,))
+        return cur.rowcount
+
+    def deletable_rows(self, *, before_ts: int, verified_before: int,
+                       limit: int) -> list[dict[str, Any]]:
+        """Rail 3: verified, older than the cutoff, and verified long enough ago."""
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT ews_id, internet_message_id, mime_sha256, subject, date_iso, "
+                "captured_changekey "
+                "FROM ews.messages WHERE archive_state = 'verified' "
+                "AND date_ts IS NOT NULL AND date_ts <= %s "
+                "AND verified_at IS NOT NULL AND verified_at <= to_timestamp(%s) "
+                "ORDER BY date_ts ASC LIMIT %s",
+                (int(before_ts), int(verified_before), int(limit))).fetchall()
+
+    def mark_deleted(self, ews_ids: list[str]) -> int:
+        if not ews_ids:
+            return 0
+        with self.db.conn() as c:
+            cur = c.execute(
+                "UPDATE ews.messages SET archive_state = 'deleted', "
+                "deleted_at = now() WHERE ews_id = ANY(%s) "
+                "AND archive_state = 'verified'", (list(ews_ids),))
+        return cur.rowcount
+
+    def apply_server_deletes(self, ews_ids: list[str]) -> tuple[int, int]:
+        """A delete event arrived from Exchange (sync, or our own tool).
+
+        Spec §3: an archived row (captured/verified) is KEPT and marked
+        deleted — the mail is ours now; a live row is dropped as before; an
+        already-deleted row is left alone. Returns (dropped, tombstoned)."""
+        if not ews_ids:
+            return 0, 0
+        ids = list(ews_ids)
+        with self.db.conn() as c:
+            tombstoned = c.execute(
+                "UPDATE ews.messages SET archive_state = 'deleted', "
+                "deleted_at = now() WHERE ews_id = ANY(%s) "
+                "AND archive_state IN ('captured', 'verified')", (ids,)).rowcount
+            dropped = c.execute(
+                "DELETE FROM ews.messages WHERE ews_id = ANY(%s) "
+                "AND archive_state = 'live'", (ids,)).rowcount
+        return dropped, tombstoned
+
+    tombstone_messages = apply_server_deletes
+
+    def archive_state_counts(self) -> dict[str, int]:
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT archive_state, COUNT(*) AS n FROM ews.messages "
+                "GROUP BY archive_state").fetchall()
+        counts = {"live": 0, "captured": 0, "verified": 0, "deleted": 0}
+        counts.update({r["archive_state"]: int(r["n"]) for r in rows})
+        return counts
+
+    def archived_counts_by_folder(self) -> dict[str, int]:
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT folder_id, COUNT(*) AS n FROM ews.messages "
+                "WHERE archive_state <> 'live' GROUP BY folder_id").fetchall()
+        return {r["folder_id"]: int(r["n"]) for r in rows}
+
+    def messages_by_ids(self, ews_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not ews_ids:
+            return {}
+        with self.db.conn() as c:
+            rows = c.execute("SELECT * FROM ews.messages WHERE ews_id = ANY(%s)",
+                             (list(ews_ids),)).fetchall()
+        return {r["ews_id"]: r for r in rows}
+
+    # ---------------------------------------------------------- attachments
+
+    def replace_attachments(self, ews_id: str,
+                            rows: list[dict[str, Any]]) -> None:
+        """Idempotent: capture is re-runnable, so the inventory is rewritten."""
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.attachments WHERE message_ews_id = %s",
+                      (ews_id,))
+            if rows:
+                c.cursor().executemany(
+                    "INSERT INTO ews.attachments (message_ews_id, name, "
+                    "content_type, size, sha256, is_inline) VALUES "
+                    "(%(message_ews_id)s, %(name)s, %(content_type)s, %(size)s, "
+                    "%(sha256)s, %(is_inline)s)",
+                    [{"message_ews_id": ews_id, "name": r.get("name"),
+                      "content_type": r.get("content_type"), "size": r.get("size"),
+                      "sha256": r.get("sha256"),
+                      "is_inline": int(r.get("is_inline") or 0)} for r in rows])
+
+    def attachments_for(self, ews_id: str) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT id, name, content_type, size, sha256, is_inline "
+                "FROM ews.attachments WHERE message_ews_id = %s ORDER BY id ASC",
+                (ews_id,)).fetchall()
+
+    # -------------------------------------------------------- archive_runs
+
+    def start_run(self, kind: str, *, dry_run: bool, policy: dict[str, Any]) -> int:
+        with self.db.conn() as c:
+            row = c.execute(
+                "INSERT INTO ews.archive_runs (kind, dry_run, policy_json) "
+                "VALUES (%s, %s, %s) RETURNING id",
+                (kind, 1 if dry_run else 0,
+                 json.dumps(policy, sort_keys=True, default=str))).fetchone()
+        return int(row["id"])
+
+    def finish_run(self, run_id: int, *, captured: int = 0, verified: int = 0,
+                   deleted: int = 0, failed: int = 0, error: str | None = None,
+                   sample: list[Any] | None = None) -> None:
+        with self.db.conn() as c:
+            c.execute(
+                "UPDATE ews.archive_runs SET finished_at = now(), captured = %s, "
+                "verified = %s, deleted = %s, failed = %s, error = %s, "
+                "sample_json = %s WHERE id = %s",
+                (int(captured), int(verified), int(deleted), int(failed),
+                 (error or None) and str(error)[:2000],
+                 json.dumps(sample or [], ensure_ascii=False, default=str),
+                 int(run_id)))
+
+    def get_run(self, run_id: int) -> dict[str, Any] | None:
+        with self.db.conn() as c:
+            return c.execute("SELECT * FROM ews.archive_runs WHERE id = %s",
+                             (int(run_id),)).fetchone()
+
+    def recent_runs(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT * FROM ews.archive_runs ORDER BY started_at DESC, id DESC "
+                "LIMIT %s", (int(limit),)).fetchall()
+
+    # -------------------------------------------------------------- chunks
+
+    def unembedded_messages(self, limit: int) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT ews_id, subject, body_clean FROM ews.messages "
+                "WHERE embedded_at IS NULL ORDER BY date_ts DESC NULLS LAST "
+                "LIMIT %s", (int(limit),)).fetchall()
+
+    def replace_chunks(self, ews_id: str, chunks: list[dict[str, Any]]) -> None:
+        """Rewrite one message's chunks and stamp `embedded_at`, atomically.
+
+        Both happen in the same transaction/connection so a crash between
+        writing chunks and marking the message embedded can never happen —
+        the backlog query (`embedded_at IS NULL`) either sees the old chunks
+        AND no stamp, or the new chunks AND the stamp, never the fully-priced
+        embeddings with an unset stamp that would make the backlog re-pay for
+        them.
+        """
+        with self.db.conn() as c:
+            c.execute("DELETE FROM ews.chunks WHERE message_ews_id = %s", (ews_id,))
+            if chunks:
+                c.cursor().executemany(
+                    "INSERT INTO ews.chunks (message_ews_id, seq, source, text, "
+                    "embedding) VALUES (%(message_ews_id)s, %(seq)s, %(source)s, "
+                    "%(text)s, %(embedding)s::vector)",
+                    [{"message_ews_id": ews_id, "seq": int(ch["seq"]),
+                      "source": ch.get("source", "body"), "text": ch["text"],
+                      "embedding": _vector_literal(ch.get("embedding"))}
+                     for ch in chunks])
+            c.execute("UPDATE ews.messages SET embedded_at = now() "
+                      "WHERE ews_id = %s", (ews_id,))
+
+    def mark_embedded(self, ews_ids: list[str]) -> None:
+        """Stamp `embedded_at` directly. `replace_chunks` already does this per
+        message, so callers normally don't need this — kept as a standalone,
+        idempotent helper (e.g. for backfills that don't go through chunking).
+        """
+        if not ews_ids:
+            return
+        with self.db.conn() as c:
+            c.execute("UPDATE ews.messages SET embedded_at = now() "
+                      "WHERE ews_id = ANY(%s)", (list(ews_ids),))
+
+    def embedding_backlog(self) -> int:
+        with self.db.conn() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM ews.messages "
+                                 "WHERE embedded_at IS NULL").fetchone()["n"])
+
+    def embedded_count(self) -> int:
+        with self.db.conn() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM ews.messages "
+                                 "WHERE embedded_at IS NOT NULL").fetchone()["n"])
+
+    def similar_message_ids(self, embedding: list[float], *, limit: int,
+                            archived: str = "any",
+                            exclude_ews_id: str | None = None
+                            ) -> list[tuple[str, float]]:
+        """Nearest messages by cosine distance, best distance per message.
+
+        The ANN part (`ORDER BY <=> ... LIMIT`) runs in an inner subquery
+        against `ews.chunks` ALONE, with no join, so pgvector's HNSW index
+        (`ix_chunks_embedding`) drives it as an index scan with an early
+        stopping condition — verified via EXPLAIN. Joining `ews.messages`
+        (needed for the `archived` filter) at that same query level defeats
+        the index: Postgres then has to weigh the join against the ORDER BY
+        and picks a full join-then-sort plan instead (also verified via
+        EXPLAIN). The join to apply `archived`/`exclude_ews_id` therefore
+        happens OUTSIDE the inner subquery, over its already-small candidate
+        set (`min(limit * 4, 400)` chunk rows). Multiple chunks can name the
+        same message, so results are deduped to the best (first, since rows
+        already arrive dist-ascending) row per message in Python, then
+        truncated to `limit` messages.
+        """
+        clause = _ARCHIVED.get(archived, "TRUE")
+        candidate_limit = min(max(int(limit), 1) * 4, 400)
+        vector = _vector_literal(embedding)
+        params: list[Any] = [vector]
+        inner_extra = ""
+        if exclude_ews_id:
+            inner_extra = "AND c.message_ews_id <> %s "
+            params.append(exclude_ews_id)
+        params.extend([vector, candidate_limit])
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT cand.ews_id AS ews_id, cand.dist AS dist FROM ("
+                "  SELECT c.message_ews_id AS ews_id, "
+                "         (c.embedding <=> %s::vector) AS dist "
+                "  FROM ews.chunks c "
+                f"  WHERE c.embedding IS NOT NULL {inner_extra}"
+                "  ORDER BY c.embedding <=> %s::vector LIMIT %s"
+                ") cand JOIN ews.messages m ON m.ews_id = cand.ews_id "
+                f"WHERE {clause} ORDER BY cand.dist ASC",
+                params).fetchall()
+        best: dict[str, float] = {}
+        order: list[str] = []
+        for r in rows:
+            ews_id = r["ews_id"]
+            if ews_id not in best:             # rows arrive dist-ascending,
+                best[ews_id] = float(r["dist"])  # so the first hit is the best
+                order.append(ews_id)
+        return [(i, best[i]) for i in order[:int(limit)]]

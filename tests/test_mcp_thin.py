@@ -66,9 +66,9 @@ def _run(ctx, name, **kw):
 
 
 def test_registry_matches_daemon_counts(db):
-    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="full").registry) == 31
-    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="draft").registry) == 26
-    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="read").registry) == 15
+    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="full").registry) == 35
+    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="draft").registry) == 29
+    assert len(_mcp_ctx(db, DeadDaemon(), ews_capability_tier="read").registry) == 18
     ctx = _mcp_ctx(db, DeadDaemon(), ews_capability_tier="full")
     assert LOCAL_TOOLS <= set(ctx.registry)
     assert "confirm_token" in ctx.registry["send_draft"].input_schema["properties"]
@@ -189,12 +189,21 @@ def test_unknown_alias_is_validation_error_locally(db):
     assert res["ok"] is False and res["error"]["code"] == "validation"
 
 
-def test_semantic_search_is_validation_error_on_mcp_side(db):
-    """mode='semantic' is rejected locally (mcp/local.py) before ever reaching
-    the daemon or Exchange -- it is reserved, not implemented in this build."""
+def test_semantic_search_is_forwarded_to_the_daemon(db):
+    """mode='semantic' never runs locally -- the MCP never holds the Gemini
+    key -- it is forwarded to ewsd verbatim."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    res = _run(ctx, "search_messages", query="budget", mode="semantic")
+    assert res["ok"] is True and res["proxied"] == "search_messages"
+    assert daemon.calls[0] == ("search_messages",
+                               {"query": "budget", "mode": "semantic"})
+
+
+def test_semantic_search_reports_daemon_unavailable_when_ewsd_is_down(db):
     ctx = _mcp_ctx(db, DeadDaemon())
     res = _run(ctx, "search_messages", query="budget", mode="semantic")
-    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert res["ok"] is False and res["error"]["code"] == "daemon_unavailable"
 
 
 def test_get_thread_with_a_dead_mirror_is_backend_unavailable(db):
@@ -237,3 +246,89 @@ def test_validation_rejects_unknown_arguments_before_forwarding(db):
     res = _run(ctx, "create_draft", subject="hi", nonsense=1)
     assert res["ok"] is False and res["error"]["code"] == "validation"
     assert daemon.calls == []
+
+
+def test_archive_status_is_answered_locally_with_the_daemon_down(db):
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    ctx.cache.mark_captured("RAW-1", mime_sha256="a" * 64, mime_path="/x.eml")
+    res = _run(ctx, "archive_status")
+    assert res["ok"] is True
+    assert res["states"]["captured"] == 1
+    assert "archive_status" in LOCAL_TOOLS
+
+
+def test_archive_status_disk_figures_come_from_the_daemon_never_the_mcps_own_disk(
+        db, monkeypatch):
+    """blob_store_bytes/free_gb live under ewsd's DATA_DIR, which may not
+    even be the same disk as the MCP's container -- so the MCP must copy
+    them out of the daemon's status response and never touch its own
+    filesystem to compute them."""
+    from ewsmcp.archive import files
+
+    def boom(data_dir):
+        raise AssertionError("MCP must never compute blob_store_bytes itself")
+
+    monkeypatch.setattr(files, "blob_store_bytes", boom)
+    monkeypatch.setattr(files, "free_gb", boom)
+
+    class StatusWithArchive(RecordingDaemon):
+        async def status(self):
+            return {"ok": True, "archive": {
+                "running": True, "cycles": 9, "blob_store_bytes": 12345,
+                "free_gb": 3.5, "state_counts": {"live": 1},
+                "embedding_backlog": 0,
+            }}
+
+    ctx = _mcp_ctx(db, StatusWithArchive())
+    _seed(ctx)
+    res = _run(ctx, "archive_status")
+    assert res["ok"] is True
+    assert res["blob_store_bytes"] == 12345
+    assert res["free_gb"] == 3.5
+    assert res["runner"]["cycles"] == 9
+    assert "state_counts" not in res["runner"]  # already reported as res["states"]
+    assert "disk_stats" not in res
+
+
+def test_archive_status_omits_disk_figures_with_the_daemon_down(db):
+    ctx = _mcp_ctx(db, DeadDaemon())
+    _seed(ctx)
+    res = _run(ctx, "archive_status")
+    assert res["ok"] is True
+    assert "blob_store_bytes" not in res
+    assert "free_gb" not in res
+    assert res["disk_stats"] == "unavailable — ewsd unreachable"
+
+
+def test_the_mcp_never_holds_the_gemini_key(db):
+    """find_similar and mode=semantic are FORWARDED: only ewsd embeds."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon, ews_capability_tier="full")
+    _seed(ctx)
+    assert "find_similar" not in LOCAL_TOOLS
+
+    res = _run(ctx, "find_similar", text="budget")
+    assert res["proxied"] == "find_similar"
+
+    res = _run(ctx, "search_messages", query="budget", mode="semantic")
+    assert res["proxied"] == "search_messages"
+    assert daemon.calls[-1][1]["mode"] == "semantic"
+
+
+def test_keyword_search_stays_local_and_honours_archived(db):
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    ctx.cache.mark_captured("RAW-1", mime_sha256="a" * 64, mime_path="/x.eml")
+    res = _run(ctx, "search_messages", query="budget", archived="only")
+    assert res["source"] == "cache"
+    assert [i["archive_state"] for i in res["items"]] == ["captured"]
+    assert daemon.calls == []
+
+
+def test_archive_run_and_get_raw_message_proxy_to_the_daemon(db):
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon, ews_capability_tier="full")
+    assert _run(ctx, "archive_run", dry_run=True)["proxied"] == "archive_run"
+    assert _run(ctx, "get_raw_message", id="RAW-1")["proxied"] == "get_raw_message"

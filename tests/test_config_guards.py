@@ -61,3 +61,30 @@ def test_require_exchange_names_ews_email_when_blank():
     with pytest.raises(ValueError) as e:
         s.require_exchange()
     assert "EWS_EMAIL" in str(e.value)
+
+
+def test_archive_settings_default_safe(monkeypatch):
+    from conftest import make_settings
+    s = make_settings()
+    assert s.archive_folders == "inbox,sent"
+    assert s.archive_after_days == 180
+    assert s.archive_grace_days == 7
+    assert s.archive_delete_enabled is False       # deletion is OFF by default
+    assert s.archive_max_delete_per_run == 200
+    assert s.archive_min_free_gb == 2.0
+    assert s.archive_cycle_seconds == 300
+    assert s.embed_dims == 768
+    assert s.gemini_api_key is None
+    assert s.semantic_enabled() is False
+
+
+def test_semantic_enabled_only_with_a_key():
+    from conftest import make_settings
+    assert make_settings(gemini_api_key="k").semantic_enabled() is True
+
+
+def test_embed_dims_must_match_the_vector_column():
+    import pytest
+    from conftest import make_settings
+    with pytest.raises(ValueError, match="EMBED_DIMS"):
+        make_settings(embed_dims=1536)

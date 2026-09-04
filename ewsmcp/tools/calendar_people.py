@@ -18,6 +18,7 @@ exchangelib 5.0.3 shapes verified against the installed library:
   ErrorNameResolutionNoResults) — those mean "no match", skip them.
 """
 
+import asyncio
 import time
 from datetime import datetime, timedelta
 from datetime import time as dtime
@@ -447,12 +448,13 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
     cache_block: Dict[str, Any] = {"enabled": True, "ready": ctx.cache is not None}
     if ctx.cache is not None:
         try:
-            cache_block.update(ctx.cache.stats())
+            # A blocking Postgres roundtrip — never on the event loop.
+            cache_block.update(await asyncio.to_thread(ctx.cache.stats))
         except Exception as exc:
             cache_block["error"] = str(exc)
     if ctx.sync is not None:
         cache_block["sync"] = ctx.sync.status()
-    return {
+    out = {
         "ok": True,
         "version": __version__,
         "uptime_s": int(time.time() - ctx.started_at),
@@ -464,6 +466,27 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
         "alias_stats": ctx.aliaser.stats(),
         "cache": cache_block,
     }
+    if ctx.archive is not None:
+        archive_block = dict(ctx.archive.status())
+        disk_stats = getattr(ctx.archive, "disk_stats", None)
+        if disk_stats is not None:
+            try:
+                archive_block.update(await disk_stats())
+            except Exception as exc:
+                archive_block["error"] = str(exc)
+        if ctx.cache is not None:
+            try:
+                # Two counting queries over ews.messages: one hop off the
+                # event loop for both.
+                counts, backlog = await asyncio.to_thread(
+                    lambda: (ctx.cache.archive_state_counts(),
+                             ctx.cache.embedding_backlog()))
+                archive_block["state_counts"] = counts
+                archive_block["embedding_backlog"] = backlog
+            except Exception as exc:
+                archive_block["error"] = str(exc)
+        out["archive"] = archive_block
+    return out
 
 
 # ---------------------------------------------------------------- specs

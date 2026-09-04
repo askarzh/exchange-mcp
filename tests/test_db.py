@@ -99,6 +99,12 @@ def test_migrations_apply_as_a_role_named_after_an_existing_schema(pg_dsn):
         ) as c:
             c.execute("CREATE SCHEMA IF NOT EXISTS ewsmigrole AUTHORIZATION ewsmigrole")
             c.execute("CREATE SCHEMA IF NOT EXISTS ews AUTHORIZATION ewsmigrole")
+            # Unlike unaccent, pgvector is not a trusted extension: CREATE
+            # EXTENSION vector requires superuser, so a DBA installs it up
+            # front exactly as they would in production. Once installed,
+            # migration 003's CREATE EXTENSION IF NOT EXISTS is a no-op that
+            # the app role can run without elevated privilege.
+            c.execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
         d = Database(_role_dsn(pg_dsn, "ewsmigrole", "x", "ewsmigtest"),
                      min_size=1, max_size=2)
         try:
@@ -114,6 +120,14 @@ def test_migrations_apply_as_a_role_named_after_an_existing_schema(pg_dsn):
                     "JOIN pg_namespace n ON n.oid = e.extnamespace "
                     "WHERE e.extname = 'unaccent'").fetchone()["s"]
                 assert schema == "public"
+                # migration 003 has the identical trap for pgvector: a bare
+                # CREATE EXTENSION vector would land in schema `ews` under
+                # this role's search_path.
+                vec_schema = c.execute(
+                    "SELECT n.nspname AS s FROM pg_extension e "
+                    "JOIN pg_namespace n ON n.oid = e.extnamespace "
+                    "WHERE e.extname = 'vector'").fetchone()["s"]
+                assert vec_schema == "public"
                 # the generated column evaluates ews.immutable_unaccent under
                 # this session's search_path — it must not depend on it
                 c.execute("INSERT INTO ews.messages(ews_id, folder_id, subject) "

@@ -8,12 +8,12 @@ import psycopg_pool
 from mcp.server import Server
 from mcp.types import Tool
 
+from ..annotations import ANNOTATIONS
 from ..audit import NullAudit
 from ..cache.store import CacheStore
 from ..config import Settings
 from ..db import SCHEMA_VERSION, Database, SchemaOutdated
 from ..ids import IdAliaser
-from ..server import ANNOTATIONS
 from ..tools.base import Context
 from .client import DaemonClient
 from .dispatch import dispatch_mcp

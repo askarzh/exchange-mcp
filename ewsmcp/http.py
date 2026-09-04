@@ -2,15 +2,21 @@
 status (DESIGN.md §Transports). No /mcp here — that's ewsmcp/mcp/http.py,
 the only module that speaks MCP over Streamable HTTP."""
 
-import hmac
+import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import jsonschema
 
-from . import __version__, uploads
+from . import __version__, downloads, uploads
 from .errors import HTTP_BY_CODE
+
+# Re-exported: the thin MCP's HTTP transport imports them from here today,
+# but they must not drag ewsd's gateway/tool imports along (see httputil.py).
+from .httputil import _authorized as _authorized
+from .httputil import _send_json as _send_json
 from .server import start_connection_manager
 from .tools.base import dispatch, validator_for
 from .tools.calendar_people import _get_server_status
@@ -18,34 +24,16 @@ from .tools.calendar_people import _get_server_status
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1_048_576  # 1 MiB — tool arguments, not attachments
+_DOWNLOAD_CHUNK = 1024 * 1024  # stream files in 1 MiB chunks, not whole into memory
 
 
-def _authorized(headers, api_key: str) -> bool:
-    expected = api_key.encode()
-    for name, value in headers or []:
-        lname = name.lower() if isinstance(name, bytes) else str(name).encode().lower()
-        raw = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
-        if lname == b"authorization" and raw.lower().startswith("bearer "):
-            if hmac.compare_digest(raw[7:].strip().encode(), expected):
-                return True
-        elif lname == b"x-api-key":
-            if hmac.compare_digest(raw.strip().encode(), expected):
-                return True
-    return False
-
-
-async def _send_json(send, status: int, payload: dict[str, Any]) -> None:
-    body = json.dumps(payload, ensure_ascii=False, default=str).encode()
-    await send({"type": "http.response.start", "status": status, "headers": [
-        [b"content-type", b"application/json"],
-        [b"content-length", str(len(body)).encode()],
-    ]})
-    await send({"type": "http.response.body", "body": body})
-
-
-def _metrics_text(ctx) -> str:
+async def _metrics_text(ctx) -> str:
     """Prometheus exposition (text format 0.0.4). Behind the API key like
-    every non-health endpoint — scrape with a bearer token."""
+    every non-health endpoint — scrape with a bearer token.
+
+    Async because the cache/archive gauges are Postgres COUNT queries: they
+    go through asyncio.to_thread rather than blocking the event loop of a
+    process that is also serving tool calls."""
     import time as _t
     lines = [
         "# TYPE ewsmcp_uptime_seconds gauge",
@@ -63,7 +51,7 @@ def _metrics_text(ctx) -> str:
             lines.append(f'ewsmcp_errors_total{{code="{key[4:]}"}} {value}')
     if ctx.cache is not None:
         try:
-            stats = ctx.cache.stats()
+            stats = await asyncio.to_thread(ctx.cache.stats)
             lines.append("# TYPE ewsmcp_cache_rows gauge")
             for table, n in stats.get("rows", {}).items():
                 lines.append(f'ewsmcp_cache_rows{{table="{table}"}} {n}')
@@ -81,6 +69,24 @@ def _metrics_text(ctx) -> str:
             lines.append(f"ewsmcp_sync_last_cycle_age_seconds {age}")
         lines.append("# TYPE ewsmcp_sync_degraded gauge")
         lines.append(f"ewsmcp_sync_degraded {1 if status.get('last_error') else 0}")
+    if ctx.archive is not None:
+        status = ctx.archive.status()
+        lines.append("# TYPE ewsmcp_archive_cycles_total counter")
+        lines.append(f"ewsmcp_archive_cycles_total {status.get('cycles', 0)}")
+        lines.append("# TYPE ewsmcp_archive_degraded gauge")
+        lines.append(f"ewsmcp_archive_degraded {1 if status.get('last_error') else 0}")
+        if ctx.cache is not None:
+            try:
+                counts, backlog = await asyncio.to_thread(
+                    lambda: (ctx.cache.archive_state_counts(),
+                             ctx.cache.embedding_backlog()))
+                lines.append("# TYPE ewsmcp_archive_messages gauge")
+                for state, n in counts.items():
+                    lines.append(f'ewsmcp_archive_messages{{state="{state}"}} {n}')
+                lines.append("# TYPE ewsmcp_archive_embedding_backlog gauge")
+                lines.append(f"ewsmcp_archive_embedding_backlog {backlog}")
+            except Exception:
+                pass
     return "\n".join(lines) + "\n"
 
 
@@ -94,6 +100,28 @@ def _openapi(ctx, tools_prefix: str) -> dict[str, Any]:
             "requestBody": {"content": {"application/json": {"schema": schema["inputSchema"]}}},
             "responses": {"200": {"description": "tool result"}},
         }}
+    # /v1/archive/run is a thin alias for POST /v1/tools/archive_run (see
+    # _dispatch_tool_route) — only documented when the tool is actually
+    # registered at this server's tier, same as every other tools_prefix
+    # entry above.
+    archive_run_spec = ctx.registry.get("archive_run")
+    if archive_run_spec is not None:
+        schema = archive_run_spec.public_schema()
+        paths["/v1/archive/run"] = {"post": {
+            "operationId": "archive_run_route",
+            "summary": schema["description"][:120],
+            "requestBody": {"content": {"application/json": {"schema": schema["inputSchema"]}}},
+            "responses": {"200": {"description": "archive_run result or "
+                                                  "two-phase confirmation"}},
+        }}
+    paths["/v1/archive/runs/{id}"] = {"get": {
+        "operationId": "get_archive_run",
+        "summary": "Read one archive_runs row by id.",
+        "parameters": [{"name": "id", "in": "path", "required": True,
+                        "schema": {"type": "integer"}}],
+        "responses": {"200": {"description": "the archive_runs row"},
+                     "404": {"description": "no such run"}},
+    }}
     return {"openapi": "3.0.3",
             "info": {"title": "ews-mcp v5", "version": __version__},
             "paths": paths}
@@ -129,6 +157,38 @@ async def _read_json_body(receive, send) -> Any | None:
         await _send_json(send, 400, {"ok": False, "error": {
             "code": "validation", "message": f"invalid JSON body: {e}"}})
         return None
+
+
+async def _dispatch_tool_route(ctx, name: str, receive, send) -> None:
+    """The REST tool shim's body, factored out so `/v1/archive/run` can be a
+    thin alias for `POST /v1/tools/archive_run` — same registry lookup
+    (404/tier envelope when the tool isn't registered at this server's
+    tier), same schema validation, same `dispatch()` call, so `dry_run=false`
+    goes through the tool's own two-phase confirm (spec.preview) exactly
+    like every other destructive tool. No route may execute a real archive
+    pass with only the bearer."""
+    spec = ctx.registry.get(name)
+    if spec is None:
+        return await _send_json(send, 404, {"ok": False, "error": {
+            "code": "validation", "message": f"Unknown tool: {name}"}})
+    arguments = await _read_json_body(receive, send)
+    if arguments is None:
+        return
+    if not isinstance(arguments, dict):
+        return await _send_json(send, 400, {"ok": False, "error": {
+            "code": "validation",
+            "message": "request body must be a JSON object of tool arguments"}})
+    error = jsonschema.exceptions.best_match(
+        validator_for(spec).iter_errors(arguments))
+    if error is not None:
+        return await _send_json(send, 400, {"ok": False, "error": {
+            "code": "validation", "message": error.message,
+            "hint": f"See the {name} schema in /openapi.json."}})
+    result = await dispatch(ctx, spec, arguments, transport="rest")
+    status = 200
+    if isinstance(result, dict) and result.get("ok") is False:
+        status = HTTP_BY_CODE.get(result.get("error", {}).get("code", ""), 500)
+    return await _send_json(send, status, result)
 
 
 def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
@@ -195,6 +255,52 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
                     "code": "not_found", "message": "not found"}})
             return await _send_json(send, 200, {"ok": True, **out})
 
+        # Capability-URL download: GET /download/<token>. Same model as
+        # /upload — deliberately ahead of the bearer gate, single use, and
+        # every failure is an identical opaque 404. The file is streamed in
+        # chunks rather than read whole into memory, since blobs may be
+        # tens of MB.
+        if path.startswith("/download/") and method == "GET":
+            token = path[len("/download/"):]
+            try:
+                rec = downloads.redeem(settings.data_dir, token)
+                file_path = Path(rec["path"])
+                size = file_path.stat().st_size
+            except (downloads.DownloadRejected, OSError):
+                return await _send_json(send, 404, {"ok": False, "error": {
+                    "code": "not_found", "message": "not found"}})
+            # Defense in depth: re-sanitize the header values here too, even
+            # though downloads.redeem() already did — these ride verbatim
+            # into HTTP headers and are ultimately attacker-influenced
+            # (mail-derived names/types).
+            safe_ct = downloads.safe_content_type(rec["content_type"])
+            # One line, two forms: an ASCII-safe `filename=` plus the real
+            # (possibly non-ASCII) name percent-encoded in `filename*`
+            # (RFC 5987) — otherwise "Отчёт.pdf" is served as "pdf".
+            disposition = downloads.content_disposition(
+                rec.get("orig_name") or rec["name"]).encode("ascii")
+            await send({"type": "http.response.start", "status": 200, "headers": [
+                [b"content-type", safe_ct.encode()],
+                [b"content-length", str(size).encode()],
+                [b"content-disposition", disposition],
+            ]})
+            try:
+                with file_path.open("rb") as fh:
+                    chunk = fh.read(_DOWNLOAD_CHUNK)
+                    while True:
+                        nxt = fh.read(_DOWNLOAD_CHUNK)
+                        await send({"type": "http.response.body", "body": chunk,
+                                    "more_body": bool(nxt)})
+                        if not nxt:
+                            break
+                        chunk = nxt
+            except Exception:
+                # The client hung up mid-stream (broken pipe / connection
+                # reset). Nothing left to serve — stop quietly rather than
+                # raising into the ASGI server.
+                logger.debug("download %s: client disconnected mid-stream", token)
+            return None
+
         if key and not _authorized(scope.get("headers"), key):
             return await _send_json(send, 401, {"ok": False, "error": {
                 "code": "auth_failed", "message": "missing or invalid bearer token"}})
@@ -202,8 +308,27 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
         if path == "/v1/status" and method == "GET":
             return await _send_json(send, 200, await _get_server_status(ctx))
 
+        if path == "/v1/archive/run" and method == "POST":
+            # Thin alias for POST /v1/tools/archive_run — NOT a shortcut
+            # around the tool's own gates. dry_run=false is two-phase
+            # confirmed by the registered archive_run ToolSpec's preview
+            # hook (see ewsmcp/tools/archive.py); this route never executes
+            # a real pass on the bearer alone.
+            return await _dispatch_tool_route(ctx, "archive_run", receive, send)
+
+        if path.startswith("/v1/archive/runs/") and method == "GET":
+            raw = path.removeprefix("/v1/archive/runs/")
+            if not raw.isdigit():
+                return await _send_json(send, 400, {"ok": False, "error": {
+                    "code": "validation", "message": "run id must be an integer"}})
+            row = ctx.cache.get_run(int(raw)) if ctx.cache is not None else None
+            if row is None:
+                return await _send_json(send, 404, {"ok": False, "error": {
+                    "code": "not_found", "message": f"no archive run {raw}"}})
+            return await _send_json(send, 200, {"ok": True, **dict(row)})
+
         if path == "/metrics" and method == "GET":
-            body = _metrics_text(ctx).encode()
+            body = (await _metrics_text(ctx)).encode()
             await send({"type": "http.response.start", "status": 200, "headers": [
                 [b"content-type", b"text/plain; version=0.0.4; charset=utf-8"],
                 [b"content-length", str(len(body)).encode()],
@@ -220,28 +345,7 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
             ]})
         if path.startswith(tools_prefix + "/") and method == "POST":
             name = path.removeprefix(tools_prefix + "/")
-            spec = ctx.registry.get(name)
-            if spec is None:
-                return await _send_json(send, 404, {"ok": False, "error": {
-                    "code": "validation", "message": f"Unknown tool: {name}"}})
-            arguments = await _read_json_body(receive, send)
-            if arguments is None:
-                return
-            if not isinstance(arguments, dict):
-                return await _send_json(send, 400, {"ok": False, "error": {
-                    "code": "validation",
-                    "message": "request body must be a JSON object of tool arguments"}})
-            error = jsonschema.exceptions.best_match(
-                validator_for(spec).iter_errors(arguments))
-            if error is not None:
-                return await _send_json(send, 400, {"ok": False, "error": {
-                    "code": "validation", "message": error.message,
-                    "hint": f"See the {name} schema in /openapi.json."}})
-            result = await dispatch(ctx, spec, arguments, transport="rest")
-            status = 200
-            if isinstance(result, dict) and result.get("ok") is False:
-                status = HTTP_BY_CODE.get(result.get("error", {}).get("code", ""), 500)
-            return await _send_json(send, status, result)
+            return await _dispatch_tool_route(ctx, name, receive, send)
 
         return await _send_json(send, 404, {"ok": False, "error": {
             "code": "validation", "message": "not found"}})

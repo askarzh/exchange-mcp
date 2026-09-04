@@ -16,11 +16,14 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import psycopg
 
+from .. import shared
+from ..archive import files
 from ..dates import parse_when
 from ..dto import envelope
 from ..errors import ToolError
@@ -65,6 +68,8 @@ def _row_card(ctx: Context, row: Any) -> dict[str, Any]:
         card["attach"] = True
     if (row["importance"] or "").lower() == "high":
         card["importance"] = "high"
+    if row["archive_state"] != "live":
+        card["archive_state"] = row["archive_state"]
     return card
 
 
@@ -89,9 +94,19 @@ def _row_full(ctx: Context, row: Any) -> dict[str, Any]:
     if cats:
         full["categories"] = cats
     if row["has_attachments"]:
-        full["attachments_hint"] = ("message has attachments — call again "
-                                    "with fresh=true for the inventory, or "
-                                    "get_attachment to read one")
+        if row["archive_state"] != "live":
+            # Archived mail has no live item to re-fetch — the inventory
+            # lives in ews.attachments, not behind fresh=true.
+            atts = ctx.cache.attachments_for(row["ews_id"])
+            full["attachments"] = [{
+                "name": a["name"], "size": a["size"],
+                "content_type": a["content_type"],
+                "downloadable": bool(a["sha256"]),
+            } for a in atts]
+        else:
+            full["attachments_hint"] = ("message has attachments — call again "
+                                        "with fresh=true for the inventory, or "
+                                        "get_attachment to read one")
     return full
 
 
@@ -224,6 +239,7 @@ async def list_folders(ctx: Context, depth: int,
         return None
     if not folder_rows:
         return None
+    archived = await asyncio.to_thread(ctx.cache.archived_counts_by_folder)
     rows = []
     for r in folder_rows:
         if (r["path"] or "").count("/") + 1 > depth:
@@ -238,6 +254,7 @@ async def list_folders(ctx: Context, depth: int,
         }
         if r["wk"]:
             row["wk"] = r["wk"]
+        row["archived"] = archived.get(r["ews_id"], 0)
         rows.append(row)
     # The hierarchy lane's own watermark — `events` belongs to the slow
     # (calendar/tasks) lane and says nothing about when these rows were read.
@@ -246,17 +263,47 @@ async def list_folders(ctx: Context, depth: int,
                   "cache", as_of)
 
 
+_ARCHIVED_MODES = ("any", "only", "exclude")
+
+
+def _semantic_rows(ctx: Context, query: str, archived: str, offset: int,
+                   limit: int, filters: dict[str, Any]
+                   ) -> tuple[list[Any], int, dict[str, Any]]:
+    """Hybrid when an index exists, keyword otherwise — never an error.
+
+    A missing key or a dead Gemini must degrade the ANSWER, not remove the
+    tool: the model asked for meaning and gets words, clearly labelled."""
+    if ctx.semantic is None:
+        rows, total = ctx.cache.search_messages(
+            text=query, archived=archived, offset=offset, limit=limit, **filters)
+        return rows, total, {"degraded": True,
+                             "reason": "semantic search is not configured "
+                                       "(GEMINI_API_KEY unset) — keyword results"}
+    rows, degraded = ctx.semantic.hybrid_search(
+        query, limit=limit, offset=offset, archived=archived, **filters)
+    meta = {"degraded": True,
+            "reason": "the embedding service failed — keyword results"} \
+        if degraded else {"degraded": False, "mode": "hybrid_rrf"}
+    return rows, len(rows) + offset, meta
+
+
 async def search_messages(ctx: Context, *, folder: str | None,
                           query: str | None, sender: str | None,
                           subject: str | None, since: str | None,
                           until: str | None, is_unread: bool | None,
                           has_attachments: bool | None, offset: int,
-                          limit: int) -> dict[str, Any] | None:
+                          limit: int, archived: str = "any",
+                          mode: str = "keyword") -> dict[str, Any] | None:
     """Store-only search over the mirror. None only when there is no cache
     at all (``ctx.cache is None``) — the caller then goes straight to live
     EWS, same as every other cache_reads helper. Otherwise raises ToolError
-    on a bad `folder`; psycopg errors propagate (the caller maps them to
-    backend_unavailable)."""
+    on a bad `folder` or `archived`; psycopg errors propagate (the caller
+    maps them to backend_unavailable). `mode="semantic"` runs the hybrid
+    (keyword + embedding, RRF-fused) and degrades to keyword with
+    `meta.degraded` when the embedder is missing or fails."""
+    if archived not in _ARCHIVED_MODES:
+        raise ToolError("validation",
+                        "archived must be 'any', 'only' or 'exclude'")
     if ctx.cache is None:
         return None
     folder_ids = [await resolve_folder_id(ctx, folder)] if folder else None
@@ -268,16 +315,25 @@ async def search_messages(ctx: Context, *, folder: str | None,
     tz = ctx.settings.ews_tz
     since_ts = int(parse_when(since, "since", tz).timestamp()) if since else None
     until_ts = int(parse_when(until, "until", tz).timestamp()) if until else None
-    rows, total = await asyncio.to_thread(
-        ctx.cache.search_messages,
-        folder_ids=folder_ids, text=query, sender=sender,
-        subject=subject, since_ts=since_ts, until_ts=until_ts,
+    filters: dict[str, Any] = dict(
+        sender=sender, subject=subject, since_ts=since_ts, until_ts=until_ts,
         is_unread=is_unread, has_attachments=has_attachments,
-        offset=offset, limit=limit, archived="any",
+        folder_ids=folder_ids,
     )
+    meta: dict[str, Any] | None = None
+    if mode == "semantic":
+        rows, total, meta = await asyncio.to_thread(
+            _semantic_rows, ctx, query or "", archived, offset, limit, filters)
+    else:
+        rows, total = await asyncio.to_thread(
+            ctx.cache.search_messages, text=query, archived=archived,
+            offset=offset, limit=limit, **filters)
     cards = await asyncio.to_thread(lambda: [_row_card(ctx, r) for r in rows])
-    return _stamp(envelope(cards, total_available=total, offset=offset),
-                  "cache", as_of)
+    out = _stamp(envelope(cards, total_available=total, offset=offset),
+                 "cache", as_of)
+    if meta:
+        out["meta"] = meta
+    return out
 
 
 async def get_message(ctx: Context, raw_id: str,
@@ -384,4 +440,96 @@ def _task_row_dto(ctx: Context, row: Any) -> dict[str, Any]:
         out["due"] = row["due_iso"]
     if row["status"]:
         out["status"] = row["status"]
+    return out
+
+
+# --------------------------------------------------------------------------
+# Archived attachments — served from the blob store, never from Exchange
+# --------------------------------------------------------------------------
+
+_TEXTY_TYPES = ("text/",)
+_TEXTY_SUFFIXES = (".txt", ".csv", ".md", ".log", ".json")
+
+
+def _pick_row(rows: list[dict[str, Any]], selector: str | None) -> dict[str, Any]:
+    if selector is None:
+        if len(rows) != 1:
+            raise ToolError(
+                "validation",
+                f"this message has {len(rows)} attachments — pass `attachment` "
+                "with a name or a zero-based index as a string",
+                hint="Names: " + ", ".join(str(r["name"]) for r in rows[:10]))
+        return rows[0]
+    if selector.isdigit() and int(selector) < len(rows):
+        return rows[int(selector)]
+    for row in rows:
+        if (row["name"] or "").lower() == selector.lower():
+            return row
+    raise ToolError("not_found", f"No attachment named {selector!r} on this message.",
+                    hint="Names: " + ", ".join(str(r["name"]) for r in rows[:10]))
+
+
+async def attachment_from_archive(ctx: Context, raw_id: str,
+                                  attachment: str | None,
+                                  mode: str) -> dict[str, Any] | None:
+    """Serve an attachment of ARCHIVED mail from the blob store, or None
+    (either a live message, or no cache at all — the caller then falls
+    through to the live Exchange path)."""
+    if ctx.cache is None:
+        return None
+    row = await asyncio.to_thread(ctx.cache.get_message, raw_id)
+    if row is None or row["archive_state"] == "live":
+        return None
+    rows = await asyncio.to_thread(ctx.cache.attachments_for, row["ews_id"])
+    if not rows:
+        raise ToolError("not_found", "This archived message has no attachments.")
+    att = _pick_row(rows, attachment)
+    name = att["name"] or "attachment"
+    out: dict[str, Any] = {"ok": True, "name": name, "size_bytes": att["size"],
+                           "content_type": att["content_type"],
+                           "source": "archive"}
+    if not att["sha256"]:
+        # A nested message: it exists only inside the raw MIME.
+        out["mode"] = "info"
+        out["hint"] = ("Nested message attachment — it lives inside the raw "
+                       "MIME. Call get_raw_message for the original .eml.")
+        return out
+    path = files.blob_path(ctx.settings.data_dir, att["sha256"])
+    if not path.is_file():
+        raise ToolError("not_found", f"The archived blob is missing at {path}.",
+                        hint="The next verify pass re-captures this message.")
+    texty = (att["content_type"] or "").lower().startswith(_TEXTY_TYPES) or \
+        name.lower().endswith(_TEXTY_SUFFIXES)
+    chosen = mode
+    if mode == "auto":
+        chosen = "text" if texty else "info"
+        if chosen == "info":
+            out["hint"] = ("Binary attachment — metadata only. Call again with "
+                           "mode='save' to write it to disk.")
+    if chosen == "info":
+        out["mode"] = "info"
+        return out
+    data = await asyncio.to_thread(path.read_bytes)
+    if chosen == "text":
+        text = data.decode("utf-8", errors="replace")
+        out["mode"] = "text"
+        out["text"] = text[:20_000]
+        if len(text) > 20_000:
+            out["truncated"] = True
+        return out
+    safe = shared.safe_name(name)
+    dest = Path(ctx.settings.data_dir) / "attachments"
+    dest.mkdir(parents=True, exist_ok=True)
+    saved = dest / safe
+    await asyncio.to_thread(saved.write_bytes, data)
+    out["mode"] = "save"
+    out["saved_path"] = str(saved)
+    try:
+        published = shared.publish(ctx.settings.shared_dir, saved)
+    except OSError as exc:
+        logger.warning("could not publish %s to the shared space: %s", safe, exc)
+        published = None
+    if published:
+        out["shared_name"] = published
+        out["shared_path"] = str(Path(ctx.settings.shared_dir) / published)
     return out

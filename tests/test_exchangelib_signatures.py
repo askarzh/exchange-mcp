@@ -94,6 +94,17 @@ def test_item_delete_has_no_disposal_kwargs():
     assert "delete_type" not in params
 
 
+def test_item_delete_is_a_hard_delete():
+    """The archive deleter (ewsmcp/archive/delete.py) calls item.delete()
+    to remove mail PERMANENTLY, having captured it first. If a future
+    exchangelib made delete() a move-to-trash, the archive would silently
+    start double-storing mail that is still in the mailbox — and the
+    "hard-deleted" wording in the audit record would be a lie. Pin the
+    body, not just the signature."""
+    source = inspect.getsource(Item.delete)
+    assert "delete_type=HARD_DELETE" in source
+
+
 def test_calendar_responses_accept_extra_kwargs():
     """accept/decline/tentatively_accept forward **kwargs (writes passes
     body=...); cancel() is pure **kwargs (writes passes new_body=...)."""
@@ -146,3 +157,15 @@ def test_protocol_cache_is_evictable():
     fresh session + auth negotiation; closing the protocol alone hands
     the same wedged instance back on the next build."""
     assert callable(getattr(CachingProtocol, "clear_cache", None))
+
+
+def test_file_attachment_exposes_the_fields_capture_reads():
+    from exchangelib.attachments import FileAttachment, ItemAttachment
+    for field in ("name", "content_type", "size", "is_inline", "content"):
+        assert hasattr(FileAttachment, field), field
+    assert issubclass(ItemAttachment, object)
+
+
+def test_message_exposes_mime_content():
+    from exchangelib import Message
+    assert "mime_content" in {f.name for f in Message.FIELDS}

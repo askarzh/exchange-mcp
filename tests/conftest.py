@@ -129,7 +129,8 @@ def seed_folders(store):
 def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
              sender_email="a@corp.example", sender_name="Ahmed",
              body="please review the numbers", date_ts=None, is_read=1,
-             has_attachments=0, conv="CONV-1", imid=None, to=None):
+             has_attachments=0, conv="CONV-1", imid=None, to=None,
+             categories=None):
     """One `CacheStore.upsert_messages` row."""
     return {
         "ews_id": ews_id,
@@ -145,10 +146,23 @@ def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
         "is_read": is_read,
         "has_attachments": has_attachments,
         "importance": None,
-        "categories_json": "[]",
+        "categories_json": json.dumps(categories or []),
         "body_clean": body,
         "internet_message_id": imid or f"<{ews_id}@corp.example>",
     }
+
+
+@pytest.fixture
+def store_with_message(db):
+    """A CacheStore holding exactly one live inbox message, plus its ews_id."""
+    from ewsmcp.cache.store import CacheStore
+    store = CacheStore(db)
+    store.replace_folders([
+        {"ews_id": "FID-INBOX", "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
+         "total": 1, "unread": 0, "children": 0},
+    ])
+    store.upsert_messages([make_row("RAW-1")])
+    return store, "RAW-1"
 
 
 def make_context(db, gateway=None, cache=True, audit_dir=None, **overrides):
@@ -168,3 +182,30 @@ def make_context(db, gateway=None, cache=True, audit_dir=None, **overrides):
                   cache=CacheStore(db) if cache else None, db=db)
     build_registry(ctx)
     return ctx
+
+
+class FakeEmbedder:
+    """Deterministic, offline stand-in for GeminiEmbedder.
+
+    Hashes each whitespace token into one of `dims` buckets, so texts that
+    share vocabulary land near each other under cosine distance and the same
+    text always yields the same vector. No network, ever.
+    """
+
+    def __init__(self, dims: int = 768):
+        self.dims = dims
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        import hashlib
+        import math
+        self.calls.append(list(texts))
+        out = []
+        for text in texts:
+            vec = [0.0] * self.dims
+            for token in (text or "").lower().split():
+                h = int(hashlib.sha256(token.encode()).hexdigest()[:8], 16)
+                vec[h % self.dims] += 1.0
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            out.append([v / norm for v in vec])
+        return out

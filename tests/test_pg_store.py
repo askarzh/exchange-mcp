@@ -183,9 +183,9 @@ def test_schema_is_v2_with_folder_id_and_no_dead_columns(db):
     assert "norm_text" not in cols
     assert "search_tsv" in cols
     assert "sender_sigs" not in tables
-    from ewsmcp.db import SCHEMA_VERSION
-    assert SCHEMA_VERSION == 2
-    assert db.schema_version() == 2
+    # the version-exact check lives in test_archive_schema.py, which tracks
+    # the newest migration; this test only cares that migration 002's shape
+    # survives later migrations.
 
 
 def test_search_folds_accents_in_the_database(store):
