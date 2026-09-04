@@ -35,6 +35,19 @@ class FakeItem:
         self.has_attachments = bool(attachments)
 
 
+class FakeAttachment:
+    """A minimal attachment double for tests that only need `.name` /
+    `.content` shape (verify.py never re-inspects re-fetched attachment
+    bytes — its blob check goes straight to the store and disk)."""
+
+    def __init__(self, name, content, content_type="application/octet-stream",
+                is_inline=False):
+        self.name = name
+        self.content = content
+        self.content_type = content_type
+        self.is_inline = is_inline
+
+
 class FakeAccount:
     def __init__(self, items):
         self.items = items                 # {raw_id: FakeItem | Exception}
