@@ -26,7 +26,7 @@ class EmbedWorker:
     async def run(self, *, limit: int | None = None) -> dict[str, Any]:
         out: dict[str, Any] = {"embedded": 0, "backlog": 0, "error": None}
         if self.index is None:
-            out["backlog"] = self.store.embedding_backlog()
+            out["backlog"] = await asyncio.to_thread(self.store.embedding_backlog)
             return out
         budget = self.page if limit is None else int(limit)
         try:
@@ -43,5 +43,5 @@ class EmbedWorker:
         except Exception as exc:  # noqa: BLE001 - backlog grows, search degrades
             out["error"] = f"{type(exc).__name__}: {exc}"
             logger.warning("embedding pass failed: %s", out["error"])
-        out["backlog"] = self.store.embedding_backlog()
+        out["backlog"] = await asyncio.to_thread(self.store.embedding_backlog)
         return out

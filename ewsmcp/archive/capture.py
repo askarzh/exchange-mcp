@@ -17,6 +17,7 @@ is retried next cycle); a full disk stops the whole run before any fetch.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -44,12 +45,16 @@ class Capturer:
 
     async def run(self, *, limit: int = BATCH_SIZE,
                   dry_run: bool = True) -> dict[str, Any]:
-        folder_ids = self.policy.folder_ids(self.store)
-        cutoff = self.policy.capture_cutoff_ts()
-        selector = {"folder_ids": folder_ids, "before_ts": cutoff,
-                    "exclude_categories": list(self.policy.exclude_categories)}
-        total = self.store.archive_candidate_count(**selector)
-        rows = self.store.archive_candidates(**selector, limit=int(limit))
+        # Folder resolution and both candidate queries are blocking DB
+        # calls: one hop off the event loop for the whole selection.
+        def select() -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
+            sel = {"folder_ids": self.policy.folder_ids(self.store),
+                   "before_ts": self.policy.capture_cutoff_ts(),
+                   "exclude_categories": list(self.policy.exclude_categories)}
+            return (self.store.archive_candidate_count(**sel),
+                    self.store.archive_candidates(**sel, limit=int(limit)), sel)
+
+        total, rows, _selector = await asyncio.to_thread(select)
         sample = [{"ews_id": r["ews_id"], "subject": r["subject"],
                    "date": r["date_iso"]} for r in rows[:10]]
         result: dict[str, Any] = {"candidates": total, "captured": 0, "failed": 0,
@@ -57,7 +62,8 @@ class Capturer:
         if dry_run or not rows:
             return result
         try:
-            files.ensure_free_space(self.settings.data_dir, self.policy.min_free_gb)
+            await asyncio.to_thread(files.ensure_free_space,
+                                    self.settings.data_dir, self.policy.min_free_gb)
         except files.DiskFull as exc:
             logger.error("capture stopped: %s", exc)
             result["stopped"] = str(exc)
