@@ -11,7 +11,6 @@ from typing import Any
 import jsonschema
 
 from . import __version__, downloads, uploads
-from .archive.runner import KINDS as ARCHIVE_KINDS
 from .errors import HTTP_BY_CODE
 from .server import start_connection_manager
 from .tools.base import dispatch, validator_for
@@ -149,6 +148,38 @@ async def _read_json_body(receive, send) -> Any | None:
         return None
 
 
+async def _dispatch_tool_route(ctx, name: str, receive, send) -> None:
+    """The REST tool shim's body, factored out so `/v1/archive/run` can be a
+    thin alias for `POST /v1/tools/archive_run` — same registry lookup
+    (404/tier envelope when the tool isn't registered at this server's
+    tier), same schema validation, same `dispatch()` call, so `dry_run=false`
+    goes through the tool's own two-phase confirm (spec.preview) exactly
+    like every other destructive tool. No route may execute a real archive
+    pass with only the bearer."""
+    spec = ctx.registry.get(name)
+    if spec is None:
+        return await _send_json(send, 404, {"ok": False, "error": {
+            "code": "validation", "message": f"Unknown tool: {name}"}})
+    arguments = await _read_json_body(receive, send)
+    if arguments is None:
+        return
+    if not isinstance(arguments, dict):
+        return await _send_json(send, 400, {"ok": False, "error": {
+            "code": "validation",
+            "message": "request body must be a JSON object of tool arguments"}})
+    error = jsonschema.exceptions.best_match(
+        validator_for(spec).iter_errors(arguments))
+    if error is not None:
+        return await _send_json(send, 400, {"ok": False, "error": {
+            "code": "validation", "message": error.message,
+            "hint": f"See the {name} schema in /openapi.json."}})
+    result = await dispatch(ctx, spec, arguments, transport="rest")
+    status = 200
+    if isinstance(result, dict) and result.get("ok") is False:
+        status = HTTP_BY_CODE.get(result.get("error", {}).get("code", ""), 500)
+    return await _send_json(send, status, result)
+
+
 def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
              api_key: str | None = None):
     """ASGI app closure, driven directly by tests (no uvicorn needed).
@@ -264,26 +295,12 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
             return await _send_json(send, 200, await _get_server_status(ctx))
 
         if path == "/v1/archive/run" and method == "POST":
-            body = await _read_json_body(receive, send)
-            if body is None:
-                return
-            if not isinstance(body, dict):
-                return await _send_json(send, 400, {"ok": False, "error": {
-                    "code": "validation",
-                    "message": "request body must be a JSON object"}})
-            kind = str(body.get("kind", "all"))
-            if kind not in ARCHIVE_KINDS:
-                return await _send_json(send, 400, {"ok": False, "error": {
-                    "code": "validation",
-                    "message": f"kind must be one of {', '.join(ARCHIVE_KINDS)}"}})
-            if getattr(ctx, "archive", None) is None:
-                return await _send_json(send, 503, {"ok": False, "error": {
-                    "code": "upstream_unavailable",
-                    "message": "the archive runner is not started"}})
-            result = await ctx.archive.run_once(
-                kind=kind, dry_run=bool(body.get("dry_run", True)),
-                before=body.get("before"), folders=body.get("folders"))
-            return await _send_json(send, 200, result)
+            # Thin alias for POST /v1/tools/archive_run — NOT a shortcut
+            # around the tool's own gates. dry_run=false is two-phase
+            # confirmed by the registered archive_run ToolSpec's preview
+            # hook (see ewsmcp/tools/archive.py); this route never executes
+            # a real pass on the bearer alone.
+            return await _dispatch_tool_route(ctx, "archive_run", receive, send)
 
         if path.startswith("/v1/archive/runs/") and method == "GET":
             raw = path.removeprefix("/v1/archive/runs/")
@@ -314,28 +331,7 @@ def build_app(ctx, settings, *, tools_prefix: str = "/v1/tools",
             ]})
         if path.startswith(tools_prefix + "/") and method == "POST":
             name = path.removeprefix(tools_prefix + "/")
-            spec = ctx.registry.get(name)
-            if spec is None:
-                return await _send_json(send, 404, {"ok": False, "error": {
-                    "code": "validation", "message": f"Unknown tool: {name}"}})
-            arguments = await _read_json_body(receive, send)
-            if arguments is None:
-                return
-            if not isinstance(arguments, dict):
-                return await _send_json(send, 400, {"ok": False, "error": {
-                    "code": "validation",
-                    "message": "request body must be a JSON object of tool arguments"}})
-            error = jsonschema.exceptions.best_match(
-                validator_for(spec).iter_errors(arguments))
-            if error is not None:
-                return await _send_json(send, 400, {"ok": False, "error": {
-                    "code": "validation", "message": error.message,
-                    "hint": f"See the {name} schema in /openapi.json."}})
-            result = await dispatch(ctx, spec, arguments, transport="rest")
-            status = 200
-            if isinstance(result, dict) and result.get("ok") is False:
-                status = HTTP_BY_CODE.get(result.get("error", {}).get("code", ""), 500)
-            return await _send_json(send, status, result)
+            return await _dispatch_tool_route(ctx, name, receive, send)
 
         return await _send_json(send, 404, {"ok": False, "error": {
             "code": "validation", "message": "not found"}})

@@ -135,20 +135,29 @@ class _Runner:
     async def run_once(self, *, kind, dry_run, before, folders):
         self.calls.append((kind, dry_run, before, folders))
         return {"ok": True, "run_id": 11, "kind": kind, "dry_run": dry_run,
-                "candidates": 5, "captured": 0, "verified": 0, "reset": 0,
+                "candidates": 3, "captured": 0, "verified": 0, "reset": 0,
                 "deleted": 0, "eligible": 0, "embedded": 0, "failed": 0,
                 "blocked": None, "stopped": None, "error": None, "sample": []}
 
 
+def _full_ctx(db, **over):
+    over.setdefault("ews_capability_tier", "full")
+    ctx = make_context(db, **over)
+    ctx.cache.replace_folders([
+        {"ews_id": "FID-INBOX", "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
+         "total": 0, "unread": 0, "children": 0}])
+    return ctx
+
+
 def test_archive_run_route_needs_the_bearer(db):
-    ctx = make_context(db, ewsd_api_key="k")
+    ctx = _full_ctx(db, ewsd_api_key="k")
     ctx.archive = _Runner()
     app = build_daemon_app(ctx, ctx.settings)
     assert _drive(app, "/v1/archive/run", "POST", {})[0] == 401
 
 
 def test_archive_run_route_defaults_to_a_dry_run(db):
-    ctx = make_context(db, ewsd_api_key="k")
+    ctx = _full_ctx(db, ewsd_api_key="k")
     ctx.archive = _Runner()
     app = build_daemon_app(ctx, ctx.settings)
     status, body = _drive(app, "/v1/archive/run", "POST", {}, headers=AUTH)
@@ -156,18 +165,18 @@ def test_archive_run_route_defaults_to_a_dry_run(db):
     assert ctx.archive.calls == [("all", True, None, None)]
 
 
-def test_archive_run_route_passes_the_arguments_through(db):
-    ctx = make_context(db, ewsd_api_key="k")
+def test_archive_run_route_dry_run_passes_the_arguments_through(db):
+    ctx = _full_ctx(db, ewsd_api_key="k")
     ctx.archive = _Runner()
     app = build_daemon_app(ctx, ctx.settings)
     _drive(app, "/v1/archive/run", "POST",
-           {"kind": "capture", "dry_run": False, "before": "2026-01-01",
+           {"kind": "capture", "dry_run": True, "before": "2026-01-01",
             "folders": ["inbox"]}, headers=AUTH)
-    assert ctx.archive.calls == [("capture", False, "2026-01-01", ["inbox"])]
+    assert ctx.archive.calls == [("capture", True, "2026-01-01", ["inbox"])]
 
 
 def test_archive_run_route_rejects_an_unknown_kind(db):
-    ctx = make_context(db, ewsd_api_key="k")
+    ctx = _full_ctx(db, ewsd_api_key="k")
     ctx.archive = _Runner()
     app = build_daemon_app(ctx, ctx.settings)
     status, body = _drive(app, "/v1/archive/run", "POST", {"kind": "nuke"},
@@ -176,11 +185,47 @@ def test_archive_run_route_rejects_an_unknown_kind(db):
 
 
 def test_archive_run_route_without_a_runner_is_503(db):
-    ctx = make_context(db, ewsd_api_key="k")
+    ctx = _full_ctx(db, ewsd_api_key="k")
     ctx.archive = None
     app = build_daemon_app(ctx, ctx.settings)
     status, body = _drive(app, "/v1/archive/run", "POST", {}, headers=AUTH)
     assert status == 503 and body["error"]["code"] == "upstream_unavailable"
+
+
+def test_archive_run_route_for_real_is_two_phase_confirmed(db):
+    """The bearer alone must never execute a real archive pass — dry_run=false
+    goes through the archive_run tool's own preview + confirm_token gate,
+    same as POST /v1/tools/archive_run."""
+    ctx = _full_ctx(db, ewsd_api_key="k")
+    ctx.archive = _Runner()
+    app = build_daemon_app(ctx, ctx.settings)
+
+    status, phase1 = _drive(app, "/v1/archive/run", "POST", {"dry_run": False},
+                            headers=AUTH)
+    assert status == 200
+    assert phase1["requires_confirmation"] is True and phase1["confirm_token"]
+    # Nothing executed: every call so far was a dry run (the preview hook's
+    # own real dry pass), and zero real (dry_run=False) calls happened.
+    assert all(call[1] is True for call in ctx.archive.calls)
+    assert not any(call[1] is False for call in ctx.archive.calls)
+
+    status, phase2 = _drive(
+        app, "/v1/archive/run", "POST",
+        {"dry_run": False, "confirm_token": phase1["confirm_token"]},
+        headers=AUTH)
+    assert status == 200 and phase2["ok"] is True
+    real_calls = [c for c in ctx.archive.calls if c[1] is False]
+    assert len(real_calls) == 1
+
+
+def test_archive_run_route_below_full_tier_is_the_tools_404_envelope(db):
+    ctx = _full_ctx(db, ewsd_api_key="k", ews_capability_tier="read")
+    assert "archive_run" not in ctx.registry
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, "/v1/archive/run", "POST", {}, headers=AUTH)
+    assert status == 404
+    assert body["error"]["code"] == "validation"
+    assert "archive_run" in body["error"]["message"]
 
 
 def test_archive_run_status_route(db):
