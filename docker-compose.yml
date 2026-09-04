@@ -1,4 +1,4 @@
-# exchange-mcp dev stack: Postgres (pgvector-ready for Phase 2) + ewsd + ewsmcp.
+# exchange-mcp dev stack: Postgres (pgvector, backs the mail archive + semantic search) + ewsd + ewsmcp.
 # Copy .env.example to .env first. Production lives in the operator's own stack.
 services:
   postgres:

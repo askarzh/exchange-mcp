@@ -1,4 +1,4 @@
-# API reference — ews-mcp 5.0
+# API reference — ews-mcp 5.1
 
 The tool table below is **generated from the registry** by
 `scripts/dump_tool_table.py` (`--write` to refresh, `--check` in CI) —
@@ -516,6 +516,48 @@ live rebuild. `fresh: true` is available on `get_message`
 (attachment inventory, raw HTML), `list_folders` and
 `get_mailbox_overview` (live counts) and forwards to `ewsd`'s live route.
 `get_server_status.cache` exposes per-folder watermarks, row counts and
-sync health. `mode: "semantic"` on `search_messages` is Phase 2 work and
-returns a `validation` error until embeddings land — see
-`docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`.
+sync health.
+
+`search_messages` also takes `archived` (`any` | `only` | `exclude`,
+default `any`) and `mode` (`keyword` default, or `semantic`). Every card
+carries `archive_state` — but only when it is not `live`, to keep the
+common all-live case at its old token cost.
+`mode="semantic"` (and the separate `find_similar` tool) never runs on
+`ewsmcp` directly: the MCP process never holds `GEMINI_API_KEY`, so both
+are forwarded to `ewsd` unconditionally. If `GEMINI_API_KEY` is unset on
+`ewsd`, or the embedding/vector call fails, the answer degrades to
+keyword ranking instead of erroring — `meta.degraded: true` and
+`meta.reason` explain why, so a mailbox search never goes dark because a
+remote API is unavailable. See
+`docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md` for
+the full archive + semantic design, and `DESIGN.md` §Archive/§Semantic
+for what is actually built.
+
+## Archive
+
+`archive_run`, `archive_status`, `get_raw_message` and `find_similar`
+cover the mail archive (capture → verify → delete) and semantic search —
+see `DESIGN.md` §Archive/§Semantic for the pipeline and `README.md` for
+the `ARCHIVE_*`/`GEMINI_API_KEY` settings. Notes that don't fit the
+generated table above:
+
+- `archive_run(dry_run=false)` is two-phase confirmed exactly like
+  `send_draft`: call once without `confirm_token` for a REAL dry-run
+  preview (candidate/eligible counts computed from the actual policy and
+  mailbox state), then again with the token to execute. A cycle already
+  in progress (the background loop, or a concurrent `archive_run` call)
+  returns `upstream_unavailable` with `retry_after_s` rather than
+  blocking the call.
+- `archive_status` is answered entirely from Postgres (message counts per
+  `archive_state`, the last five runs, embedding backlog, active policy,
+  `delete_enabled`) — it works from `ewsmcp` with no filesystem access
+  and while Exchange is down. `ewsd`'s own answer additionally reports
+  `blob_store_bytes` and `free_gb`, since only `ewsd` owns `DATA_DIR`.
+- `get_raw_message` never returns bytes: it mints a single-use
+  `GET /download/<token>` capability URL (mirroring `create_upload_link`
+  in the other direction), served only out of `{DATA_DIR}/mime/` or
+  `{DATA_DIR}/blobs/`. Captured/verified/deleted mail is served from
+  disk; live mail is fetched fresh through Exchange on demand (and cached
+  under its content hash) without changing the message's archive state.
+  The link is spent by the first successful download; every rejection
+  (expired, already used, never existed) renders as the same opaque 404.

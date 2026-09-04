@@ -18,14 +18,27 @@ def test_tool_table_matches_registry():
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_version_is_50_line():
+def test_version_is_51_line():
     spec = importlib.util.spec_from_file_location(
         "_v5_init", V5_ROOT / "ewsmcp" / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.__version__.startswith("5.0."), mod.__version__
+    assert mod.__version__.startswith("5.1."), mod.__version__
     pyproject = (V5_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert f'version = "{mod.__version__}"' in pyproject
+
+
+def test_docs_describe_the_archive():
+    design = (V5_ROOT / "DESIGN.md").read_text(encoding="utf-8")
+    assert "## §Archive" in design
+    assert "Phase 2 (not yet built)" not in design
+    readme = (V5_ROOT / "README.md").read_text(encoding="utf-8")
+    for key in ("ARCHIVE_DELETE_ENABLED", "ARCHIVE_AFTER_DAYS", "GEMINI_API_KEY",
+                "ARCHIVE_GRACE_DAYS", "ARCHIVE_MAX_DELETE_PER_RUN",
+                "ARCHIVE_MIN_FREE_GB", "ARCHIVE_CYCLE_SECONDS", "EMBED_DIMS"):
+        assert key in readme, key
+    changelog = (V5_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## [5.1.0a1]" in changelog
 
 
 FORBIDDEN = ["SQLite", "FTS5", "700×", "700x", "norm_text",

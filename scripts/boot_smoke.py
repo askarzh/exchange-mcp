@@ -10,10 +10,15 @@ daemon and database. Asserts:
 - `get_server_status` works cold via ewsd's REST shim
 - an EWS-backed read (`search_messages`) fails fast with `upstream_unavailable`
   (no mirror yet, Exchange cold)
+- `archive_status` works cold (Postgres-only, states.live == 0,
+  delete_enabled == False)
+- `archive_run(dry_run=true)` fails fast with `upstream_unavailable` cold —
+  the capturer needs Exchange to project live items, so the runner refuses
+  rather than hanging or half-running
 - `send_draft` refusal carries the `kill_switch` code (policy beats
   connectivity) and ewsd's `/openapi.json` publishes `confirm_token` for it
 - ewsmcp's `/mcp` (Streamable HTTP, stateless) answers `initialize` and
-  `tools/list`; tier=full lists 31 tools
+  `tools/list`; tier=full lists 35 tools
 
 Run from the repo root:  python scripts/boot_smoke.py [draft|full]
 """
@@ -150,7 +155,24 @@ def main() -> int:
             if status != 503 or msg.get("error", {}).get("code") != "upstream_unavailable":
                 failures.append(f"search cold {status} {msg}")
 
+            status, arch = _req(EWSD_BASE, EWSD_KEY, "POST",
+                                "/v1/tools/archive_status", {})
+            if status != 200 or arch.get("states", {}).get("live") != 0:
+                failures.append(f"archive_status cold {status} {arch}")
+            if arch.get("delete_enabled") is not False:
+                failures.append("archive_status must report delete_enabled=false")
+
             if tier == "full":
+                # A dry run needs Exchange (the capturer projects live items),
+                # so cold it must fail FAST with upstream_unavailable rather
+                # than hanging or half-running.
+                status, run = _req(EWSD_BASE, EWSD_KEY, "POST",
+                                   "/v1/tools/archive_run", {"dry_run": True})
+                if run.get("error", {}).get("code") != "upstream_unavailable":
+                    failures.append(
+                        f"archive_run dry-run cold expected upstream_unavailable, "
+                        f"got {status} {run}")
+
                 status, send = _req(EWSD_BASE, EWSD_KEY, "POST",
                                     "/v1/tools/send_draft", {"draft_id": "d1"})
                 if send.get("error", {}).get("code") != "kill_switch":
@@ -172,8 +194,8 @@ def main() -> int:
             list_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
             list_resp = _mcp_req(MCP_BASE, MCP_KEY, list_payload)
             tools = (list_resp or {}).get("result", {}).get("tools", [])
-            if tier == "full" and len(tools) != 31:
-                failures.append(f"expected 31 mcp tools at tier full, got {len(tools)}")
+            if tier == "full" and len(tools) != 35:
+                failures.append(f"expected 35 mcp tools at tier full, got {len(tools)}")
 
             if failures:
                 print("FAILURES:")

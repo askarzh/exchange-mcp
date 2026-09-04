@@ -99,7 +99,7 @@ def test_status_answers_cold(db):
     ctx = make_context(db, ewsd_api_key="k")
     app = build_daemon_app(ctx, ctx.settings)
     status, body = _drive(app, "/v1/status", headers=AUTH)
-    assert status == 200 and body["ok"] and body["version"].startswith("5.0.")
+    assert status == 200 and body["ok"] and body["version"].startswith("5.1.")
     assert body["cache"]["ready"] is True
 
 

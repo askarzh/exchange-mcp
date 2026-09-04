@@ -1,4 +1,4 @@
-# Design — ews-mcp v5 (release line 5.0.x)
+# Design — ews-mcp v5 (release line 5.1.x)
 
 The architecture the code enforces. Module docstrings cite the sections
 below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Store,
@@ -12,7 +12,7 @@ below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Stor
    makes an LLM call and never ships a "judgment tool". Tool count stays
    lean and is generated into the docs, never hand-counted.
 2. **Storage = Postgres in core.** One `ews` schema holds the mirror,
-   aliases and (Phase 2) the archive. Full-text search is a generated,
+   aliases and the archive (§Archive). Full-text search is a generated,
    stored `tsvector` over subject + sender + cleaned body, indexed GIN and
    queried with Postgres' `simple` text-search config (no stemming, no
    stopwords). Accent folding happens in the database, on both the index
@@ -48,12 +48,16 @@ Two processes share one Postgres database.
   (default `127.0.0.1:8790`): `GET /v1/tools`, `POST /v1/tools/<name>`,
   `GET /v1/status`, `/metrics`, `/openapi.json` are behind `EWSD_API_KEY`;
   `GET /livez`, `/readyz`, `/health`, `/version` are always public; `PUT|POST
-  /upload/<token>` is deliberately ahead of the bearer gate too — the
-  unguessable single-use token IS the credential.
+  /upload/<token>` and `GET /download/<token>` are deliberately ahead of the
+  bearer gate too — the unguessable single-use token IS the credential. Also
+  owns the archive pipeline (§Archive) and holds the only `GEMINI_API_KEY`
+  in the stack.
 - **`ewsmcp`, the thin MCP.** Any number of instances. Reads Postgres
-  directly for `list_folders`, `search_messages`, `get_message`,
-  `get_thread`, `get_mailbox_overview`, `list_tasks`, `waiting_on`, and
-  `get_server_status`. Every other tool, and any read called with
+  directly for `list_folders`, `search_messages(mode="keyword")`,
+  `get_message`, `get_thread`, `get_mailbox_overview`, `list_tasks`,
+  `waiting_on`, `archive_status` and `get_server_status`. Every other tool
+  — including `find_similar` and `search_messages(mode="semantic")`, since
+  `ewsmcp` never holds `GEMINI_API_KEY` — and any read called with
   `fresh=true`, is forwarded to `ewsd` verbatim (`confirm_token` included)
   over `EWSD_URL`. Serves stdio or Streamable HTTP `/mcp` plus `/livez`,
   `/readyz`, `/health`, `/version`, behind `MCP_API_KEY` in HTTP mode.
@@ -70,9 +74,9 @@ Two processes share one Postgres database.
 
 ## §Tools — the surface
 
-31 tools in the default (`full`-tier) registry; 26 register at `draft`
-tier and 15 at `read` tier (see the generated table in `docs/API.md`).
-Four packs:
+35 tools in the default (`full`-tier) registry; 29 register at `draft`
+tier and 18 at `read` tier (see the generated table in `docs/API.md`).
+Five packs:
 
 - **mail-read** (6): `list_folders`, `search_messages`, `get_message`,
   `get_thread`, `get_attachment`, `get_mailbox_overview`.
@@ -85,10 +89,20 @@ Four packs:
   `add_attachment`, `delete_attachment`), bulk ops (`update_messages`,
   `move_messages`, `delete_messages`), calendar writes (`create_event`,
   `update_event`, `respond_to_event`, `cancel_event`), `set_oof`.
+- **archive / semantic** (4): `archive_status`, `get_raw_message` and
+  `find_similar` are `read`-class and register at every tier;
+  `archive_run` is `destructive`-class (min tier `full`) and
+  `dry_run=false` is two-phase confirmed like `send_draft`.
 
-`search_messages`' `mode="semantic"` is Phase 2 work (see the design
-spec): the mode is a reserved enum value that returns a validation error
-until embeddings land.
+`search_messages` gained an `archived` argument (`any` | `only` |
+`exclude`, default `any`) and a working `mode="semantic"` — both are §Archive
+work now, not a reserved placeholder. `mode="semantic"` and `find_similar`
+are forwarded from `ewsmcp` to `ewsd` unconditionally (the MCP process
+never holds `GEMINI_API_KEY`) and degrade to keyword ranking with
+`meta.degraded=true`/`meta.reason` set when no embedder is configured, so a
+mailbox search never goes dark because a remote API is unavailable or
+rate-limiting. Every card carries `archive_state` — but ONLY when it is not
+`live`, to keep the common case (all-live results) at its old token cost.
 
 Every list-shaped result ships exactly the canonical envelope
 `{items, count, total_available, next_offset}` (contract-tested).
@@ -153,7 +167,17 @@ call shipped 115,457 chars for a ~150-char message.
   SQL migrations applied by `ewsd` at startup and version-checked by
   `ewsmcp` (refuses to start against an older schema than it expects).
   `messages`, `events`, `tasks`, `folders`, `sync_state`, `aliases` —
-  the durable mirror both processes read.
+  the durable mirror both processes read. Migration 003 (`SCHEMA_VERSION
+  = 3`) adds the archive: `attachments` (one row per captured attachment,
+  content-hashed, name search over a generated `tsvector`), `chunks`
+  (`embedding vector(768)`, HNSW index, `vector_cosine_ops` — see
+  §Archive/§Semantic below) and `archive_runs` (one row per pass, the
+  history behind `archive_status`), plus `messages.captured_changekey`
+  (the changekey observed at capture time, checked again before delete).
+  `CREATE EXTENSION vector` is pinned `WITH SCHEMA public` — the
+  production role and schema are both named `ews`, so a bare `CREATE
+  EXTENSION` would otherwise land the type in schema `ews` via
+  `"$user"` and break every later `vector(768)`/`<=>` reference.
 - Full-text search: `search_tsv` is generated as
   `to_tsvector('simple', ews.immutable_unaccent(lower(subject || sender ||
   body_clean)))` with a GIN index (`ix_msg_tsv`). `search_messages` builds
@@ -201,12 +225,19 @@ in HTTP mode). `ewsd`: HTTP only — `GET /v1/tools`,
 `POST /v1/tools/<name>` (jsonschema-validated against the public tool
 schema, 1 MiB body cap), `GET /v1/status`, `/metrics` (Prometheus) and
 `/openapi.json` are behind `EWSD_API_KEY`; `GET /livez`, `/readyz`,
-`/health`, `/version` are always public; `PUT|POST /upload/<token>` is
-deliberately ahead of the bearer gate — the unguessable single-use token
-IS the credential. `/upload/<token>` is served ONLY by `ewsd` (port 8790
-by default): `create_upload_link` builds the capability URL from
-`EXTERNAL_URL`, so any reverse proxy in front of the stack must route
-`/upload/*` through to `ewsd`, not to `ewsmcp`.
+`/health`, `/version` are always public; `PUT|POST /upload/<token>` and
+`GET /download/<token>` are deliberately ahead of the bearer gate — the
+unguessable single-use token IS the credential. Both `/upload/<token>` and
+`/download/<token>` are served ONLY by `ewsd` (port 8790 by default) and
+ONLY out of `{DATA_DIR}/mime/` or `{DATA_DIR}/blobs/`: `create_upload_link`
+and `get_raw_message` both build the capability URL from `EXTERNAL_URL`,
+so any reverse proxy in front of the stack must route `/upload/*` and
+`/download/*` through to `ewsd`, not to `ewsmcp`. A download link is
+single-use — the first successful `GET` spends it, and every rejection
+(expired, already used, never existed) renders as an identical opaque 404.
+`POST /v1/archive/run` is a REST alias of `POST /v1/tools/archive_run`
+(same two-phase confirm applies to `dry_run=false`); `GET
+/v1/archive/runs/<id>` reads one `archive_runs` row.
 **Never-exit boot** (both processes): tools/routes register and
 transports bind before any Exchange contact; in `ewsd` a background
 warmup loop owns connection recovery (exponential backoff + jitter,
@@ -232,13 +263,89 @@ link and catches edits, deletions and truncation.
   `test_docs_match_registry.py` fails CI when `docs/API.md` drifts from
   the registry.
 
-## Phase 2 (not yet built)
+## §Archive — capture, verify, delete
 
-A durable, attachment-inclusive mail archive with a safe path to
-deletion (capture → verify → delete workers in `ewsd`), plus
-Gemini-embedding-backed semantic search (`search_messages(mode="semantic")`
-and a new similarity tool). Authoritative design:
-`docs/superpowers/specs/2026-09-03-postgres-archive-daemon-design.md`.
-Everything in this document describes what is built now (Phase 1): the
-Postgres store and the two-process split, with the archive tables and
-embedding pipeline not yet present.
+The mailbox is near quota and the weight is attachment bytes, so `ewsd`
+moves old mail onto local disk and then removes it from Exchange. Three
+idempotent workers, each driven by `messages.archive_state`, run every
+`ARCHIVE_CYCLE_SECONDS` (300) in an asyncio task started after warm-up:
+
+- **Capture** takes `live` rows matching the policy (folder in
+  `ARCHIVE_FOLDERS`, older than `ARCHIVE_AFTER_DAYS`, category not in
+  `ARCHIVE_EXCLUDE_CATEGORIES`), fetches `mime_content` plus every
+  attachment in ONE `Account.fetch`, writes `{DATA_DIR}/mime/<sha256>.eml`
+  and `{DATA_DIR}/blobs/<sha[:2]>/<sha>`, fills `ews.attachments`, and sets
+  `captured`. Batches of 25. Free space is checked against
+  `ARCHIVE_MIN_FREE_GB` before each batch; writes are temp-then-rename, so
+  a crash never leaves wrong bytes under a content-addressed name. An
+  EMPTY `ARCHIVE_FOLDERS` is fail-closed: it archives nothing, never every
+  folder.
+- **Verify** re-fetches each `captured` row (`changekey`, `attachments`),
+  re-hashes the MIME file from disk and checks every blob's existence and
+  size. All pass → `verified`. Any failure → back to `live`, capture
+  retries.
+- **Delete** hard-deletes `verified` rows through THREE independent
+  rails — `ARCHIVE_DELETE_ENABLED=true`, capability tier `full` (plus a
+  confirm token on `archive_run(dry_run=false)`), and verified older than
+  the cutoff plus `ARCHIVE_GRACE_DAYS` (floored at 1 day, so a
+  misconfigured 0 can never make freshly-verified mail immediately
+  deletable) — capped at `ARCHIVE_MAX_DELETE_PER_RUN` per pass. The
+  `captured_changekey` snapshot taken at capture time is verified twice —
+  once by the verifier, and again immediately before each item's delete
+  call — so mail that changed after verification is skipped, not deleted
+  on stale trust. One audit record per deletion carries `ews_id`,
+  `internet_message_id`, `mime_sha256` and the run id; deletes that
+  succeeded against Exchange but could not be recorded afterward (a DB
+  hiccup right after the hard-delete) surface in `deleted_unrecorded`
+  rather than vanishing — the deleter's result always satisfies
+  `deleted + failed + remaining == eligible`. Off by default.
+
+`ArchiveRunner.run_once` and the background cycle share one lock, so a
+manual `archive_run` call and a scheduled pass never run concurrently
+against the same mailbox; a caller that can't get the lock within a few
+seconds gets back `blocked` instead of hanging. `POST /v1/archive/run` is
+a REST alias of `POST /v1/tools/archive_run` — the same two-phase confirm
+applies to `dry_run=false`.
+
+Rows are never dropped for archived mail: `ews_id` stays the stable key,
+so search, `get_message` and `get_thread` read archived mail exactly like
+live mail. `search_messages` takes an `archived` argument
+(`any`|`only`|`exclude`, default `any`); a card carries `archive_state`
+only when it is not `live`. When Exchange reports a delete for a
+`captured`/`verified` row (our own deleter, or a hand-delete in Outlook)
+the SyncEngine keeps the row and marks it `deleted`; only `live` rows are
+dropped. `get_attachment` serves archived mail straight from the blob
+store, without contacting Exchange. `get_raw_message` mints a single-use
+`GET /download/<token>` capability URL for the original RFC822 bytes —
+served from disk for captured/verified/deleted mail, fetched fresh
+through Exchange (and cached, without changing archive state) for live
+mail — because a .eml is exactly the kind of payload that must not
+travel through the model's context. Every pass writes an
+`ews.archive_runs` row — the human-readable history behind
+`archive_status` and `GET /v1/archive/runs/<id>`. `archive_status` itself
+splits cleanly by process: the Postgres-only body (state counts, recent
+runs, embedding backlog, policy, `delete_enabled`) is computed by whichever
+process answers the call, so it works from `ewsmcp` with no filesystem
+access; blob-store size and free disk are ewsd-only figures, since only
+`ewsd` owns `DATA_DIR`.
+
+Calendar, contacts, tasks, drafts and the outbox are never archived.
+
+## §Semantic — embeddings and hybrid search
+
+`ewsd` embeds `subject + body_clean` in 1,500-character chunks with
+Gemini's `gemini-embedding-2` at 768 dimensions (plain HTTPS via
+`httpx` — no vendor SDK), stores them in `ews.chunks.embedding
+vector(768)` behind an HNSW index with `vector_cosine_ops`, and stamps
+`messages.embedded_at`. Backlog is drained every cycle in batches of 100
+with exponential backoff on 429/5xx.
+
+`search_messages(mode="semantic")` fuses the tsvector ranking and the
+vector ranking with Reciprocal Rank Fusion (k=60); `find_similar(id|text)`
+is pure vector search. Both cover live and archived mail. If the embedder
+or the vector query fails, the answer degrades to keyword results with
+`meta.degraded=true`/`meta.reason` set — a mailbox search never goes dark
+because a remote API is rate-limiting us. The MCP process deliberately
+holds no `GEMINI_API_KEY`: `find_similar` and `mode="semantic"` are
+forwarded to `ewsd` unconditionally, whether or not an embedder is
+actually configured there.
