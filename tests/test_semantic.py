@@ -191,6 +191,30 @@ def test_hybrid_passes_structured_filters_through(indexed):
     assert rows == []
 
 
+def test_include_calendar_items_flag_alone_does_not_force_keyword_intersection(indexed):
+    """`include_calendar_items` reaches `hybrid_search` as a `**filters` entry
+    that is never None (cache_reads.search_messages always sets it), so it
+    must NOT be treated like a genuine structured filter — otherwise every
+    semantic-mode call through the tool would force the keyword/vector
+    intersection and kill vector-only RRF survivors.
+
+    "hummus" appears nowhere in the fixture, so the keyword AND across
+    ("hummus", "lunch") matches nothing; the vector half still surfaces
+    M-LUNCH through the shared "lunch" token (its subject is "Lunch
+    plans"). include_calendar_items=False alone must not suppress that hit."""
+    _store, index = indexed
+    rows, _ = index.hybrid_search("hummus lunch", limit=3, include_calendar_items=False)
+    assert "M-LUNCH" in [r["ews_id"] for r in rows]
+
+    # A genuine structured filter still forces the intersection, same as
+    # test_hybrid_passes_structured_filters_through above — the exclusion is
+    # specific to include_calendar_items, not a blanket skip of the gate.
+    rows2, _ = index.hybrid_search("hummus lunch", limit=3,
+                                   include_calendar_items=False,
+                                   sender="nobody@example.com")
+    assert rows2 == []
+
+
 def test_short_reply_chunk0_carries_parent_context(db):
     store = CacheStore(db)
     store.upsert_messages([
