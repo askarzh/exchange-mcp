@@ -363,3 +363,23 @@ def test_parent_in_thread_is_the_latest_earlier_message(db):
                            make_row("X", conv="D", date_ts=250)])
     assert store.parent_in_thread("R")["ews_id"] == "P1"
     assert store.parent_in_thread("P0") is None
+
+
+def test_update_bodies_applies_metadata_for_ids_with_no_body(store):
+    """A body-less meeting response returns no text and no recipients from
+    GetItem — only an item_class, which is exactly what the calendar filter
+    needs. Its id therefore never appears in `bodies`, and the update must
+    still land without disturbing body_clean or embedded_at."""
+    store.upsert_messages([make_row("A1", body="original body")])
+    store.replace_chunks("A1", [{"seq": 0, "source": "body", "text": "original body",
+                                 "embedding": [0.1] * 768}])
+    stamp = store.get_message("A1")["embedded_at"]
+    assert stamp is not None
+
+    assert store.update_bodies({}, None,
+                               {"A1": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}}) == 1
+    row = store.get_message("A1")
+    assert row["item_class"] == "IPM.Schedule.Meeting.Resp.Pos"
+    assert row["body_clean"] == "original body"
+    assert row["embedded_at"] == stamp          # not re-queued, chunks kept
+    assert store.embedding_backlog() == 0

@@ -102,6 +102,13 @@ store cleans up after itself. Design:
   `states.skipped_too_large`: the runner block's `state_counts` is dropped
   as duplicated DB counts, which also threw away ewsd's per-process
   too-large counter before it reached the reply.
+- `CacheStore.update_bodies` iterates the union of `bodies`, `recipients`
+  and `extra` instead of `bodies` alone: a row whose GetItem returns no text
+  and no recipients (the body-less meeting response, the very row whose
+  `item_class` the calendar filter needs) now gets its
+  `item_class`/`attachments_json`, with `body_clean` and `embedded_at` left
+  untouched. `scripts/backfill_bodies.py` no longer has to fake an empty
+  body to carry that metadata through.
 - `/v1/status` no longer overwrote the runner's `state_counts` wholesale
   with the DB-derived counts, which destroyed `skipped_too_large` before it
   could be reported; the two are merged.

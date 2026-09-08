@@ -730,40 +730,58 @@ class CacheStore:
                       recipients: dict[str, str] | None = None,
                       extra: dict[str, dict] | None = None) -> int:
         """Set `body_clean` (and `to_json`, `item_class`, `attachments_json`
-        when given) for the ids in `bodies`. A row whose body actually
-        changed goes back on the embedding backlog — its chunks were built
-        from the old text, so they are dropped and `embedded_at` cleared in
-        the same transaction; a row whose body is unchanged (recipients-only
-        repair, or a re-run) keeps its chunks and its stamp. Returns the
-        number of rows updated."""
-        if not bodies:
-            return 0
+        when given) for the UNION of the ids in `bodies`, `recipients` and
+        `extra`. A row whose body actually changed goes back on the embedding
+        backlog — its chunks were built from the old text, so they are dropped
+        and `embedded_at` cleared in the same transaction; a row whose body is
+        unchanged (recipients-only repair, or a re-run) keeps its chunks and
+        its stamp.
+
+        An id present in `recipients`/`extra` but NOT in `bodies` gets the
+        metadata columns alone: `body_clean` and `embedded_at` are left
+        exactly as they were. That is the body-less meeting response — GetItem
+        returns neither text nor recipients for it, and it is exactly the row
+        whose `item_class` the calendar filter needs — which a bodies-only
+        loop could never repair.
+
+        Returns the number of rows actually updated."""
         recipients = recipients or {}
         extra = extra or {}
+        ids = list(dict.fromkeys([*bodies, *recipients, *extra]))
+        if not ids:
+            return 0
+        meta = ("  to_json = coalesce(%(to)s, to_json), "
+                "  item_class = coalesce(%(item_class)s, item_class), "
+                "  attachments_json = coalesce(%(atts)s, attachments_json) "
+                "WHERE ews_id = %(ews_id)s ")
+        updated = 0
         requeued: list[str] = []
         with self.db.conn() as c:
-            for ews_id, body in bodies.items():
-                ex = extra.get(ews_id, {})
-                row = c.execute(
-                    "UPDATE ews.messages SET "
-                    "  embedded_at = CASE WHEN body_clean IS DISTINCT FROM %(body)s "
-                    "                     THEN NULL ELSE embedded_at END, "
-                    "  body_clean = %(body)s, "
-                    "  to_json = coalesce(%(to)s, to_json), "
-                    "  item_class = coalesce(%(item_class)s, item_class), "
-                    "  attachments_json = coalesce(%(atts)s, attachments_json) "
-                    "WHERE ews_id = %(ews_id)s "
-                    "RETURNING (embedded_at IS NULL) AS requeued",
-                    {"ews_id": ews_id, "body": body,
-                     "to": recipients.get(ews_id),
-                     "item_class": ex.get("item_class"),
-                     "atts": ex.get("attachments_json")}).fetchone()
-                if row and row["requeued"]:
+            for ews_id in ids:
+                ex = extra.get(ews_id) or {}
+                params = {"ews_id": ews_id, "to": recipients.get(ews_id),
+                          "item_class": ex.get("item_class"),
+                          "atts": ex.get("attachments_json")}
+                if ews_id in bodies:
+                    params["body"] = bodies[ews_id]
+                    sql = ("UPDATE ews.messages SET "
+                           "  embedded_at = CASE WHEN body_clean IS DISTINCT FROM "
+                           "    %(body)s THEN NULL ELSE embedded_at END, "
+                           "  body_clean = %(body)s, " + meta +
+                           "RETURNING (embedded_at IS NULL) AS requeued")
+                else:
+                    sql = ("UPDATE ews.messages SET " + meta +
+                           "RETURNING FALSE AS requeued")
+                row = c.execute(sql, params).fetchone()
+                if row is None:
+                    continue
+                updated += 1
+                if row["requeued"]:
                     requeued.append(ews_id)
             if requeued:
                 c.execute("DELETE FROM ews.chunks WHERE message_ews_id = ANY(%s)",
                           (requeued,))
-        return len(bodies)
+        return updated
 
     def mark_embedded(self, ews_ids: list[str]) -> None:
         """Stamp `embedded_at` directly. `replace_chunks` already does this per

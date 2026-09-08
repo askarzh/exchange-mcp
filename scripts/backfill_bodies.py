@@ -115,18 +115,20 @@ def main(argv: list[str] | None = None) -> int:
                 else None,
             }
             if ref.text_body is None:
+                # No text on Exchange (a body-less meeting response, say).
+                # `update_bodies` still applies the recipients/item_class/
+                # attachments it DID return, leaving body_clean untouched.
                 missing += 1
-                if ref.id in tos:
-                    bodies[ref.id] = ""   # recipients-only repair; body stays empty
                 continue
             try:
                 bodies[ref.id] = clean_body(ref.text_body, max_chars=BODY_CLEAN_MAX)["text"]
             except Exception:  # noqa: BLE001 - mirror the sync engine's fallback
                 bodies[ref.id] = ref.text_body[:BODY_CLEAN_MAX]
-        # A genuinely empty body still counts as fetched: writing "" keeps the
-        # row out of the next pass (it is selected by body_clean = '') only
-        # for this run, via `seen`; across runs it is simply re-fetched, which
-        # is cheap and correct. An unchanged body keeps its embedding.
+        # A genuinely empty body (Exchange returned "" or whitespace) still
+        # counts as fetched and is written as "": it keeps the row out of the
+        # next pass (it is selected by body_clean = '') only for this run, via
+        # `seen`; across runs it is simply re-fetched, which is cheap and
+        # correct. An unchanged body keeps its embedding.
         filled += store.update_bodies(bodies, tos, extra)
         done += len(rows)
         log.info("backfilled %d/%d rows so far (%d with no text body on Exchange)",
