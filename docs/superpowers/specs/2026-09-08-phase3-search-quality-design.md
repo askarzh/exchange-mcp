@@ -148,6 +148,16 @@ of 20 paragraphs each for eyeballing. The owner sets
 `ARCHIVE_BOILERPLATE_DROP` to the winner (or `both`), re-queues embeddings for
 messages with hits, and the losing detector is removed in a follow-up commit.
 
+**Escalation path (not in this phase).** The embedding detector is a
+bi-encoder with a nearest-reference rule; the logged hits and misses are a
+labelled dataset. If the two weeks show boilerplate both detectors miss, the
+next step is a fine-tuned small multilingual encoder (multilingual-e5-small or
+paraphrase-multilingual-MiniLM, Kazakh coverage matters; rubert-tiny2 is
+Russian-only) as a binary paragraph classifier, exported to ONNX and run in
+the daemon at 15–30 ms per message — deterministic, so golden tests hold — in
+preference to keeping a generative call in the pipeline. It adds onnxruntime
+and a tokenizer (~200 MB) to the image and is a separate owner decision.
+
 ## 3. Thread context for short replies
 
 `chunk_text(subject, body, chunk_chars)` becomes
