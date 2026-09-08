@@ -66,12 +66,12 @@ class ThrowawayPostgres:
             self.dsn = f"postgresql://postgres:test@127.0.0.1:{port}/postgres"
             wait_ready(self.dsn)
         except BaseException:
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+            subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True, check=False)
             self._container = None
             raise
         return self.dsn
 
     def __exit__(self, *exc_info) -> None:
         if self._container:
-            subprocess.run(["docker", "rm", "-f", self._container],
+            subprocess.run(["docker", "rm", "-f", "-v", self._container],
                            capture_output=True, check=False)
