@@ -33,6 +33,14 @@ _ARCHIVED = {"any": "TRUE", "only": "m.archive_state <> 'live'",
              "exclude": "m.archive_state = 'live'"}
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
+CALENDAR_CLASS_PREFIXES = ("IPM.Schedule.Meeting", "IPM.Appointment")
+_CALENDAR_EXCLUDE = ("(m.item_class IS NULL OR NOT (m.item_class LIKE 'IPM.Schedule.Meeting%%' "
+                     "OR m.item_class LIKE 'IPM.Appointment%%'))")
+
+
+def is_calendar_item_class(item_class: str | None) -> bool:
+    return bool(item_class) and item_class.startswith(CALENDAR_CLASS_PREFIXES)
+
 
 def _vector_literal(values: Any) -> str:
     """pgvector's text input format: '[0.1,0.2,…]'. psycopg casts it with ::vector."""
@@ -266,12 +274,15 @@ class CacheStore:
         since_ts: int | None = None, until_ts: int | None = None,
         is_unread: bool | None = None, has_attachments: bool | None = None,
         archived: str = "any", offset: int = 0, limit: int = 20,
+        include_calendar_items: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
         """Full-text + structured search over the mirror. Every argument is
         optional and freely combinable; `folder_ids=None` searches every
         mirrored folder. Returns (page rows, exact total)."""
         where: list[str] = [_ARCHIVED.get(archived, "TRUE")]
         params: list[Any] = []
+        if not include_calendar_items:
+            where.append(_CALENDAR_EXCLUDE)
         tokens = _tokens(text) if text else []
         if tokens:
             where.append(f"m.search_tsv @@ {_TSQUERY}")
@@ -784,7 +795,7 @@ class CacheStore:
                 f"  WHERE c.embedding IS NOT NULL {inner_extra}"
                 "  ORDER BY c.embedding <=> %s::vector LIMIT %s"
                 ") cand JOIN ews.messages m ON m.ews_id = cand.ews_id "
-                f"WHERE {clause} ORDER BY cand.dist ASC",
+                f"WHERE {clause} AND {_CALENDAR_EXCLUDE} ORDER BY cand.dist ASC",
                 params).fetchall()
         best: dict[str, float] = {}
         order: list[str] = []

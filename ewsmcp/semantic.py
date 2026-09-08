@@ -139,8 +139,13 @@ class SemanticIndex:
             fused_ids = rrf([keyword_ids, vector_ids])
         # Structured filters live on the keyword side; a vector-only hit must
         # still satisfy them, so intersect with what the store would return.
+        # `include_calendar_items` is excluded from this check: it is never
+        # None (always a bool) and calendar exclusion is already baked into
+        # both halves (keyword_rows above, similar_message_ids always), so it
+        # would otherwise force the intersection on every call.
         allowed = set(keyword_ids)
-        if any(v is not None for v in filters.values()):
+        structured = {k: v for k, v in filters.items() if k != "include_calendar_items"}
+        if any(v is not None for v in structured.values()):
             fused_ids = [i for i in fused_ids if i in allowed]
         window = fused_ids[offset:offset + limit]
         by_id = self.store.messages_by_ids(window)

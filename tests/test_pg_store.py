@@ -250,6 +250,17 @@ def test_search_ands_across_tokens_not_just_ors_within_one(store):
     assert total == 1 and rows[0]["ews_id"] == "BOTH"
 
 
+def test_search_excludes_calendar_items_unless_asked(store):
+    store.upsert_messages([make_row("N1", subject="White Hill offer"),
+                           make_row("C1", subject="Accepted: White Hill meeting")])
+    store.update_bodies({"C1": ""}, None,
+                        {"C1": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
+    rows, total = store.search_messages(subject="white hill")
+    assert [r["ews_id"] for r in rows] == ["N1"] and total == 1
+    rows, total = store.search_messages(subject="white hill", include_calendar_items=True)
+    assert total == 2
+
+
 def test_search_underscore_token_group_stays_anded_with_the_next_token(store):
     """An ordinary token with an underscore (e.g. "report_v2") splits into
     more than one lexeme too ('report', 'v2') — its OR group must not leak

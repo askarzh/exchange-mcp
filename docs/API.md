@@ -86,6 +86,7 @@ Search mail across the local mirror of the whole mailbox. `query` is full-text o
 | `limit` | integer | no | (default `20`) |
 | `archived` | string | no | any (default) searches live and archived mail; only restricts to archived; exclude to live. (one of: `any`, `only`, `exclude`; default `any`) |
 | `mode` | string | no | keyword = full-text over the mirror; semantic = hybrid (full-text + embedding similarity, RRF-fused). semantic falls back to keyword with meta.degraded=true when embeddings are unavailable. The embedding half reads a capped candidate set (limit*4 chunks, at most 400) BEFORE archived/date/sender filters are applied, so a highly selective filter can come back with fewer than `limit` hits — widen the filter or raise `limit` rather than reading the short page as 'no such mail'. (one of: `keyword`, `semantic`; default `keyword`) |
+| `include_calendar_items` | boolean | no | Meeting requests/responses (Accepted:, Declined:, cancellations) are hidden by default; set true to search them too. (default `False`) |
 
 #### `get_message` — read (min tier: read)
 
