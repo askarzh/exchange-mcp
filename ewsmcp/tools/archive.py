@@ -176,6 +176,9 @@ async def _archive_status(ctx: Context) -> dict[str, Any]:
         files.free_gb, ctx.settings.data_dir), 2)
     if ctx.archive is not None:
         out["runner"] = ctx.archive.status()
+        boilerplate = out["runner"].get("boilerplate")
+        if boilerplate:
+            out["boilerplate"] = boilerplate
     return out
 
 

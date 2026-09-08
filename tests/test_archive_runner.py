@@ -320,3 +320,25 @@ def test_delete_auto_defaults_off_and_shows_in_status(tmp_path, db):
     runner, _store_ = _runner(db, tmp_path)
     assert runner.settings.archive_delete_auto is False
     assert runner.status()["delete_auto"] is False
+
+
+def test_status_carries_the_boilerplate_counters_after_a_cycle(tmp_path, db):
+    account = FakeAccount({"OLD-1": FakeItem("OLD-1")})
+    runner, _store = _runner(db, tmp_path, account=account,
+                             archive_cycle_seconds=1)
+    assert runner.status()["boilerplate"] == {}      # nothing read yet
+
+    async def drive():
+        await runner.start()
+        for _ in range(100):
+            if runner.cycles:
+                break
+            await asyncio.sleep(0.05)
+        await runner.stop()
+
+    asyncio.run(drive())
+    block = runner.status()["boilerplate"]
+    assert block["drop_detector"] == "off"
+    assert block["threshold"] == float(runner.settings.embed_boilerplate_threshold)
+    assert block["embedding"] == {"hits": 0, "dropped": 0}
+    assert block["llm"] == {"hits": 0, "dropped": 0, "errors": 0}

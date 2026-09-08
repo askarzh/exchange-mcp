@@ -4,7 +4,8 @@ import math
 
 from conftest import FakeEmbedder, make_row
 
-from ewsmcp.boilerplate import BoilerplateHarness, EmbeddingDetector
+from ewsmcp.bodyclean import tail_paragraphs
+from ewsmcp.boilerplate import BoilerplateHarness, EmbeddingDetector, LlmDetector
 from ewsmcp.cache.store import CacheStore
 
 BODY = ("Коллеги, добрый день.\n\nПо итогам встречи направляю обновлённую модель. "
@@ -57,3 +58,52 @@ def test_harness_never_drops_the_first_paragraph(db):
     h = BoilerplateHarness(store, emb, threshold=0.5, drop="embedding")
     text, hits = h.analyse("A1", short)      # under TAIL_MIN_CHARS: no tail window
     assert text == short and hits == []
+
+
+class _ScriptedCleaner:
+    def __init__(self, answers):
+        self.answers, self.calls = list(answers), []
+
+    def boundary(self, first_paragraph, paragraphs):
+        self.calls.append((first_paragraph, list(paragraphs)))
+        a = self.answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+
+def test_llm_detector_accepts_only_validated_answers():
+    paras = ["thanks", "Best regards, X", "CONFIDENTIALITY NOTICE: ..."]
+    det = LlmDetector(_ScriptedCleaner([
+        {"drop_from": 2, "reason": "legal footer"},
+        {"drop_from": 7, "reason": "out of range"},
+        {"drop_from": None, "reason": "nothing"},
+        {"garbage": True},
+        TimeoutError("slow"),
+    ]))
+    ok = det.detect("m", "first", paras)
+    assert ok[0].paragraph_index == 2 and ok[0].ref_label == "legal footer"
+    assert det.detect("m", "first", paras)[0].paragraph_index == -1   # out of range
+    assert det.detect("m", "first", paras) == []                     # null = no hit
+    assert det.detect("m", "first", paras)[0].ref_label.startswith("error:")
+    assert det.detect("m", "first", paras)[0].ref_label == "error:TimeoutError"
+
+
+def test_harness_drop_enum_llm_and_both(db):
+    store = CacheStore(db)
+    emb = FakeEmbedder()
+    footer = BODY.split("\n\n")[-1]
+    store.upsert_boilerplate_ref("bcc", footer, emb.embed([footer])[0])
+    tail_n = len(tail_paragraphs(BODY))
+    llm = LlmDetector(_ScriptedCleaner(
+        [{"drop_from": tail_n - 2, "reason": "sig+footer"}] * 3))
+    text, hits = BoilerplateHarness(store, emb, threshold=0.8, drop="llm",
+                                    llm=llm).analyse("A", BODY)
+    assert "С уважением" not in text            # llm cut earlier than embedding
+    text, _ = BoilerplateHarness(store, emb, threshold=0.8, drop="embedding",
+                                 llm=llm).analyse("A", BODY)
+    assert "С уважением" in text and "BCC Invest" not in text
+    text, _ = BoilerplateHarness(store, emb, threshold=0.8, drop="both",
+                                 llm=llm).analyse("A", BODY)
+    assert "С уважением" not in text
+    assert store.boilerplate_stats()["llm"]["hits"] == 3

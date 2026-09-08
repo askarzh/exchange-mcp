@@ -8,10 +8,13 @@ message is never in the tail window, so it can never be dropped.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass
 from typing import Any
+
+import httpx
 
 from .bodyclean import tail_paragraphs
 
@@ -97,3 +100,99 @@ class BoilerplateHarness:
             return text, hits
         off = tail[cut_from][0]
         return text[:off].rstrip(), hits
+
+
+GEMINI_GENERATE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent"
+)
+_PROMPT = (
+    "You see the FIRST paragraph of an email and its LAST paragraphs, numbered. "
+    "Answer with JSON {{\"drop_from\": <index or null>, \"reason\": <short string>}}: "
+    "drop_from is the index of the first numbered paragraph where signature, "
+    "legal disclaimer, or mail-gateway boilerplate begins and continues to the end. "
+    "If the numbered paragraphs are all real message content, answer null. "
+    "Never pick a paragraph that contains the writer's actual message.\n\n"
+    "FIRST PARAGRAPH:\n{first}\n\nLAST PARAGRAPHS:\n{numbered}")
+
+
+class GeminiCleaner:
+    """Gemini generateContent, asked for one JSON object and nothing else.
+
+    Like GeminiEmbedder, the key rides in the x-goog-api-key HEADER (a query
+    string leaks into proxy logs, Referer and crash reports) and the client
+    is injectable so tests drive it with an httpx MockTransport.
+    """
+
+    def __init__(self, api_key: str, *, model: str, client: Any | None = None,
+                 timeout: float = 10.0) -> None:
+        if not api_key:
+            raise ValueError("GeminiCleaner needs an API key")
+        self.model = model
+        self.timeout = float(timeout)
+        self.url = GEMINI_GENERATE_URL.format(model=model)
+        self._client = client or httpx.Client(timeout=timeout)
+        self._owns_client = client is None
+        self._headers = {"x-goog-api-key": api_key,
+                         "Content-Type": "application/json"}
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def boundary(self, first_paragraph: str, paragraphs: list[str]) -> dict[str, Any]:
+        """The parsed answer dict. Raises on HTTP error/timeout/invalid JSON —
+        LlmDetector turns any of those into a logged `error:` hit."""
+        numbered = "\n\n".join(f"[{i}] {p}" for i, p in enumerate(paragraphs))
+        body = {
+            "contents": [{"parts": [{"text": _PROMPT.format(
+                first=first_paragraph[:1000], numbered=numbered[:6000])}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "drop_from": {"type": "INTEGER", "nullable": True},
+                        "reason": {"type": "STRING"},
+                    },
+                    "required": ["reason"],
+                },
+            },
+        }
+        r = self._client.post(self.url, headers=self._headers, json=body,
+                              timeout=self.timeout)
+        r.raise_for_status()
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+
+
+class LlmDetector:
+    """Wraps a cleaner so a bad answer can never move the cut.
+
+    Anything that is not a validated in-range index becomes a Hit with
+    paragraph_index=-1: the harness skips negative indexes in its cut loop,
+    so the row is LOGGED (that is where `errors` in boilerplate_stats comes
+    from) but can never drop a paragraph.
+    """
+
+    def __init__(self, cleaner: Any) -> None:
+        self.cleaner = cleaner
+
+    def detect(self, ews_id: str, first_paragraph: str,
+               paragraphs: list[str]) -> list[Hit]:
+        try:
+            ans = self.cleaner.boundary(first_paragraph, paragraphs)
+            if not isinstance(ans, dict) or "reason" not in ans:
+                raise ValueError("malformed answer")
+            idx = ans.get("drop_from")
+            if idx is None:
+                return []
+            idx = int(idx)
+            reason = str(ans.get("reason") or "")[:200]
+            if not 0 <= idx < len(paragraphs):
+                return [Hit("llm", -1, "", None, f"error:index {idx} out of range")]
+            return [Hit("llm", idx, paragraphs[idx], None, reason or "boilerplate")]
+        except Exception as exc:  # noqa: BLE001 - a detector never breaks indexing
+            logger.info("llm detector error for %s: %s", ews_id, type(exc).__name__)
+            return [Hit("llm", -1, "", None, f"error:{type(exc).__name__}")]

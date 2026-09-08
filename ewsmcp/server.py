@@ -48,15 +48,20 @@ def build_context(settings: Settings) -> Context:
         db=db,
     )
     if settings.semantic_enabled():
-        from .boilerplate import BoilerplateHarness
+        from .boilerplate import BoilerplateHarness, GeminiCleaner, LlmDetector
         from .embeddings import GeminiEmbedder
         from .semantic import SemanticIndex
         embedder = GeminiEmbedder(settings.gemini_api_key, dims=settings.embed_dims)
-        # Task 7 fills `llm=`; until then the embedding detector runs alone.
+        # The LLM detector is optional and always additive: it only ever
+        # LOGS unless ARCHIVE_BOILERPLATE_DROP names it.
+        llm = None
+        if settings.archive_boilerplate_llm and settings.gemini_api_key:
+            llm = LlmDetector(GeminiCleaner(settings.gemini_api_key,
+                                            model=settings.gemini_clean_model))
         harness = BoilerplateHarness(
             ctx.cache, embedder,
             threshold=settings.embed_boilerplate_threshold,
-            drop=settings.archive_boilerplate_drop, llm=None)
+            drop=settings.archive_boilerplate_drop, llm=llm)
         ctx.semantic = SemanticIndex(ctx.cache, embedder, harness=harness)
     else:
         logger.info("GEMINI_API_KEY unset — semantic search disabled, "

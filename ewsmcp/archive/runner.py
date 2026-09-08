@@ -59,6 +59,9 @@ class ArchiveRunner:
         self._lock = asyncio.Lock()
         self._disk_cache: dict[str, Any] | None = None
         self._disk_cache_ts: float = 0.0
+        # status() is sync (an HTTP handler calls it), so the boilerplate
+        # counters are read once per cycle and served from here.
+        self._boilerplate_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------ one pass
 
@@ -191,6 +194,14 @@ class ArchiveRunner:
             except Exception as exc:  # noqa: BLE001 - degrade, never die
                 self.last_error = f"{type(exc).__name__}: {exc}"[:500]
                 logger.warning("archive cycle failed: %s", self.last_error)
+            try:
+                self._boilerplate_cache = {
+                    **await asyncio.to_thread(self.store.boilerplate_stats),
+                    "drop_detector": self.settings.archive_boilerplate_drop,
+                    "threshold": float(self.settings.embed_boilerplate_threshold),
+                }
+            except Exception as exc:  # noqa: BLE001 - counters never break a cycle
+                logger.warning("boilerplate stats failed: %s", exc)
             self.cycles += 1
             self.last_cycle_ts = time.time()
             await asyncio.sleep(max(MIN_CYCLE_SECONDS,
@@ -218,6 +229,8 @@ class ArchiveRunner:
             # environment of its own, so this is the only truthful source.
             "policy": self._policy_dict(),
             "semantic_enabled": bool(self.settings.semantic_enabled()),
+            # Filled at the end of each cycle; empty before the first one.
+            "boilerplate": dict(self._boilerplate_cache),
         }
 
     def _policy_dict(self) -> dict[str, Any]:
