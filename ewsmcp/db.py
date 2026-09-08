@@ -22,7 +22,7 @@ from psycopg_pool import ConnectionPool
 logger = logging.getLogger(__name__)
 
 SCHEMA = "ews"
-SCHEMA_VERSION = 3  # bump together with the newest migrations/NNN_*.sql
+SCHEMA_VERSION = 4  # bump together with the newest migrations/NNN_*.sql
 _MIGRATION_RE = re.compile(r"^(\d{3})_[a-z0-9_]+\.sql$")
 _MIGRATE_LOCK_KEY = 7355608  # arbitrary, stable advisory-lock id
 
@@ -102,3 +102,19 @@ class Database:
             raise SchemaOutdated(
                 f"database schema is v{have}; this build needs v{expected}. "
                 "Start ewsd once to migrate.")
+
+    def reapply_last_migration_for_tests(self) -> None:
+        """Delete the newest schema_migrations row and re-run `migrate()`.
+
+        Test-only: lets a test exercise a migration's data-shaping statements
+        (e.g. the Phase 3 re-queue UPDATE) against rows it has already
+        inserted, on top of a DB that `migrate()` already brought fully
+        current. Every migration must be idempotent (IF NOT EXISTS, etc.) for
+        this re-application to be safe.
+        """
+        with self.conn() as c:
+            c.execute(
+                f"DELETE FROM {SCHEMA}.schema_migrations WHERE version = "
+                f"(SELECT MAX(version) FROM {SCHEMA}.schema_migrations)"
+            )
+        self.migrate()

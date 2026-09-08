@@ -105,6 +105,22 @@ class Settings(BaseSettings):
     archive_min_free_gb: float = 2.0
     archive_cycle_seconds: int = 300
 
+    # --- Phase 3: boilerplate detectors (daemon only) ------------------------
+    embed_boilerplate_threshold: float = 0.80
+    archive_boilerplate_drop: str = "off"      # off | embedding | llm | both
+    archive_boilerplate_llm: bool = True       # run the LLM detector at all
+    gemini_clean_model: str = "gemini-2.5-flash-lite"
+    # --- Phase 3: hygiene ----------------------------------------------------
+    archive_gc_interval_hours: int = 168
+    archive_max_item_mb: int = 50
+    db_pool_max: int = 8
+
+    @model_validator(mode="after")
+    def _check_boilerplate_drop(self) -> "Settings":
+        if self.archive_boilerplate_drop not in ("off", "embedding", "llm", "both"):
+            raise ValueError("ARCHIVE_BOILERPLATE_DROP must be off|embedding|llm|both")
+        return self
+
     @model_validator(mode="after")
     def _check_embed_dims(self) -> "Settings":
         if self.embed_dims != 768:
