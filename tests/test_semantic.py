@@ -273,3 +273,37 @@ def test_index_messages_keeps_the_footer_but_still_logs_when_drop_is_off(db):
     store, text = _harnessed(db, "off")
     assert "BCC Invest" in text
     assert store.boilerplate_stats()["embedding"] == {"hits": 1, "dropped": 0}
+
+
+def test_hybrid_vector_half_honours_include_calendar_items(indexed):
+    """The vector half used to exclude calendar items unconditionally, so a
+    calendar row that only the vector engine can find stayed invisible even
+    with include_calendar_items=true. "hummus" is in no document, so the
+    keyword AND matches nothing and the row can arrive by vector alone."""
+    store, index = indexed
+    store.upsert_messages([make_row("M-CAL", subject="Lunch sync accepted",
+                                    body="lunch at noon with the team")])
+    store.update_bodies({}, None,
+                        {"M-CAL": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
+    index.index_messages(store.unembedded_messages(10))
+
+    rows, _ = index.hybrid_search("hummus lunch", limit=5,
+                                  include_calendar_items=True)
+    assert "M-CAL" in [r["ews_id"] for r in rows]
+
+    rows, _ = index.hybrid_search("hummus lunch", limit=5,
+                                  include_calendar_items=False)
+    assert "M-CAL" not in [r["ews_id"] for r in rows]
+
+
+def test_find_similar_always_excludes_calendar_items(indexed):
+    """find_similar / similar_to_message have no such flag: meeting responses
+    are never useful "more like this" answers."""
+    store, index = indexed
+    store.upsert_messages([make_row("M-CAL2", subject="Accepted: Quarterly budget",
+                                    body="the budget forecast spreadsheet for finance")])
+    store.update_bodies({}, None,
+                        {"M-CAL2": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
+    index.index_messages(store.unembedded_messages(10))
+    hits = index.similar_to_message("M-BUDGET", limit=5)
+    assert "M-CAL2" not in [r["ews_id"] for r in hits]

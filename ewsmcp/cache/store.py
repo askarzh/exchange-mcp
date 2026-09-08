@@ -806,9 +806,15 @@ class CacheStore:
 
     def similar_message_ids(self, embedding: list[float], *, limit: int,
                             archived: str = "any",
-                            exclude_ews_id: str | None = None
+                            exclude_ews_id: str | None = None,
+                            include_calendar_items: bool = False
                             ) -> list[tuple[str, float]]:
         """Nearest messages by cosine distance, best distance per message.
+
+        Calendar chatter (meeting responses and appointments) is excluded by
+        default, exactly as `search_messages` excludes it, so the two halves
+        of a hybrid search answer the same question; `include_calendar_items`
+        lifts that for the callers whose user asked for it.
 
         The ANN part (`ORDER BY <=> ... LIMIT`) runs in an inner subquery
         against `ews.chunks` ALONE, with no join, so pgvector's HNSW index
@@ -825,6 +831,8 @@ class CacheStore:
         truncated to `limit` messages.
         """
         clause = _ARCHIVED.get(archived, "TRUE")
+        if not include_calendar_items:
+            clause = f"{clause} AND {_CALENDAR_EXCLUDE}"
         candidate_limit = min(max(int(limit), 1) * 4, 400)
         vector = _vector_literal(embedding)
         params: list[Any] = [vector]
@@ -842,7 +850,7 @@ class CacheStore:
                 f"  WHERE c.embedding IS NOT NULL {inner_extra}"
                 "  ORDER BY c.embedding <=> %s::vector LIMIT %s"
                 ") cand JOIN ews.messages m ON m.ews_id = cand.ews_id "
-                f"WHERE {clause} AND {_CALENDAR_EXCLUDE} ORDER BY cand.dist ASC",
+                f"WHERE {clause} ORDER BY cand.dist ASC",
                 params).fetchall()
         best: dict[str, float] = {}
         order: list[str] = []

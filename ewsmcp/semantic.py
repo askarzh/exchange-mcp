@@ -130,10 +130,12 @@ class SemanticIndex:
     # -------------------------------------------------------------- reading
 
     def vector_ids(self, text: str, *, limit: int, archived: str = "any",
-                   exclude_ews_id: str | None = None) -> list[tuple[str, float]]:
+                   exclude_ews_id: str | None = None,
+                   include_calendar_items: bool = False) -> list[tuple[str, float]]:
         vector = self.embedder.embed([QUERY_PREFIX + (text or "")])[0]
         return self.store.similar_message_ids(
-            vector, limit=limit, archived=archived, exclude_ews_id=exclude_ews_id)
+            vector, limit=limit, archived=archived, exclude_ews_id=exclude_ews_id,
+            include_calendar_items=include_calendar_items)
 
     def similar_to_message(self, ews_id: str, *, limit: int,
                            archived: str = "any") -> list[dict[str, Any]]:
@@ -164,7 +166,9 @@ class SemanticIndex:
         vector_ids: list[str] = []
         try:
             vector_ids = [i for i, _d in self.vector_ids(
-                query, limit=depth, archived=archived)]
+                query, limit=depth, archived=archived,
+                include_calendar_items=bool(
+                    filters.get("include_calendar_items", False)))]
         except Exception as exc:  # noqa: BLE001 - degrade, never fail the search
             logger.warning("semantic half unavailable (%s) — keyword only", exc)
             degraded = True
@@ -175,9 +179,9 @@ class SemanticIndex:
         # Structured filters live on the keyword side; a vector-only hit must
         # still satisfy them, so intersect with what the store would return.
         # `include_calendar_items` is excluded from this check: it is never
-        # None (always a bool) and calendar exclusion is already baked into
-        # both halves (keyword_rows above, similar_message_ids always), so it
-        # would otherwise force the intersection on every call.
+        # None (always a bool) and both halves already apply it themselves
+        # (keyword_rows above, `vector_ids` just now), so it would otherwise
+        # force the intersection on every call.
         allowed = set(keyword_ids)
         structured = {k: v for k, v in filters.items() if k != "include_calendar_items"}
         if any(v is not None for v in structured.values()):

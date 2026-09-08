@@ -109,6 +109,11 @@ store cleans up after itself. Design:
   `item_class`/`attachments_json`, with `body_clean` and `embedded_at` left
   untouched. `scripts/backfill_bodies.py` no longer has to fake an empty
   body to carry that metadata through.
+- `search_messages(mode="semantic", include_calendar_items=true)` now
+  returns calendar items from the vector half too: `similar_message_ids`
+  hard-coded the exclusion and `vector_ids` never passed the flag, so the
+  keyword half honoured the request and the vector half silently did not.
+  `find_similar` / `similar_to_message` still always exclude them.
 - `/v1/status` no longer overwrote the runner's `state_counts` wholesale
   with the DB-derived counts, which destroyed `skipped_too_large` before it
   could be reported; the two are merged.
