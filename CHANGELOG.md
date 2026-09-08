@@ -114,6 +114,10 @@ store cleans up after itself. Design:
   hard-coded the exclusion and `vector_ids` never passed the flag, so the
   keyword half honoured the request and the vector half silently did not.
   `find_similar` / `similar_to_message` still always exclude them.
+- Removed the unused `is_calendar_item_class` / `CALENDAR_CLASS_PREFIXES`
+  pair from `ewsmcp/cache/store.py` (the exclusion lives in SQL,
+  `_CALENDAR_EXCLUDE`), and the duplicate `test_schema_version_is_four`
+  in `tests/test_migrations.py` — `tests/test_archive_schema.py` owns it.
 - `/v1/status` no longer overwrote the runner's `state_counts` wholesale
   with the DB-derived counts, which destroyed `skipped_too_large` before it
   could be reported; the two are merged.

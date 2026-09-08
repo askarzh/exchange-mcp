@@ -34,13 +34,8 @@ _ARCHIVED = {"any": "TRUE", "only": "m.archive_state <> 'live'",
              "exclude": "m.archive_state = 'live'"}
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
-CALENDAR_CLASS_PREFIXES = ("IPM.Schedule.Meeting", "IPM.Appointment")
 _CALENDAR_EXCLUDE = ("(m.item_class IS NULL OR NOT (m.item_class LIKE 'IPM.Schedule.Meeting%%' "
                      "OR m.item_class LIKE 'IPM.Appointment%%'))")
-
-
-def is_calendar_item_class(item_class: str | None) -> bool:
-    return bool(item_class) and item_class.startswith(CALENDAR_CLASS_PREFIXES)
 
 
 def _vector_literal(values: Any) -> str:
