@@ -30,8 +30,20 @@ Decisions below were confirmed by the owner on 2026-09-08.
 |---|---|
 | Scope | Everything parked, one plan, ordered so search quality ships first. |
 | Thread context | Chunk 0 of a short reply carries the parent's subject and first 300 characters. No thread-level vectors. |
-| Boilerplate guardrail | Ships log-only (`ARCHIVE_BOILERPLATE_DROP=false`); enforcement is a config flip after two weeks of logged hits. |
+| Boilerplate guardrail | Two detectors run log-only side by side — embedding similarity (§2) and an LLM boundary pass (§2b) — with `ARCHIVE_BOILERPLATE_DROP=off`; after two weeks the owner picks the winner and the loser is removed. |
+| Third-party cleaners | `mail-parser-reply` is evaluated in a spike (§0) against the mirror before any dependency is added; `talon`, `unstructured`, DOM-level HTML cleaning are rejected (see Out of scope). |
 | Delete rails | Unchanged (on, 120 days, 1-day grace). Phase 3 adds the audit line for skipped deletes and nothing else. |
+
+## 0. Spike: `mail-parser-reply` against the mirror
+
+Before §1 is written, a throwaway script runs `mail-parser-reply` (pure
+Python, maintained) over every `body_clean` in the mirror and diffs its output
+against ours: paragraphs it removes that we keep, and vice versa, grouped by
+language. Output is a short report in the plan's SDD workspace. If it removes
+real boilerplate we miss in more than a handful of cases, its rules for those
+cases are ported into `bodyclean` (as regexes with golden tests); the library
+itself is not added as a dependency unless its Russian/Kazakh coverage turns
+out to exist and beat ours. Budget: half a day.
 
 ## 1. Trailing disclaimers (deterministic)
 
@@ -79,17 +91,62 @@ cosine similarity against every ref. A paragraph with
 `similarity >= EMBED_BOILERPLATE_THRESHOLD` (default 0.80) is a **hit**.
 
 **Log.** Every hit is written to `ews.boilerplate_hits(id, message_ews_id,
-paragraph, similarity, ref_label, dropped, created_at)`. `archive_status`
-reports `boilerplate: {hits_7d, dropped_7d, drop_enabled, threshold}`.
+detector, paragraph, similarity, ref_label, dropped, created_at)` with
+`detector = 'embedding'`. `archive_status` reports
+`boilerplate: {embedding: {hits_7d, dropped_7d}, llm: {hits_7d, dropped_7d,
+errors_7d}, drop_detector, threshold}`.
 
-**Drop.** Only when `ARCHIVE_BOILERPLATE_DROP=true`: the hit paragraph and
-everything after it are removed from the text that is chunked (the stored
-`body_clean` is NOT modified — the guardrail affects the index only, so a
-threshold mistake is reversible by re-embedding). The first non-empty paragraph
-of a message is never dropped.
+**Drop.** Only when `ARCHIVE_BOILERPLATE_DROP` names this detector
+(`embedding`): the hit paragraph and everything after it are removed from the
+text that is chunked (the stored `body_clean` is NOT modified — the guardrail
+affects the index only, so a threshold mistake is reversible by re-embedding).
+The first non-empty paragraph of a message is never dropped.
 
 **Cost.** Tail paragraphs add roughly 3–6 short texts per message to the
 embedding batch; at gemini-embedding-2 pricing this is negligible.
+
+### 2b. LLM boundary detector (second detector, same harness)
+
+Runs alongside the embedding check on the same tail paragraphs, so the two can
+be compared on real data before either is allowed to drop anything.
+
+**Model.** Gemini Flash-Lite (`GEMINI_CLEAN_MODEL`, default
+`gemini-2.5-flash-lite`) through the same API key as the embedder, from the
+daemon only. `temperature = 0`, JSON response schema.
+
+**Prompt.** The model receives the tail paragraphs numbered `0..n-1` plus the
+first paragraph of the message for context, and must answer
+`{"drop_from": <index or null>, "reason": <short string>}` — the index of the
+first paragraph that begins signature/disclaimer/gateway boilerplate. It never
+returns text. The daemon keeps the original bytes; the model only points.
+
+**Validation.** An answer is accepted only if `drop_from` is a valid index into
+the tail window and does not remove the first non-empty paragraph of the
+message. Anything else (invalid index, malformed JSON, HTTP error, timeout >
+10 s) is logged as `errors_7d` and treated as "no hit". One call per message,
+no retries beyond the embedder's existing 429 backoff.
+
+**Log.** Hits are written to the same `ews.boilerplate_hits` table with
+`detector = 'llm'`, `similarity = NULL`, `ref_label = <reason>`.
+
+**Drop.** Only when `ARCHIVE_BOILERPLATE_DROP=llm`. The flag is an enum:
+`off` (default) | `embedding` | `llm` | `both` (drop when either detector hits).
+
+**Tests.** Unit tests use a fake model with scripted answers (hit, miss,
+invalid index, garbage JSON, timeout). One recorded-fixture test runs the real
+model on six stored emails and asserts the drop set; it is marked
+`live_llm` and skipped without the API key.
+
+**Cost.** Roughly 1,000 input tokens per message: about 2.5 M tokens for the
+whole mailbox once, then a few thousand per day.
+
+### 2c. Choosing the winner
+
+After two weeks of log-only running, `scripts/boilerplate_report.py` prints,
+per detector: hits, hits on messages the other detector missed, and a sample
+of 20 paragraphs each for eyeballing. The owner sets
+`ARCHIVE_BOILERPLATE_DROP` to the winner (or `both`), re-queues embeddings for
+messages with hits, and the losing detector is removed in a follow-up commit.
 
 ## 3. Thread context for short replies
 
@@ -202,7 +259,9 @@ if it exceeds the pool. The MCP process keeps `max_size=4`.
 | Setting | Default | Section |
 |---|---|---|
 | `EMBED_BOILERPLATE_THRESHOLD` | `0.80` | §2 |
-| `ARCHIVE_BOILERPLATE_DROP` | `false` | §2 |
+| `ARCHIVE_BOILERPLATE_DROP` | `off` (`off` \| `embedding` \| `llm` \| `both`) | §2, §2b |
+| `GEMINI_CLEAN_MODEL` | `gemini-2.5-flash-lite` | §2b |
+| `ARCHIVE_BOILERPLATE_LLM` | `true` (run the LLM detector at all) | §2b |
 | `ARCHIVE_GC_INTERVAL_HOURS` | `168` | §7 |
 | `ARCHIVE_MAX_ITEM_MB` | `50` | §7 |
 | `DB_POOL_MAX` | `8` | §7 |
@@ -214,9 +273,9 @@ if it exceeds the pool. The MCP process keeps `max_size=4`.
 3. `docker exec -i ewsd python - --all < scripts/backfill_bodies.py`: fills
    `item_class` and `attachments_json` on every row, applies the disclaimer
    cut, re-queues bodies that changed.
-4. After two weeks, read `boilerplate_hits`; if the hits are all boilerplate,
-   set `ARCHIVE_BOILERPLATE_DROP=true` and re-queue embeddings for messages
-   with hits.
+4. After two weeks, run `scripts/boilerplate_report.py` (§2c), set
+   `ARCHIVE_BOILERPLATE_DROP` to the winning detector, re-queue embeddings for
+   messages with hits, and remove the losing detector.
 
 ## 10. Testing
 
@@ -227,6 +286,10 @@ if it exceeds the pool. The MCP process keeps `max_size=4`.
   misses deterministically; assert hits are logged, dropped only under the
   flag, and the first paragraph survives; assert chunk 0 carries thread
   context only for short replies with a parent.
+- llm detector: a fake model scripted per test (hit, miss, invalid index,
+  malformed JSON, timeout); assert only validated answers become hits, errors
+  are counted not raised, and the drop honours the enum flag; one
+  `live_llm`-marked fixture test against the real model, skipped without a key.
 - sync: hydration fills `item_class` and `attachments_json`; an
   `ItemAttachment` produces the documented row; `.content` is never accessed
   (a property that raises in the fake).
@@ -242,5 +305,9 @@ if it exceeds the pool. The MCP process keeps `max_size=4`.
 ## Out of scope
 
 Thread-level vectors; DOM-level HTML cleaning (the mirror indexes Exchange's
-plain-text rendering); any change to the delete rails or grace; per-user
-ranking tuning.
+plain-text rendering, and this gateway's banner is plain text there, not a
+classed element); `talon` (unmaintained, Python 2-era scientific
+dependencies) and `unstructured` (built for raw `.eml` ingestion, heavy
+dependency tree); a local small model (no GPU in this deployment — the LLM
+detector uses Gemini instead); any change to the delete rails or grace;
+per-user ranking tuning.
