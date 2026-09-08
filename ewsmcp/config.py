@@ -109,6 +109,10 @@ class Settings(BaseSettings):
     embed_boilerplate_threshold: float = 0.80
     archive_boilerplate_drop: str = "off"      # off | embedding | llm | both
     archive_boilerplate_llm: bool = True       # run the LLM detector at all
+    # Ceiling on Gemini boundary calls per embed pass. Each call is serial
+    # and blocking while the runner lock is held, so a whole page of
+    # messages calling out would hold that lock for page * timeout seconds.
+    archive_boilerplate_llm_per_cycle: int = 40
     gemini_clean_model: str = "gemini-2.5-flash-lite"
     # --- Phase 3: hygiene ----------------------------------------------------
     archive_gc_interval_hours: int = 168

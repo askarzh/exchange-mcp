@@ -29,6 +29,12 @@ class EmbedWorker:
             out["backlog"] = await asyncio.to_thread(self.store.embedding_backlog)
             return out
         budget = self.page if limit is None else int(limit)
+        # One pass, one LLM call budget (see BoilerplateHarness.begin_pass).
+        # getattr: `index` is duck-typed — tests and older stubs pass an
+        # object with index_messages alone.
+        begin = getattr(self.index, "begin_pass", None)
+        if begin is not None:
+            begin()
         try:
             while budget > 0:
                 rows = await asyncio.to_thread(

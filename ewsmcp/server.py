@@ -71,7 +71,8 @@ def build_context(settings: Settings) -> Context:
         harness = BoilerplateHarness(
             ctx.cache, embedder,
             threshold=settings.embed_boilerplate_threshold,
-            drop=settings.archive_boilerplate_drop, llm=llm)
+            drop=settings.archive_boilerplate_drop, llm=llm,
+            llm_per_cycle=settings.archive_boilerplate_llm_per_cycle)
         ctx.semantic = SemanticIndex(ctx.cache, embedder, harness=harness)
     else:
         logger.info("GEMINI_API_KEY unset — semantic search disabled, "

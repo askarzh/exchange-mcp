@@ -107,3 +107,42 @@ def test_harness_drop_enum_llm_and_both(db):
                                  llm=llm).analyse("A", BODY)
     assert "С уважением" not in text
     assert store.boilerplate_stats()["llm"]["hits"] == 3
+
+
+def test_llm_budget_stops_calls_and_reset_restores_it():
+    """Exhausted budget = no call at all: not a hit, not an `error:` row —
+    the pass simply stops asking until the next reset."""
+    cleaner = _ScriptedCleaner([{"drop_from": 0, "reason": "sig"}] * 5)
+    det = LlmDetector(cleaner, budget=2)
+    paras = ["Best regards, X"]
+    assert det.detect("m1", "first", paras)[0].paragraph_index == 0
+    assert det.detect("m2", "first", paras)[0].paragraph_index == 0
+    assert det.detect("m3", "first", paras) == []
+    assert len(cleaner.calls) == 2
+    det.reset(1)
+    assert det.detect("m4", "first", paras)[0].paragraph_index == 0
+    assert len(cleaner.calls) == 3 and det.budget == 0
+
+
+def test_embed_pass_caps_llm_calls_and_the_next_pass_rearms_them(db):
+    """One EmbedWorker pass may call the boundary detector at most
+    ARCHIVE_BOILERPLATE_LLM_PER_CYCLE times, however many messages it
+    indexes; the following pass gets a fresh budget."""
+    import asyncio
+
+    from ewsmcp.archive.embed import EmbedWorker
+    from ewsmcp.semantic import SemanticIndex
+
+    store = CacheStore(db)
+    store.upsert_messages([make_row(f"B{i}", body=BODY) for i in range(3)])
+    cleaner = _ScriptedCleaner([{"drop_from": None, "reason": "clean"}] * 20)
+    harness = BoilerplateHarness(store, FakeEmbedder(), threshold=0.99, drop="off",
+                                 llm=LlmDetector(cleaner), llm_per_cycle=2)
+    index = SemanticIndex(store, FakeEmbedder(), harness=harness)
+
+    asyncio.run(EmbedWorker(store, index).run(limit=10))
+    assert len(cleaner.calls) == 2          # 3 messages, 2 calls
+    with store.db.conn() as c:              # re-queue everything
+        c.execute("UPDATE ews.messages SET embedded_at = NULL")
+    asyncio.run(EmbedWorker(store, index).run(limit=10))
+    assert len(cleaner.calls) == 4          # budget re-armed, capped again

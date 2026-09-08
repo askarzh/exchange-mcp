@@ -70,6 +70,13 @@ class SemanticIndex:
 
     # ------------------------------------------------------------- indexing
 
+    def begin_pass(self) -> None:
+        """Called once per backlog pass by `EmbedWorker`. Only the boilerplate
+        harness cares today: it re-arms the LLM detector's per-pass call
+        budget so one pass can never make a call per message."""
+        if self.harness is not None:
+            self.harness.begin_pass()
+
     def index_messages(self, rows: list[dict[str, Any]]) -> int:
         """Chunk, embed and store `rows`; returns the number of messages done.
 

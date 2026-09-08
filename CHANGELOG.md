@@ -89,6 +89,11 @@ store cleans up after itself. Design:
   `_delete_batch` reason, including chunks with no deletions at all. The
   stale-changekey rail has its own exception type, so its reason reads
   `changekey ...` rather than `ValueError: ...`.
+- The boilerplate LLM detector is capped at
+  `ARCHIVE_BOILERPLATE_LLM_PER_CYCLE` (40) calls per embed pass. Each call
+  is serial and blocking while the archive runner holds its lock, so a full
+  200-message page could previously hold that lock for ~2000 s when Gemini
+  stalled; messages past the budget are indexed without the LLM's opinion.
 - `/v1/status` no longer overwrote the runner's `state_counts` wholesale
   with the DB-derived counts, which destroyed `skipped_too_large` before it
   could be reported; the two are merged.

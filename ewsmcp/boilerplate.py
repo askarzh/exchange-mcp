@@ -57,12 +57,27 @@ class EmbeddingDetector:
 
 class BoilerplateHarness:
     def __init__(self, store: Any, embedder: Any, *, threshold: float, drop: str,
-                 llm: Any | None = None) -> None:
+                 llm: Any | None = None, llm_per_cycle: int | None = None) -> None:
         self.store, self.embedder, self.threshold, self.drop = store, embedder, threshold, drop
         self.llm = llm
+        # How many LLM calls one indexing pass may make (None = unlimited).
+        # Stored here at construction so the pass itself only has to say
+        # "a new pass starts now" — see begin_pass().
+        self.llm_per_cycle = llm_per_cycle
         self._refs_stamp: Any = None
         self._detector = EmbeddingDetector([], threshold)
         self.refresh_refs()
+
+    def begin_pass(self) -> None:
+        """A new indexing pass starts: hand the LLM detector its call budget.
+
+        Without this the detector would call out once per message for a whole
+        200-message page, each call serial and blocking while the archive
+        runner holds its lock."""
+        if self.llm is not None and self.llm_per_cycle is not None:
+            reset = getattr(self.llm, "reset", None)
+            if reset is not None:
+                reset(int(self.llm_per_cycle))
 
     def refresh_refs(self) -> None:
         rows = self.store.boilerplate_refs()
@@ -174,13 +189,26 @@ class LlmDetector:
     paragraph_index=-1: the harness skips negative indexes in its cut loop,
     so the row is LOGGED (that is where `errors` in boilerplate_stats comes
     from) but can never drop a paragraph.
+
+    `budget` caps how many calls one pass may make (None = unlimited, which
+    is what a one-off script or a test wants). Once it is exhausted `detect`
+    returns nothing at all — no call, no hit, and no error row: the pass
+    simply stops asking, and the next `reset()` opens the budget again.
     """
 
-    def __init__(self, cleaner: Any) -> None:
+    def __init__(self, cleaner: Any, budget: int | None = None) -> None:
         self.cleaner = cleaner
+        self.budget = budget
+
+    def reset(self, budget: int | None) -> None:
+        self.budget = budget
 
     def detect(self, ews_id: str, first_paragraph: str,
                paragraphs: list[str]) -> list[Hit]:
+        if self.budget is not None:
+            if self.budget <= 0:
+                return []
+            self.budget -= 1
         try:
             ans = self.cleaner.boundary(first_paragraph, paragraphs)
             if not isinstance(ans, dict) or "reason" not in ans:
