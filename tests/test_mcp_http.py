@@ -78,4 +78,4 @@ def test_version(db):
     app = build_mcp_http_app(ctx, ctx.settings, None)
     status, body = _drive(app, "/version")
     assert status == 200
-    assert body["version"] == __version__ == "5.2.0a1"
+    assert body["version"] == __version__ == "5.2.0a2"

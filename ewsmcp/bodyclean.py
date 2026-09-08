@@ -64,6 +64,16 @@ _ORIG_EN_RE = re.compile(r"^-{2,}\s*original message\s*-{2,}$", re.IGNORECASE)
 _FROM_EN_RE = re.compile(r"^from\s*:", re.IGNORECASE)
 _PAIR_EN_RE = re.compile(r"^(?:sent|date)\s*:", re.IGNORECASE)
 
+# Apple Mail / Outlook RU attribution: "29 мая 2026 г., в 12:20, Имя
+# <a@b> написал(а):" — the direct equivalent of the Gmail EN line below,
+# and the only marker that closes a Russian quoted chain. The trailing
+# "$" is load-bearing: "Он написал: посмотри вложение" keeps text after
+# the colon and is ordinary prose, not a quote header.
+_WROTE_RU_RE = re.compile(r"^.{4,200}?(?:напис|пис)ал(?:\(а\)|а)?\s*:$",
+                          re.IGNORECASE)
+# Kazakh equivalent, same shape ("… жазды:").
+_WROTE_KZ_RE = re.compile(r"^.{4,200}?жазды\s*:$", re.IGNORECASE)
+
 # Gmail-style EN attribution: "On Mon, Jun 1, 2026 ... <a@b> wrote:".
 # Up to 200 chars: Outlook-rendered addresses ("<a@b<mailto:a@b>>") push the
 # attribution line well past 80.
@@ -116,6 +126,9 @@ def _find_markers(
             continue
         if _GMAIL_EN_RE.match(s):
             markers.append((idx, "gmail_en"))
+            continue
+        if _WROTE_RU_RE.match(s) or _WROTE_KZ_RE.match(s):
+            markers.append((idx, "wrote_ru"))
 
     markers.sort(key=lambda m: m[0])
     return markers, runs
@@ -169,6 +182,9 @@ def strip_quoted_history(text: str) -> tuple[str, int]:
 
 # (prefix, max length allowed AFTER the prefix on the same line).
 # The remainder cap keeps lines like "Thanks, that works for me." safe.
+# Longest remainder allowed after a closer prefix on the same line.
+_MAX_CLOSER_LINE_LEN = 200
+
 _CLOSERS_EN: list[tuple[str, int]] = [
     ("best regards", 4),
     ("kind regards", 4),
@@ -178,10 +194,14 @@ _CLOSERS_EN: list[tuple[str, int]] = [
 ]
 
 # Russian sign-off closers, same mechanism as _CLOSERS_EN.
+# Russian business mail routinely puts the closer, name, title and company
+# on ONE line ("С уважением, Имя Фамилия Старший эксперт …"), so unlike the
+# EN closers these allow a long remainder: the phrases are unambiguous
+# sign-offs, and `strip_signature` still only looks at the trailing block.
 _CLOSERS_RU: list[tuple[str, int]] = [
-    ("с уважением", 4),
-    ("с наилучшими пожеланиями", 4),
-    ("с благодарностью", 4),
+    ("с уважением", _MAX_CLOSER_LINE_LEN),
+    ("с наилучшими пожеланиями", _MAX_CLOSER_LINE_LEN),
+    ("с благодарностью", _MAX_CLOSER_LINE_LEN),
 ]
 
 _CLOSERS: list[tuple[str, int]] = _CLOSERS_EN + _CLOSERS_RU
@@ -227,7 +247,9 @@ def strip_signature(text: str) -> str:
         block_ne = [ln for ln in lines[i:] if ln.strip()]
         if len(block_ne) > _MAX_SIG_LINES:
             continue
-        if any(len(ln.strip()) > _MAX_SIG_LINE_LEN for ln in block_ne):
+        if any(len(ln.strip()) > _MAX_SIG_LINE_LEN for ln in block_ne[1:]):
+            continue
+        if len(block_ne[0].strip()) > _MAX_CLOSER_LINE_LEN:
             continue
         if sum(1 for ln in lines[:i] if ln.strip()) < 2:
             continue
@@ -274,7 +296,9 @@ _BANNER_LINE_RE = re.compile(
 # Outlook's auto-inserted horizontal rule line ("________________________")
 # separating a forwarded/replied message from the rest of the body. Purely
 # decorative, so it is dropped line by line like the RU header lines.
-_OUTLOOK_RULE_LINE_RE = re.compile(r"^_{10,}\s*$", re.MULTILINE)
+# Outlook indents the separator in some layouts, so the leading-whitespace
+# allowance is load-bearing.
+_OUTLOOK_RULE_LINE_RE = re.compile(r"^[ \t]*_{10,}[ \t]*$", re.MULTILINE)
 
 
 def strip_header_lines(text: str) -> str:
@@ -301,6 +325,21 @@ _DISCLAIMER_ANCHOR_RE = re.compile(
     r"intended solely for|intended only for the|confidentiality notice|"
     r"if you are not the intended recipient|"
     r"received this (?:e-?mail|message) in error|privileged and confidential)",
+    re.IGNORECASE)
+
+
+# Auto-generated meeting and notification footers. None of these phrases
+# occurs in prose a person writes, so they are cut from the tail window
+# exactly like a legal disclaimer.
+_MEETING_TAIL_ANCHOR_RE = re.compile(
+    r"(?:teams\.microsoft\.com/meetingoptions|"
+    r"aka\.ms/jointeamsmeeting|"
+    r"play\.google\.com/store/apps/details\?id=com\.microsoft\.teams|"
+    r"for organizers\s*:|для организаторов\s*:|"
+    r"собрание microsoft teams|microsoft teams meeting|"
+    r"получить outlook для|get outlook for|"
+    r"письмо отправлено автоматически|"
+    r"you are receiving this (?:e-?mail|message) because)",
     re.IGNORECASE)
 
 
@@ -332,10 +371,28 @@ def tail_paragraphs(text: str) -> list[tuple[int, str]]:
 
 
 def strip_disclaimer_tail(text: str) -> tuple[str, bool]:
+    """Cut from the first boilerplate paragraph to the end.
+
+    Two anchor sets with deliberately different reach. A legal disclaimer
+    shares its vocabulary with ordinary prose ("это письмо является
+    конфиденциальным" can be the point of the message), so it may only cut
+    inside the tail window. A Teams/Outlook auto-footer cannot occur in
+    prose at all, so it cuts wherever it starts — a short mail can carry a
+    400-character invitation block that never reaches the tail window.
+    Neither may touch the first paragraph.
+    """
+    cut: int | None = None
     for off, para in tail_paragraphs(text):
         if _DISCLAIMER_ANCHOR_RE.search(para):
-            return text[:off].rstrip(), True
-    return text, False
+            cut = off
+            break
+    for off, para in _paragraphs(text)[1:]:
+        if _MEETING_TAIL_ANCHOR_RE.search(para):
+            cut = off if cut is None else min(cut, off)
+            break
+    if cut is None:
+        return text, False
+    return text[:cut].rstrip(), True
 
 
 def clean_body(text: str, max_chars: int = 4000) -> dict:

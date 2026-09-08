@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exchange-mcp"
-version = "5.2.0a1"
+version = "5.2.0a2"
 description = "Postgres-backed Exchange (EWS) daemon plus a thin MCP tool surface for an executive-mailbox assistant (see DESIGN.md)"
 requires-python = ">=3.11"
 dependencies = [

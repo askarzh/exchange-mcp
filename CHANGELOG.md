@@ -4,6 +4,27 @@ Earlier history (the 4.0–4.5 lines) lives in the upstream
 [`azizmazrou/ews-mcp`](https://github.com/azizmazrou/ews-mcp) changelog;
 this file starts from the point this repository was extracted.
 
+## [5.2.0a2] - 2026-09-08 (pre-release)
+
+### Fixed
+- Russian reply attributions (`… написал(а):`, and the Kazakh `… жазды:`) now
+  end a quoted chain the way the English `On … wrote:` line does. Without them
+  122 of 1,948 mirrored bodies carried a whole quoted thread into the
+  full-text index and their embeddings.
+- The Outlook separator rule is stripped even when the layout indents it
+  (`^_{10,}` demanded the line begin with an underscore; 49 bodies kept it).
+- Auto-generated Teams/Outlook footers (meeting options and join links, the
+  Teams app-store links, "Получить Outlook для…", automated-notification
+  preambles) are cut from the body. Unlike a legal disclaimer these cannot
+  occur in prose, so they cut wherever they start rather than only inside the
+  tail window; the first paragraph is still never touched.
+- A Russian sign-off carrying the whole signature on ONE line ("С уважением,
+  Имя Фамилия Должность …") is recognised: the RU closers now allow a long
+  remainder, and `strip_signature` caps only the lines BELOW the closer.
+
+Dry-run over the live mirror: 436 of 1,922 bodies change, 518 KB of
+boilerplate removed, none emptied.
+
 ## [5.2.0a1] - 2026-09-08 (pre-release)
 
 ### Changed

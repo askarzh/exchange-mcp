@@ -505,3 +505,74 @@ def test_kazakh_disclaimer_anchor_is_cut():
     assert out["disclaimer_cut"] is True
     assert "қателесіп" not in out["text"]
     assert out["text"].endswith("вопросы по документам.")
+
+
+# --- Russian reply attribution, indented rules, meeting tails, inline sign-offs ---
+
+
+def test_russian_reply_attribution_cuts_the_quoted_chain():
+    """Apple Mail / Outlook in Russian end the quote header with
+    "написал(а):" — the English-only "On … wrote:" rule left the whole
+    quoted chain in the body (122 of 1948 mirrored messages)."""
+    text = (
+        "Добрый день.\n"
+        "Канат подскажите Вы уже завершили тестирование?\n"
+        "\n"
+        "1 сент. 2026 г., в 16:53, Есимбеков Канат Маратулы "
+        "<Kanat.Yessimbekov@bcchub.kz> написал(а):\n"
+        "\n"
+        "Добрый день! Новости есть. Только вчера получили ресурсы.\n"
+    )
+    out = clean_body(text)
+    assert out["text"] == ("Добрый день.\n"
+                           "Канат подскажите Вы уже завершили тестирование?")
+    assert out["quoted_blocks_stripped"] == 1
+
+
+def test_a_sentence_mentioning_written_is_not_an_attribution():
+    text = ("Добрый день.\n\n"
+            "Он написал: посмотрите вложение и вернитесь с комментариями.\n"
+            "Спасибо.\n")
+    assert "Он написал:" in clean_body(text)["text"]
+
+
+def test_an_indented_outlook_rule_line_is_stripped_too():
+    """`^_{10,}` demanded the line start with an underscore; Outlook indents
+    the separator in some layouts, leaving it in 49 mirrored bodies."""
+    text = ("Секретный код: Hy9Fy7U4\n"
+            "  ________________________________\n"
+            "\n"
+            "Нужна помощь?\n")
+    out = clean_body(text)["text"]
+    assert "_" * 10 not in out and "Нужна помощь?" in out
+
+
+def test_teams_invitation_tail_is_cut():
+    body = "\n\n".join(f"Коллеги, обсудим пункт {i} повестки на встрече." for i in range(5))
+    text = (body + "\n\n"
+            "Собрание Microsoft Teams\n"
+            "Присоединиться: https://teams.microsoft.com/meet/46173140844312\n"
+            "For organizers: Meeting options"
+            "<https://teams.microsoft.com/meetingOptions/?organizerId=abc>\n")
+    out = clean_body(text)["text"]
+    assert "Microsoft Teams" not in out and out.endswith("пункт 4 повестки на встрече.")
+
+
+def test_a_one_line_russian_signature_is_stripped():
+    """The closer, name, title and company arrive on ONE line, so the
+    4-characters-after-the-prefix rule never fired."""
+    text = ("Добрый день, коллеги.\n"
+            "Прошу согласовать бюджет до пятницы.\n"
+            "\n"
+            "С уважением, Ермекбаева Сауле Мухтарбековна Старший Эксперт "
+            "Департамента развития\n")
+    out = clean_body(text)["text"]
+    assert out.endswith("Прошу согласовать бюджет до пятницы.")
+    assert "С уважением" not in out
+
+
+def test_a_short_russian_reply_that_opens_with_a_closer_survives():
+    """Only the TAIL is a signature: a two-line body whose first line is a
+    closer has fewer than 2 body lines above it, so nothing is stripped."""
+    text = "С уважением, Аскар\n"
+    assert clean_body(text)["text"] == "С уважением, Аскар"
