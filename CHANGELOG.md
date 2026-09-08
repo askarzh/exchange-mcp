@@ -98,6 +98,10 @@ store cleans up after itself. Design:
   vector out of Postgres for every message it analyses: a new
   `CacheStore.boilerplate_refs_stamp()` (`max(created_at)`) is the per-
   message probe, and the 768-dim rows are reloaded only when it moves.
+- `archive_status` through the thin MCP now reports
+  `states.skipped_too_large`: the runner block's `state_counts` is dropped
+  as duplicated DB counts, which also threw away ewsd's per-process
+  too-large counter before it reached the reply.
 - `/v1/status` no longer overwrote the runner's `state_counts` wholesale
   with the DB-derived counts, which destroyed `skipped_too_large` before it
   could be reported; the two are merged.

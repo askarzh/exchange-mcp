@@ -362,3 +362,25 @@ def test_archive_run_and_get_raw_message_proxy_to_the_daemon(db):
     ctx = _mcp_ctx(db, daemon, ews_capability_tier="full")
     assert _run(ctx, "archive_run", dry_run=True)["proxied"] == "archive_run"
     assert _run(ctx, "get_raw_message", id="RAW-1")["proxied"] == "get_raw_message"
+
+
+def test_archive_status_surfaces_skipped_too_large_from_the_daemon(db):
+    """`skipped_too_large` is a per-process counter on ewsd's runner with no
+    DB row behind it. The MCP drops the runner's `state_counts` wholesale
+    (the DB-derived counts are already in `states`), so it has to lift that
+    one key across or an operator can never see items stuck behind
+    ARCHIVE_MAX_ITEM_MB."""
+    class StatusWithTooLarge(RecordingDaemon):
+        async def status(self):
+            return {"ok": True, "archive": {
+                "running": True, "cycles": 2,
+                "state_counts": {"skipped_too_large": 3},
+            }}
+
+    ctx = _mcp_ctx(db, StatusWithTooLarge())
+    _seed(ctx)
+    res = _run(ctx, "archive_status")
+    assert res["ok"] is True
+    assert res["states"]["skipped_too_large"] == 3
+    assert res["states"]["live"] == 2          # DB-derived counts still there
+    assert "state_counts" not in res["runner"]
