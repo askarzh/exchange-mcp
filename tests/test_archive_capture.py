@@ -266,6 +266,21 @@ def test_a_failure_after_mark_captured_does_not_strand_the_row(seeded):
     assert store.get_message("OLD-2")["archive_state"] == "captured"
 
 
+def test_capture_skips_items_over_the_size_cap(seeded):
+    store, settings = seeded
+    big = FakeItem("OLD-1")
+    big.size = 60 * 1024 * 1024
+    small = FakeItem("OLD-2")
+    small.size = 1024
+    account = FakeAccount({"OLD-1": big, "OLD-2": small})
+    cap = Capturer(settings, FakeGatewayFor(account), store, _policy(settings))
+    result = asyncio.run(cap.run(dry_run=False))
+    assert result["captured"] == 1 and result["too_large"] == 1
+    assert result["failed"] == 0
+    assert store.get_message("OLD-1")["archive_state"] == "live"
+    assert any(s.get("reason") == "too_large" for s in result["sample"])
+
+
 def test_low_disk_stops_the_run_before_fetching(seeded, monkeypatch):
     store, settings = seeded
     monkeypatch.setattr(files.shutil, "disk_usage", lambda p: (100, 99, 1))

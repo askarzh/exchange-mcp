@@ -68,6 +68,10 @@ class ArchiveRunner:
         # daemon does not walk the whole blob store on its first pass.
         self._last_gc_ts: float = time.time()
         self._gc_status: dict[str, Any] = {}
+        # Reset each cycle by the capture lane — a per-process counter, not
+        # a durable state (the row itself stays `live`, so nothing is
+        # tracked in Postgres for it).
+        self._too_large_last: int = 0
 
     # ------------------------------------------------------------ one pass
 
@@ -84,6 +88,7 @@ class ArchiveRunner:
                 "ok": False, "run_id": None, "kind": kind, "dry_run": dry_run,
                 "candidates": 0, "captured": 0, "verified": 0, "reset": 0,
                 "deleted": 0, "eligible": 0, "embedded": 0, "failed": 0,
+                "too_large": 0,
                 "blocked": "cycle in progress", "retry_after_s": 30,
                 "stopped": None, "error": None, "sample": [], "gc": None,
             }
@@ -109,6 +114,7 @@ class ArchiveRunner:
             "ok": True, "run_id": run_id, "kind": kind, "dry_run": dry_run,
             "candidates": 0, "captured": 0, "verified": 0, "reset": 0,
             "deleted": 0, "eligible": 0, "embedded": 0, "failed": 0,
+            "too_large": 0,
             "blocked": None, "stopped": None, "error": None, "sample": [],
             "gc": None,
         }
@@ -120,6 +126,8 @@ class ArchiveRunner:
                     out["candidates"] = res["candidates"]
                     out["captured"] = res["captured"]
                     out["failed"] += res["failed"]
+                    out["too_large"] = res["too_large"]
+                    self._too_large_last = res["too_large"]
                     out["stopped"] = res["stopped"]
                     out["sample"] = res["sample"]
                 if kind in ("verify", "all") and not dry_run:
@@ -275,6 +283,10 @@ class ArchiveRunner:
             "boilerplate": dict(self._boilerplate_cache),
             # Last orphan sweep; empty until one has run.
             "gc": dict(self._gc_status),
+            # Per-process counter from the last capture pass — the row
+            # itself stays `live`, so this is the only place an operator
+            # sees how many items are stuck behind ARCHIVE_MAX_ITEM_MB.
+            "state_counts": {"skipped_too_large": self._too_large_last},
         }
 
     def _policy_dict(self) -> dict[str, Any]:
