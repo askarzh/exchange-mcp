@@ -285,8 +285,10 @@ def test_delete_skips_an_item_whose_changekey_moved_since_capture(captured):
     items = {"V0": DeletableItem("V0", changekey="CK-MOVED"),
              "V1": DeletableItem("V1")}
     account = FakeAccount(items)
-    result = asyncio.run(_deleter(store, settings, account,
-                                  archive_delete_enabled=True).run(dry_run=False))
+    audit = RecordingAudit()
+    result = asyncio.run(_deleter(store, settings, account, audit,
+                                  archive_delete_enabled=True).run(
+                                      dry_run=False, run_id=42))
     assert result["deleted"] == 1 and result["failed"] == 1
     assert items["V0"].deleted is False
     assert items["V1"].deleted is True
@@ -295,6 +297,12 @@ def test_delete_skips_an_item_whose_changekey_moved_since_capture(captured):
     assert len(result["reasons"]) == 1
     assert "V0" in result["reasons"][0] and "changed since capture" in result["reasons"][0]
     _assert_invariant(result)
+    skipped = [r for r in audit.records if r["tool"] == "archive_delete_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["detail"]["ews_id"] == "V0"
+    assert skipped[0]["detail"]["run_id"] == 42
+    assert skipped[0]["detail"]["reason"].startswith("changekey")
+    assert skipped[0]["outcome"] == "skipped"
 
 
 class _RaisesOnFirstMarkDeleted:
@@ -407,8 +415,10 @@ def test_a_verified_row_whose_eml_vanished_is_never_deleted(captured):
     _mime_of(store, "V0", settings).unlink()
     items = {f"V{i}": DeletableItem(f"V{i}") for i in range(2)}
     account = FakeAccount(items)
-    result = asyncio.run(_deleter(store, settings, account,
-                                  archive_delete_enabled=True).run(dry_run=False))
+    audit = RecordingAudit()
+    result = asyncio.run(_deleter(store, settings, account, audit,
+                                  archive_delete_enabled=True).run(
+                                      dry_run=False, run_id=42))
     assert items["V0"].deleted is False
     assert items["V1"].deleted is True
     assert result["deleted"] == 1 and result["failed"] == 1
@@ -416,6 +426,12 @@ def test_a_verified_row_whose_eml_vanished_is_never_deleted(captured):
     assert store.get_message("V0")["verified_at"] is None
     assert "archive copy missing/corrupt" in result["reasons"][0]
     _assert_invariant(result)
+    skipped = [r for r in audit.records if r["tool"] == "archive_delete_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["detail"]["ews_id"] == "V0"
+    assert skipped[0]["detail"]["run_id"] == 42
+    assert "mime file missing" in skipped[0]["detail"]["reason"]
+    assert skipped[0]["outcome"] == "skipped"
 
 
 def test_a_corrupted_eml_is_never_deleted(captured):
