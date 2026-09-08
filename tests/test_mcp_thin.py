@@ -384,3 +384,24 @@ def test_archive_status_surfaces_skipped_too_large_from_the_daemon(db):
     assert res["states"]["skipped_too_large"] == 3
     assert res["states"]["live"] == 2          # DB-derived counts still there
     assert "state_counts" not in res["runner"]
+
+
+def test_keyword_search_honours_include_calendar_items_locally(db):
+    """The MCP builds the cache_reads call itself, so every tool argument has
+    to be handed over explicitly — `include_calendar_items` was dropped on
+    the floor, silently ignoring what the caller asked for (the daemon path
+    in tools/mail_read.py passes it)."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    ctx.cache.upsert_messages([make_row("CAL-1", subject="Accepted: Budget review",
+                                        body="", conv="C1")])
+    ctx.cache.update_bodies({}, None,
+                            {"CAL-1": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
+
+    res = _run(ctx, "search_messages", query="budget")
+    assert "Accepted: Budget review" not in [i["subject"] for i in res["items"]]
+
+    res = _run(ctx, "search_messages", query="budget", include_calendar_items=True)
+    assert "Accepted: Budget review" in [i["subject"] for i in res["items"]]
+    assert res["source"] == "cache" and daemon.calls == []

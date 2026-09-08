@@ -114,6 +114,10 @@ store cleans up after itself. Design:
   hard-coded the exclusion and `vector_ids` never passed the flag, so the
   keyword half honoured the request and the vector half silently did not.
   `find_similar` / `similar_to_message` still always exclude them.
+- `search_messages(mode="keyword", include_calendar_items=true)` through the
+  thin MCP no longer ignores the flag: its local handler builds the
+  `cache_reads.search_messages` call argument by argument and never passed
+  it, so only the daemon path honoured it.
 - Removed the unused `is_calendar_item_class` / `CALENDAR_CLASS_PREFIXES`
   pair from `ewsmcp/cache/store.py` (the exclusion lives in SQL,
   `_CALENDAR_EXCLUDE`), and the duplicate `test_schema_version_is_four`

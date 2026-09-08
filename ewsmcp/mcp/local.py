@@ -138,7 +138,8 @@ async def search_messages(ctx: Context, **kw) -> dict[str, Any]:
             subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),
             is_unread=kw.get("is_unread"), has_attachments=kw.get("has_attachments"),
             offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20)),
-            archived=kw.get("archived", "any"))
+            archived=kw.get("archived", "any"),
+            include_calendar_items=bool(kw.get("include_calendar_items", False)))
     except (psycopg.Error, RuntimeError) as exc:
         raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
                          hint="Check DATABASE_URL.", retry_after_s=15) from exc
