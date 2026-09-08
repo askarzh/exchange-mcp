@@ -104,9 +104,15 @@ def _row_full(ctx: Context, row: Any) -> dict[str, Any]:
                 "downloadable": bool(a["sha256"]),
             } for a in atts]
         else:
-            full["attachments_hint"] = ("message has attachments — call again "
-                                        "with fresh=true for the inventory, or "
-                                        "get_attachment to read one")
+            try:
+                inv = json.loads(row["attachments_json"] or "[]")
+            except ValueError:
+                inv = []
+            if inv:
+                full["attachments"] = inv
+            else:
+                full["attachments_hint"] = ("inventory not synced yet — call again "
+                                            "with fresh=true, or get_attachment")
     return full
 
 
@@ -293,7 +299,9 @@ async def search_messages(ctx: Context, *, folder: str | None,
                           until: str | None, is_unread: bool | None,
                           has_attachments: bool | None, offset: int,
                           limit: int, archived: str = "any",
-                          mode: str = "keyword") -> dict[str, Any] | None:
+                          mode: str = "keyword",
+                          include_calendar_items: bool = False
+                          ) -> dict[str, Any] | None:
     """Store-only search over the mirror. None only when there is no cache
     at all (``ctx.cache is None``) — the caller then goes straight to live
     EWS, same as every other cache_reads helper. Otherwise raises ToolError
@@ -318,7 +326,7 @@ async def search_messages(ctx: Context, *, folder: str | None,
     filters: dict[str, Any] = dict(
         sender=sender, subject=subject, since_ts=since_ts, until_ts=until_ts,
         is_unread=is_unread, has_attachments=has_attachments,
-        folder_ids=folder_ids,
+        folder_ids=folder_ids, include_calendar_items=include_calendar_items,
     )
     meta: dict[str, Any] | None = None
     if mode == "semantic":

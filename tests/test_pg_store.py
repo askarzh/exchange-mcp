@@ -250,6 +250,17 @@ def test_search_ands_across_tokens_not_just_ors_within_one(store):
     assert total == 1 and rows[0]["ews_id"] == "BOTH"
 
 
+def test_search_excludes_calendar_items_unless_asked(store):
+    store.upsert_messages([make_row("N1", subject="White Hill offer"),
+                           make_row("C1", subject="Accepted: White Hill meeting")])
+    store.update_bodies({"C1": ""}, None,
+                        {"C1": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
+    rows, total = store.search_messages(subject="white hill")
+    assert [r["ews_id"] for r in rows] == ["N1"] and total == 1
+    rows, total = store.search_messages(subject="white hill", include_calendar_items=True)
+    assert total == 2
+
+
 def test_search_underscore_token_group_stays_anded_with_the_next_token(store):
     """An ordinary token with an underscore (e.g. "report_v2") splits into
     more than one lexeme too ('report', 'v2') — its OR group must not leak
@@ -323,6 +334,16 @@ def test_archived_filter(store):
     assert store.get_message("M2")["archive_state"] == "verified"
 
 
+def test_update_bodies_extra_sets_item_class_and_inventory(store):
+    store.upsert_messages([make_row("A1")])
+    store.update_bodies({"A1": "body"}, None,
+                        {"A1": {"item_class": "IPM.Schedule.Meeting.Resp.Pos",
+                                "attachments_json": "[]"}})
+    row = store.get_message("A1")
+    assert row["item_class"] == "IPM.Schedule.Meeting.Resp.Pos"
+    assert row["attachments_json"] == "[]"
+
+
 def test_upsert_never_touches_archive_columns(store):
     store.upsert_messages([make_row("M1")])
     with store.db.conn() as c:
@@ -332,3 +353,33 @@ def test_upsert_never_touches_archive_columns(store):
     row = store.get_message("M1")
     assert row["subject"] == "edited"
     assert row["archive_state"] == "captured" and row["mime_sha256"] == "abc"
+
+
+def test_parent_in_thread_is_the_latest_earlier_message(db):
+    store = CacheStore(db)
+    store.upsert_messages([make_row("P0", conv="C", date_ts=100),
+                           make_row("P1", conv="C", date_ts=200),
+                           make_row("R", conv="C", date_ts=300),
+                           make_row("X", conv="D", date_ts=250)])
+    assert store.parent_in_thread("R")["ews_id"] == "P1"
+    assert store.parent_in_thread("P0") is None
+
+
+def test_update_bodies_applies_metadata_for_ids_with_no_body(store):
+    """A body-less meeting response returns no text and no recipients from
+    GetItem — only an item_class, which is exactly what the calendar filter
+    needs. Its id therefore never appears in `bodies`, and the update must
+    still land without disturbing body_clean or embedded_at."""
+    store.upsert_messages([make_row("A1", body="original body")])
+    store.replace_chunks("A1", [{"seq": 0, "source": "body", "text": "original body",
+                                 "embedding": [0.1] * 768}])
+    stamp = store.get_message("A1")["embedded_at"]
+    assert stamp is not None
+
+    assert store.update_bodies({}, None,
+                               {"A1": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}}) == 1
+    row = store.get_message("A1")
+    assert row["item_class"] == "IPM.Schedule.Meeting.Resp.Pos"
+    assert row["body_clean"] == "original body"
+    assert row["embedded_at"] == stamp          # not re-queued, chunks kept
+    assert store.embedding_backlog() == 0

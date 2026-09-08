@@ -6,12 +6,13 @@ tz-aware datetimes (Asia/Riyadh).
 """
 
 import asyncio
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
-from conftest import FakeGateway, make_context
+from conftest import FakeGateway, make_context, make_row
 
 from ewsmcp.tools import mail_read
 from ewsmcp.tools.base import dispatch
@@ -171,6 +172,19 @@ def test_get_message_full_shape_and_alias_roundtrip(tmp_path, db):
     assert message["to"] == []
     assert message["attachments"][0]["name"] == "contract.pdf"
     assert "snippet" not in message
+
+
+def test_get_message_from_mirror_lists_attachments_without_a_live_call(db):
+    ctx = make_context(db, gateway=FakeGateway())
+    row = make_row("A1", has_attachments=1)
+    ctx.cache.upsert_messages([row])
+    ctx.cache.update_bodies({"A1": "body"}, None, {"A1": {"attachments_json": json.dumps(
+        [{"name": "шаблон.xlsx", "size": 10, "content_type": "x/y", "inline": False}])}})
+    res = _run(ctx, "get_message", id="A1")
+    assert res["message"]["attachments"] == [{"name": "шаблон.xlsx", "size": 10,
+                                              "content_type": "x/y", "inline": False}]
+    assert "attachments_hint" not in res["message"]
+    assert ctx.gateway.calls == 0          # FakeGateway records calls
 
 
 def test_get_message_concise_returns_card(tmp_path, db):

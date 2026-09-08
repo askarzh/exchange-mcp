@@ -122,6 +122,16 @@ def test_archive_run_without_a_runner_is_unavailable(db):
     assert res["error"]["code"] == "upstream_unavailable"
 
 
+def test_archive_run_accepts_the_gc_kind(db):
+    ctx = _ctx(db)
+    ctx.archive = _FakeRunner()
+    res = _run(ctx, "archive_run", dry_run=True, kind="gc")
+    assert res["ok"] is True
+    assert ctx.archive.calls[0]["kind"] == "gc"
+    assert "gc" in ctx.registry["archive_run"].input_schema[
+        "properties"]["kind"]["enum"]
+
+
 def test_archive_run_rejects_an_unknown_kind(db):
     ctx = _ctx(db)
     ctx.archive = _FakeRunner()
@@ -241,7 +251,12 @@ def _semantic(ctx):
         make_row("S-FORECAST", subject="Forecast update",
                  body="finance forecast numbers"),
         make_row("S-LUNCH", subject="Lunch", body="shawarma at noon"),
+        make_row("S-BUDGET-CAL", subject="Quarterly budget",
+                 body="finance forecast spreadsheet"),
     ])
+    ctx.cache.update_bodies({"S-BUDGET-CAL": "finance forecast spreadsheet"}, None,
+                            {"S-BUDGET-CAL": {
+                                "item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
     ctx.semantic = SemanticIndex(ctx.cache, FakeEmbedder())
     ctx.semantic.index_messages(ctx.cache.unembedded_messages(100))
     return ctx
@@ -253,6 +268,11 @@ def test_find_similar_by_message_id(db):
     assert res["ok"] is True and res["count"] >= 1
     assert all(item["id"] != "S-BUDGET" for item in res["items"])
     assert "similarity" in res["items"][0]
+    # A calendar item (meeting response) with the same subject/body never
+    # appears — even though it is the nearest embedding to S-BUDGET. The
+    # only other row sharing this subject is the calendar row, so it must
+    # be entirely absent from the results.
+    assert not any(item["subject"] == "Quarterly budget" for item in res["items"])
 
 
 def test_find_similar_by_free_text(db):

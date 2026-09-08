@@ -210,7 +210,8 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                            has_attachments: Optional[bool] = None,
                            offset: int = 0, limit: int = 20,
                            archived: str = "any",
-                           mode: str = "keyword") -> Dict[str, Any]:
+                           mode: str = "keyword",
+                           include_calendar_items: bool = False) -> Dict[str, Any]:
     """Store-only search. There is no live Exchange search path: the whole
     mailbox is mirrored, so the mirror IS the search index. mode='semantic'
     runs the hybrid (keyword + embedding) search on ``ctx.semantic`` and
@@ -226,7 +227,8 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
             ctx, folder=folder, query=query, sender=sender, subject=subject,
             since=since, until=until, is_unread=is_unread,
             has_attachments=has_attachments, offset=offset, limit=limit,
-            archived=archived, mode=mode)
+            archived=archived, mode=mode,
+            include_calendar_items=include_calendar_items)
     except (psycopg.Error, RuntimeError) as exc:  # psycopg_pool.PoolClosed is RuntimeError
         raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
                         hint="Check DATABASE_URL; ewsd repairs the mirror on its own.",
@@ -535,6 +537,12 @@ TOOLS: List[ToolSpec] = [
                                "back with fewer than `limit` hits — widen the "
                                "filter or raise `limit` rather than reading "
                                "the short page as 'no such mail'.",
+            },
+            "include_calendar_items": {
+                "type": "boolean", "default": False,
+                "description": "Meeting requests/responses (Accepted:, Declined:, "
+                               "cancellations) are hidden by default; set true to "
+                               "search them too.",
             },
         }),
         handler=_search_messages,

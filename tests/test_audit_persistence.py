@@ -63,3 +63,17 @@ def test_verifier_catches_truncated_tail(tmp_path):
     lines = path.read_text(encoding="utf-8").strip().splitlines()
     path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
     assert verifier.verify(audit_dir) == 1  # chain.state no longer matches
+
+
+def test_verifier_passes_on_a_chain_with_a_skipped_delete_record(tmp_path):
+    """A skipped-delete record (Task 10: `archive_delete_skipped`) is just
+    another entry in the same hash chain — its `detail` payload must not
+    break the chain any differently than an ordinary record's would."""
+    log = AuditLog(str(tmp_path))
+    _record(log, 2)
+    log.record(tool="archive_delete_skipped", side_effect_class="destructive",
+               outcome="skipped", latency_ms=0, transport="archive",
+               detail={"ews_id": "V0", "reason": "changekey changed since capture",
+                       "run_id": 42})
+    _record(log, 1)
+    assert verifier.verify(tmp_path / "audit") == 0

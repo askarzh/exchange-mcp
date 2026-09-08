@@ -266,6 +266,21 @@ def test_a_failure_after_mark_captured_does_not_strand_the_row(seeded):
     assert store.get_message("OLD-2")["archive_state"] == "captured"
 
 
+def test_capture_skips_items_over_the_size_cap(seeded):
+    store, settings = seeded
+    big = FakeItem("OLD-1")
+    big.size = 60 * 1024 * 1024
+    small = FakeItem("OLD-2")
+    small.size = 1024
+    account = FakeAccount({"OLD-1": big, "OLD-2": small})
+    cap = Capturer(settings, FakeGatewayFor(account), store, _policy(settings))
+    result = asyncio.run(cap.run(dry_run=False))
+    assert result["captured"] == 1 and result["too_large"] == 1
+    assert result["failed"] == 0
+    assert store.get_message("OLD-1")["archive_state"] == "live"
+    assert any(s.get("reason") == "too_large" for s in result["sample"])
+
+
 def test_low_disk_stops_the_run_before_fetching(seeded, monkeypatch):
     store, settings = seeded
     monkeypatch.setattr(files.shutil, "disk_usage", lambda p: (100, 99, 1))
@@ -275,3 +290,31 @@ def test_low_disk_stops_the_run_before_fetching(seeded, monkeypatch):
     assert result["captured"] == 0
     assert "ARCHIVE_MIN_FREE_GB" in result["stopped"]
     assert account.fetch_calls == []
+
+
+def test_a_too_large_item_is_held_out_of_the_next_candidate_page(seeded):
+    """A skipped-for-size row stays `live`, and the candidate query is
+    date-ordered and limited — so without an in-memory skip list a handful of
+    oversized items at the head of the queue fills every page and capture
+    never progresses again."""
+    store, settings = seeded
+    big = FakeItem("OLD-1")
+    big.size = 60 * 1024 * 1024
+    small = FakeItem("OLD-2")
+    small.size = 1024
+    account = FakeAccount({"OLD-1": big, "OLD-2": small})
+    gateway = FakeGatewayFor(account)
+    remembered: set[str] = set()
+
+    first = asyncio.run(Capturer(settings, gateway, store, _policy(settings),
+                                 remembered).run(dry_run=False, limit=1))
+    assert first["too_large"] == 1 and first["captured"] == 0
+    assert remembered == {"OLD-1"}
+
+    second = asyncio.run(Capturer(settings, gateway, store, _policy(settings),
+                                  remembered).run(dry_run=False, limit=1))
+    assert [i for i, _ck in account.fetch_calls[-1][0]] == ["OLD-2"]
+    assert second["captured"] == 1
+    assert second["candidates"] == first["candidates"] - 1   # OLD-1 not counted
+    assert store.get_message("OLD-2")["archive_state"] == "captured"
+    assert store.get_message("OLD-1")["archive_state"] == "live"

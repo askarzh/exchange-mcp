@@ -19,9 +19,9 @@ def _indexes(db, table):
     return {r["indexname"]: r["indexdef"] for r in rows}
 
 
-def test_schema_version_is_three(db):
-    assert SCHEMA_VERSION == 3
-    assert db.schema_version() == 3
+def test_schema_version_is_four(db):
+    assert SCHEMA_VERSION == 4
+    assert db.schema_version() == 4
 
 
 def test_vector_extension_is_installed(db):

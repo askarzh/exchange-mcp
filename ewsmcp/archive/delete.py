@@ -142,6 +142,9 @@ class Deleter:
             failed_count += len(unusable)
             batch = [i for i in chunk if i not in unusable]
             if not batch:
+                if unusable:
+                    await asyncio.to_thread(
+                        self._persist_skips, list(unusable.items()), run_id)
                 processed_upto = start + len(chunk)
                 continue
             try:
@@ -156,12 +159,18 @@ class Deleter:
                 # Without this they would be counted twice and the
                 # deleted + failed + remaining == eligible invariant would
                 # break on exactly the path that is hardest to reason about.
+                if unusable:
+                    await asyncio.to_thread(
+                        self._persist_skips, list(unusable.items()), run_id)
                 processed_upto = start + len(unusable)
                 break
             processed_upto = start + len(chunk)
             for raw_id, reason in reasons.items():
                 result["reasons"].append(f"{raw_id}: {reason}")
             failed_count += len(reasons)
+            skip_pairs = list(unusable.items()) + list(reasons.items())
+            if skip_pairs:
+                await asyncio.to_thread(self._persist_skips, skip_pairs, run_id)
             if not deleted:
                 continue
             # Counted as `deleted` the moment Exchange's item.delete() has
@@ -217,6 +226,20 @@ class Deleter:
                         "run_id": run_id})
         return unmarked_ids
 
+    # Runs on a worker thread (asyncio.to_thread): one audit write per
+    # skipped candidate. Called for every chunk that produced a skip — a
+    # disk re-check failure (`_unusable_copies`) or a `_delete_batch`
+    # reason (stale changekey / a raised exception) — including a chunk
+    # with nothing deleted at all, so the audit chain explains every gap
+    # between `eligible` and `deleted`, not just the successes.
+    def _persist_skips(self, pairs: list[tuple[str, str]],
+                       run_id: int | None) -> None:
+        for ews_id, reason in pairs:
+            self.audit.record(
+                tool="archive_delete_skipped", side_effect_class="destructive",
+                outcome="skipped", latency_ms=0, transport="archive",
+                detail={"ews_id": ews_id, "reason": reason, "run_id": run_id})
+
     # Runs on a worker thread (asyncio.to_thread): file hashing and the
     # per-row attachment lookups are both blocking.
     # Returns {ews_id: reason} for every row whose archive copy is unusable.
@@ -266,6 +289,12 @@ class Deleter:
     def _delete_batch(
         self, account: Any, ids: list[str], by_id: dict[str, Any]
     ) -> tuple[list[str], dict[str, int], dict[str, str]]:
+        class _StaleChangekey(Exception):
+            """Raised — and reported without an exception-class prefix, so
+            its audit/log reason reads as `changekey ...` rather than
+            `ValueError: ...` — when the live changekey no longer matches
+            the one captured at verification time."""
+
         done: list[str] = []
         timings: dict[str, int] = {}
         reasons: dict[str, str] = {}
@@ -285,12 +314,16 @@ class Deleter:
                 live_ck = getattr(item, "changekey", None)
                 captured_ck = by_id[raw_id].get("captured_changekey")
                 if not captured_ck or not live_ck or live_ck != captured_ck:
-                    raise ValueError(
-                        f"changed since capture (captured={captured_ck!r}, "
+                    raise _StaleChangekey(
+                        f"changekey changed since capture (captured={captured_ck!r}, "
                         f"live={live_ck!r})")
                 item.delete()  # exchangelib 5.0.3: Item.delete() IS HardDelete
                 done.append(raw_id)
                 timings[raw_id] = int((time.time() - item_started) * 1000)
+            except _StaleChangekey as exc:
+                reason = str(exc)
+                reasons[raw_id] = reason
+                logger.warning("archive delete failed for %s: %s", raw_id, reason)
             except Exception as exc:  # noqa: BLE001 - one failure never stops the batch
                 reason = f"{type(exc).__name__}: {exc}"
                 reasons[raw_id] = reason

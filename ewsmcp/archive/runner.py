@@ -33,12 +33,13 @@ from . import files
 from .capture import Capturer
 from .delete import Deleter
 from .embed import EmbedWorker
+from .gc import GcWorker
 from .policy import ArchivePolicy
 from .verify import Verifier
 
 logger = logging.getLogger(__name__)
 
-KINDS = ("capture", "verify", "delete", "embed", "all")
+KINDS = ("capture", "verify", "delete", "embed", "gc", "all")
 MIN_CYCLE_SECONDS = 30
 
 
@@ -59,6 +60,22 @@ class ArchiveRunner:
         self._lock = asyncio.Lock()
         self._disk_cache: dict[str, Any] | None = None
         self._disk_cache_ts: float = 0.0
+        # status() is sync (an HTTP handler calls it), so the boilerplate
+        # counters are read once per cycle and served from here.
+        self._boilerplate_cache: dict[str, Any] = {}
+        # The GC lane runs on its own (weekly by default) interval, never
+        # inside a regular cycle. Seeded with "now" so a freshly started
+        # daemon does not walk the whole blob store on its first pass.
+        self._last_gc_ts: float = time.time()
+        self._gc_status: dict[str, Any] = {}
+        # Reset each cycle by the capture lane — a per-process counter, not
+        # a durable state (the row itself stays `live`, so nothing is
+        # tracked in Postgres for it).
+        self._too_large_last: int = 0
+        # The ids behind that counter, remembered for the life of the
+        # process so they stop re-filling every candidate page (see
+        # Capturer.__init__). Cleared by a restart.
+        self._too_large_ids: set[str] = set()
 
     # ------------------------------------------------------------ one pass
 
@@ -75,8 +92,9 @@ class ArchiveRunner:
                 "ok": False, "run_id": None, "kind": kind, "dry_run": dry_run,
                 "candidates": 0, "captured": 0, "verified": 0, "reset": 0,
                 "deleted": 0, "eligible": 0, "embedded": 0, "failed": 0,
+                "too_large": 0,
                 "blocked": "cycle in progress", "retry_after_s": 30,
-                "stopped": None, "error": None, "sample": [],
+                "stopped": None, "error": None, "sample": [], "gc": None,
             }
         try:
             return await self._run_once_locked(kind=kind, dry_run=dry_run,
@@ -100,16 +118,21 @@ class ArchiveRunner:
             "ok": True, "run_id": run_id, "kind": kind, "dry_run": dry_run,
             "candidates": 0, "captured": 0, "verified": 0, "reset": 0,
             "deleted": 0, "eligible": 0, "embedded": 0, "failed": 0,
+            "too_large": 0,
             "blocked": None, "stopped": None, "error": None, "sample": [],
+            "gc": None,
         }
         try:
             try:
                 if kind in ("capture", "all"):
                     res = await Capturer(self.settings, self.gateway, self.store,
-                                         policy).run(dry_run=dry_run)
+                                         policy, self._too_large_ids
+                                         ).run(dry_run=dry_run)
                     out["candidates"] = res["candidates"]
                     out["captured"] = res["captured"]
                     out["failed"] += res["failed"]
+                    out["too_large"] = res["too_large"]
+                    self._too_large_last = len(self._too_large_ids)
                     out["stopped"] = res["stopped"]
                     out["sample"] = res["sample"]
                 if kind in ("verify", "all") and not dry_run:
@@ -121,6 +144,17 @@ class ArchiveRunner:
                 if kind in ("embed", "all") and not dry_run:
                     res = await EmbedWorker(self.store, self.index).run()
                     out["embedded"] = res["embedded"]
+                    if res["error"]:
+                        out["error"] = res["error"]
+                if kind == "gc":
+                    # Never part of "all": the orphan sweep walks the whole
+                    # blob store, so it runs on its own interval.
+                    res = await GcWorker(self.settings, self.store).run(
+                        dry_run=dry_run)
+                    out["gc"] = {k: res[k] for k in ("scanned", "removed_files",
+                                                     "removed_bytes", "kept_recent")}
+                    out["sample"] = [{"removed_files": res["removed_files"],
+                                      "removed_bytes": res["removed_bytes"]}]
                     if res["error"]:
                         out["error"] = res["error"]
                 if kind in ("delete", "all") and not allow_delete:
@@ -191,10 +225,42 @@ class ArchiveRunner:
             except Exception as exc:  # noqa: BLE001 - degrade, never die
                 self.last_error = f"{type(exc).__name__}: {exc}"[:500]
                 logger.warning("archive cycle failed: %s", self.last_error)
+            try:
+                self._boilerplate_cache = {
+                    **await asyncio.to_thread(self.store.boilerplate_stats),
+                    "drop_detector": self.settings.archive_boilerplate_drop,
+                    "threshold": float(self.settings.embed_boilerplate_threshold),
+                }
+            except Exception as exc:  # noqa: BLE001 - counters never break a cycle
+                logger.warning("boilerplate stats failed: %s", exc)
+            await self._maybe_gc()
             self.cycles += 1
             self.last_cycle_ts = time.time()
             await asyncio.sleep(max(MIN_CYCLE_SECONDS,
                                     int(self.settings.archive_cycle_seconds)))
+
+    async def _maybe_gc(self) -> None:
+        """The orphan sweep, on its own interval (ARCHIVE_GC_INTERVAL_HOURS).
+
+        Separate from the cycle because it walks every file under DATA_DIR:
+        weekly is plenty, and 0 means "every cycle" (which is what the tests
+        use)."""
+        due = float(self.settings.archive_gc_interval_hours) * 3600
+        if time.time() - self._last_gc_ts < due:
+            return
+        self._last_gc_ts = time.time()
+        try:
+            async with self._lock:
+                result = await self._run_once_locked(
+                    kind="gc", dry_run=False, before=None, folders=None)
+            self._gc_status = {"last_run_ts": self._last_gc_ts,
+                               **(result.get("gc") or {})}
+            if result.get("error"):
+                self.last_error = result["error"]
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - GC never breaks the loop
+            logger.warning("archive gc failed: %s", exc)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -218,6 +284,16 @@ class ArchiveRunner:
             # environment of its own, so this is the only truthful source.
             "policy": self._policy_dict(),
             "semantic_enabled": bool(self.settings.semantic_enabled()),
+            # Filled at the end of each cycle; empty before the first one.
+            "boilerplate": dict(self._boilerplate_cache),
+            # Last orphan sweep; empty until one has run.
+            "gc": dict(self._gc_status),
+            # Per-process counter: how many distinct items this process has
+            # skipped for size since it started. The rows stay `live` (and
+            # are held out of later candidate pages), so this is the only
+            # place an operator sees what is stuck behind
+            # ARCHIVE_MAX_ITEM_MB.
+            "state_counts": {"skipped_too_large": self._too_large_last},
         }
 
     def _policy_dict(self) -> dict[str, Any]:

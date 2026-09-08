@@ -189,3 +189,121 @@ def test_hybrid_passes_structured_filters_through(indexed):
     _store, index = indexed
     rows, _ = index.hybrid_search("budget", limit=5, sender="nobody@example.com")
     assert rows == []
+
+
+def test_include_calendar_items_flag_alone_does_not_force_keyword_intersection(indexed):
+    """`include_calendar_items` reaches `hybrid_search` as a `**filters` entry
+    that is never None (cache_reads.search_messages always sets it), so it
+    must NOT be treated like a genuine structured filter — otherwise every
+    semantic-mode call through the tool would force the keyword/vector
+    intersection and kill vector-only RRF survivors.
+
+    "hummus" appears nowhere in the fixture, so the keyword AND across
+    ("hummus", "lunch") matches nothing; the vector half still surfaces
+    M-LUNCH through the shared "lunch" token (its subject is "Lunch
+    plans"). include_calendar_items=False alone must not suppress that hit."""
+    _store, index = indexed
+    rows, _ = index.hybrid_search("hummus lunch", limit=3, include_calendar_items=False)
+    assert "M-LUNCH" in [r["ews_id"] for r in rows]
+
+    # A genuine structured filter still forces the intersection, same as
+    # test_hybrid_passes_structured_filters_through above — the exclusion is
+    # specific to include_calendar_items, not a blanket skip of the gate.
+    rows2, _ = index.hybrid_search("hummus lunch", limit=3,
+                                   include_calendar_items=False,
+                                   sender="nobody@example.com")
+    assert rows2 == []
+
+
+def test_short_reply_chunk0_carries_parent_context(db):
+    store = CacheStore(db)
+    store.upsert_messages([
+        make_row("P", conv="C", date_ts=100, subject="Прогноз - инвестиции в ДО",
+                 body="Просим предоставить прогнозы по докапитализации ваших ДО. " * 3),
+        make_row("R", conv="C", date_ts=200, subject="RE: Прогноз - инвестиции в ДО",
+                 body="Добрый день. 1. 33,3 млрд тенге."),
+        make_row("L", conv="C", date_ts=300, subject="RE: long", body="x " * 400),
+    ])
+    index = SemanticIndex(store, FakeEmbedder())
+    index.index_messages(store.unembedded_messages(10))
+    with store.db.conn() as c:
+        texts = {r["message_ews_id"]: r["text"] for r in c.execute(
+            "SELECT message_ews_id, text FROM ews.chunks WHERE seq = 0")}
+    assert "In reply to: Прогноз - инвестиции в ДО" in texts["R"]
+    assert "докапитализации" in texts["R"]
+    assert "In reply to" not in texts["P"]          # no parent
+    assert "In reply to" not in texts["L"]          # too long
+
+
+BOILERPLATE_BODY = (
+    "Коллеги, добрый день.\n\n"
+    "По итогам встречи направляю обновлённую модель бюджета на следующий квартал. "
+    "Прошу посмотреть допущения на вкладке 2 и вернуться с комментариями до пятницы.\n\n"
+    "Отдельно обращаю внимание на сроки согласования с юристами: они просят две недели, "
+    "поэтому финальную версию нужно собрать заранее и разослать участникам.\n\n"
+    "С уважением, Аскар.\n\n"
+    "Предоставляемая АО «BCC Invest» информация не является предложением о покупке "
+    "и/или обязательством по продаже ценных бумаг.")
+
+
+def _harnessed(db, drop):
+    from ewsmcp.boilerplate import BoilerplateHarness
+    store = CacheStore(db)
+    store.upsert_messages([make_row("M-FOOT", body=BOILERPLATE_BODY)])
+    emb = FakeEmbedder()
+    footer = BOILERPLATE_BODY.split("\n\n")[-1]
+    store.upsert_boilerplate_ref("bcc_invest_ru", footer, emb.embed([footer])[0])
+    harness = BoilerplateHarness(store, emb, threshold=0.80, drop=drop)
+    index = SemanticIndex(store, emb, harness=harness)
+    rows = [r for r in store.messages_by_ids(["M-FOOT"]).values()]
+    assert index.index_messages(rows) == 1
+    with db.conn() as c:
+        chunks = c.execute("SELECT text FROM ews.chunks WHERE message_ews_id = 'M-FOOT' "
+                           "ORDER BY seq").fetchall()
+    return store, " ".join(r["text"] for r in chunks)
+
+
+def test_index_messages_drops_the_footer_when_drop_names_the_detector(db):
+    store, text = _harnessed(db, "embedding")
+    assert "BCC Invest" not in text
+    assert store.boilerplate_stats()["embedding"] == {"hits": 1, "dropped": 1}
+
+
+def test_index_messages_keeps_the_footer_but_still_logs_when_drop_is_off(db):
+    store, text = _harnessed(db, "off")
+    assert "BCC Invest" in text
+    assert store.boilerplate_stats()["embedding"] == {"hits": 1, "dropped": 0}
+
+
+def test_hybrid_vector_half_honours_include_calendar_items(indexed):
+    """The vector half used to exclude calendar items unconditionally, so a
+    calendar row that only the vector engine can find stayed invisible even
+    with include_calendar_items=true. "hummus" is in no document, so the
+    keyword AND matches nothing and the row can arrive by vector alone."""
+    store, index = indexed
+    store.upsert_messages([make_row("M-CAL", subject="Lunch sync accepted",
+                                    body="lunch at noon with the team")])
+    store.update_bodies({}, None,
+                        {"M-CAL": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
+    index.index_messages(store.unembedded_messages(10))
+
+    rows, _ = index.hybrid_search("hummus lunch", limit=5,
+                                  include_calendar_items=True)
+    assert "M-CAL" in [r["ews_id"] for r in rows]
+
+    rows, _ = index.hybrid_search("hummus lunch", limit=5,
+                                  include_calendar_items=False)
+    assert "M-CAL" not in [r["ews_id"] for r in rows]
+
+
+def test_find_similar_always_excludes_calendar_items(indexed):
+    """find_similar / similar_to_message have no such flag: meeting responses
+    are never useful "more like this" answers."""
+    store, index = indexed
+    store.upsert_messages([make_row("M-CAL2", subject="Accepted: Quarterly budget",
+                                    body="the budget forecast spreadsheet for finance")])
+    store.update_bodies({}, None,
+                        {"M-CAL2": {"item_class": "IPM.Schedule.Meeting.Resp.Pos"}})
+    index.index_messages(store.unembedded_messages(10))
+    hits = index.similar_to_message("M-BUDGET", limit=5)
+    assert "M-CAL2" not in [r["ews_id"] for r in hits]

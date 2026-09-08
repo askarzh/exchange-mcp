@@ -4,22 +4,135 @@ Earlier history (the 4.0–4.5 lines) lives in the upstream
 [`azizmazrou/ews-mcp`](https://github.com/azizmazrou/ews-mcp) changelog;
 this file starts from the point this repository was extracted.
 
-## [Unreleased]
+## [5.2.0a1] - 2026-09-08 (pre-release)
+
+Phase 3: search quality and archive hygiene. Boilerplate (legal
+disclaimers, gateway banners) stops dominating what the index sees, short
+replies carry their thread's topic, calendar chatter leaves the default
+result set, the mirror knows what is attached to a message, and the blob
+store cleans up after itself. Design:
+`docs/superpowers/specs/2026-09-08-phase3-search-quality-design.md`.
+
+### Added
+- Schema v4 (`ewsmcp/migrations/004_phase3.sql`, `SCHEMA_VERSION = 4`):
+  `ews.messages.item_class` and `attachments_json`, the
+  `ews.boilerplate_refs` / `ews.boilerplate_hits` pair, and a widened
+  `archive_runs.kind` CHECK that admits `gc`. The migration re-queues short
+  in-thread replies for embedding so their chunk 0 gains thread context.
+- `bodyclean` cuts trailing legal/confidentiality disclaimers inside a
+  bounded tail window (`tail_paragraphs()` + `strip_disclaimer_tail()`: the
+  last 40% of a body, at most 8 paragraphs, never the first one, bodies of
+  400 characters or more). `clean_body` now returns `disclaimer_cut`.
+  Russian sign-offs (`с уважением`, …), the Kazakh `қателесіп алсаңыз`
+  anchor and Outlook's auto-inserted `____` rules are recognized too.
+- The sync hydration pass fills `item_class` and an attachment inventory
+  (name / size / content type / inline flag) from the same bulk `GetItem`
+  that already fetched bodies and recipients — `SyncFolderItems` carries
+  neither. `FileAttachment.content` is never touched (it is a lazy
+  `GetAttachment` round trip). `scripts/backfill_bodies.py` repairs rows
+  whose `item_class` is still NULL.
+- Boilerplate detectors, log-only by default. An embedding detector
+  compares tail paragraphs against the reference disclaimers in
+  `ews.boilerplate_refs` (cosine, `EMBED_BOILERPLATE_THRESHOLD`); a Gemini
+  boundary detector (`GEMINI_CLEAN_MODEL`, temperature 0, a `responseSchema`
+  with a nullable `drop_from`) asks for the index where boilerplate begins.
+  Every hit lands in `ews.boilerplate_hits`; a paragraph is cut from the
+  text handed to the chunker — never from the stored body — only when
+  `ARCHIVE_BOILERPLATE_DROP` names the detector that found it. An answer
+  that is not a validated in-range index becomes a `paragraph_index = -1`
+  hit and can never cut anything. `archive_status` reports the
+  `boilerplate` block (per-detector hits / dropped / errors).
+- `scripts/seed_boilerplate.py` (8 reference disclaimers: the RU footer, the
+  RU/KZ confidentiality pair, the KZ/RU/EN gateway banners and the EN
+  confidentiality wording) and `scripts/boilerplate_report.py` (last 14
+  days: per-detector counts, disagreement, 20 sampled paragraphs) — the
+  evidence for choosing a detector before the drop is switched on. An empty
+  refs table makes the harness a no-op.
+- Weekly orphan blob GC (`GcWorker`, `ARCHIVE_GC_INTERVAL_HOURS`, default
+  168 h): a verification failure resets a row to `live` and forgets its
+  capture, leaving content-addressed files in `mime/` and `blobs/` forever.
+  The lane keeps everything `messages.mime_sha256` / `attachments.sha256`
+  still references and removes the rest once it is older than a day. It runs
+  on its own interval, never inside `kind="all"` (it walks the whole blob
+  store), its clock starts at daemon start, and `archive_run(kind="gc")`
+  exposes it manually under the usual two-phase confirmation — it deletes
+  files under `DATA_DIR`.
+- Settings: `EMBED_BOILERPLATE_THRESHOLD`, `ARCHIVE_BOILERPLATE_DROP`
+  (`off` | `embedding` | `llm` | `both`, validated), `ARCHIVE_BOILERPLATE_LLM`,
+  `GEMINI_CLEAN_MODEL`, `ARCHIVE_GC_INTERVAL_HOURS`, `ARCHIVE_MAX_ITEM_MB`,
+  `DB_POOL_MAX`.
+
+### Changed
+- Chunk 0 of a reply under 600 characters that has an earlier message in the
+  same conversation now carries `In reply to: <subject>` plus the parent's
+  first 300 characters, so a two-line "ok, agreed" stops embedding as
+  near-nothing and ranking below background noise on topical queries.
+- `get_message` lists attachments straight from `messages.attachments_json`
+  instead of telling the caller to fetch the message again with `fresh=true`.
+- `search_messages` hides calendar item classes (meeting requests and
+  responses, appointments) unless `include_calendar_items=true`;
+  `find_similar`'s vector half always excludes them. The flag is deliberately
+  not a structured filter, so passing it alone does not force the hybrid
+  intersection gate. **35 tools, unchanged** — `archive_run`'s `kind` enum
+  and `search_messages`'s schema are what moved.
+- Capture skips items larger than `ARCHIVE_MAX_ITEM_MB` (default 50) before
+  writing MIME or blobs: the row stays `live`, the skip is counted rather
+  than failed, and it surfaces as `state_counts.skipped_too_large`.
+- The daemon's Postgres pool honours `DB_POOL_MAX` (default 8, was psycopg's
+  4) and `build_context` logs the expected concurrent consumer count (EWS
+  thread pool + 4 archive lanes + 2 HTTP handlers), warning when it exceeds
+  the pool.
 
 ### Fixed
-- `archive_status` failed with "Object of type datetime is not JSON serializable": `recent_runs` timestamps are now ISO-8601 strings.
-- `archive_status` from the MCP reported the policy and `delete_enabled` from the MCP container's own defaults, contradicting the daemon. It now copies both from ewsd's status (`policy_source: "ewsd"`) and flags them as defaults when ewsd is unreachable.
-- The mirror never had message bodies: Exchange leaves `item:TextBody` empty in SyncFolderItems, so `body_clean` was `""` for every row and full-text search plus embeddings ran on subject and sender only. The sync engine now fetches bodies in bulk with GetItem (100 per call) before cleaning; `scripts/backfill_bodies.py` repairs rows synced before the fix and re-queues them for embedding.
-- `archive_status` from the MCP reported `semantic_enabled: false` because only ewsd holds `GEMINI_API_KEY`; the flag is now copied from ewsd.
-- Recipients were empty on every mirrored row for the same reason as bodies (`message:ToRecipients` is absent from SyncFolderItems); the bulk GetItem now fetches `to_recipients` too and the backfill repairs `to_json` without re-embedding unchanged bodies.
-- `get_attachment` on live mail now stamps `source: "live"` (the archive path already stamped `archive`).
-- `get_raw_message` returned the ASCII-reduced filename (a Cyrillic subject became `Fwd_ _ - _.eml`); it now reports the real name, which the download already served through `filename*`.
-- `list_folders` documents `archived` as the number of messages the archive holds a copy of (captured, verified or deleted), which is what it always counted.
-- `bodyclean` drops Russian forward/reply header lines (От/Дата/Кому/Копия/Тема, "Начало переадресованного письма") while keeping the forwarded text, so `find_similar` stops ranking every forward next to every other forward. `scripts/backfill_bodies.py --all` re-cleans existing rows.
-- `get_raw_message` names no longer contain `:` or other filesystem-unsafe characters ("Fwd: X" → "Fwd - X.eml"), so the curl hint works on Windows.
-- `bodyclean` removes the corporate "external sender" banner (KZ/RU/EN lines) and invisible code points (U+FEFF, zero-width spaces, NBSP) before storing and embedding; on this mailbox the banner sat on 15% of messages and made unrelated external mail look alike to `find_similar`.
-- Gmail-style "On … wrote:" attribution lines longer than 80 characters (Outlook renders the address as `<a@b<mailto:a@b>>`) did not cut quoted history; the cap is now 200.
-- `archive_status` runner block reports `next_cycle_in_s`, so a flat backlog between five-minute cycles is distinguishable from a stalled worker.
+- Every delete candidate that never reached `deleted` now produces an
+  `archive_delete_skipped` audit record — disk-recheck failures and every
+  `_delete_batch` reason, including chunks with no deletions at all. The
+  stale-changekey rail has its own exception type, so its reason reads
+  `changekey ...` rather than `ValueError: ...`.
+- The boilerplate LLM detector is capped at
+  `ARCHIVE_BOILERPLATE_LLM_PER_CYCLE` (40) calls per embed pass. Each call
+  is serial and blocking while the archive runner holds its lock, so a full
+  200-message page could previously hold that lock for ~2000 s when Gemini
+  stalled; messages past the budget are indexed without the LLM's opinion.
+- `BoilerplateHarness.refresh_refs()` no longer pulls every reference
+  vector out of Postgres for every message it analyses: a new
+  `CacheStore.boilerplate_refs_stamp()` (`max(created_at)`) is the per-
+  message probe, and the 768-dim rows are reloaded only when it moves.
+- `archive_status` through the thin MCP now reports
+  `states.skipped_too_large`: the runner block's `state_counts` is dropped
+  as duplicated DB counts, which also threw away ewsd's per-process
+  too-large counter before it reached the reply.
+- `CacheStore.update_bodies` iterates the union of `bodies`, `recipients`
+  and `extra` instead of `bodies` alone: a row whose GetItem returns no text
+  and no recipients (the body-less meeting response, the very row whose
+  `item_class` the calendar filter needs) now gets its
+  `item_class`/`attachments_json`, with `body_clean` and `embedded_at` left
+  untouched. `scripts/backfill_bodies.py` no longer has to fake an empty
+  body to carry that metadata through.
+- `search_messages(mode="semantic", include_calendar_items=true)` now
+  returns calendar items from the vector half too: `similar_message_ids`
+  hard-coded the exclusion and `vector_ids` never passed the flag, so the
+  keyword half honoured the request and the vector half silently did not.
+  `find_similar` / `similar_to_message` still always exclude them.
+- `search_messages(mode="keyword", include_calendar_items=true)` through the
+  thin MCP no longer ignores the flag: its local handler builds the
+  `cache_reads.search_messages` call argument by argument and never passed
+  it, so only the daemon path honoured it.
+- Removed the unused `is_calendar_item_class` / `CALENDAR_CLASS_PREFIXES`
+  pair from `ewsmcp/cache/store.py` (the exclusion lives in SQL,
+  `_CALENDAR_EXCLUDE`), and the duplicate `test_schema_version_is_four`
+  in `tests/test_migrations.py` — `tests/test_archive_schema.py` owns it.
+- Capture remembers the items it skipped for size (in memory, per ewsd
+  process) and excludes them from later candidate pages via a new
+  `exclude_ids` argument on `archive_candidates`/`archive_candidate_count`.
+  The candidate query is date-ordered and limited to 25, so a handful of
+  oversized items at the head of the queue used to re-fill every page and
+  stall capture indefinitely. `state_counts.skipped_too_large` now counts
+  the distinct items skipped since the process started; a restart clears
+  the list, which is how you retry them after raising `ARCHIVE_MAX_ITEM_MB`.
+- `/v1/status` no longer overwrote the runner's `state_counts` wholesale
+  with the DB-derived counts, which destroyed `skipped_too_large` before it
+  could be reported; the two are merged.
 
 ## [5.1.0a1] - 2026-09-04 (pre-release)
 
@@ -116,6 +229,21 @@ attachable through the same tools. Semantic search arrives with it. Design:
 - `get_raw_message` is no longer cold-gated: archived mail is served from
   disk while Exchange is warming up (the live-mail branch still refuses
   with `upstream_unavailable`).
+
+### Fixed
+- `archive_status` failed with "Object of type datetime is not JSON serializable": `recent_runs` timestamps are now ISO-8601 strings.
+- `archive_status` from the MCP reported the policy and `delete_enabled` from the MCP container's own defaults, contradicting the daemon. It now copies both from ewsd's status (`policy_source: "ewsd"`) and flags them as defaults when ewsd is unreachable.
+- The mirror never had message bodies: Exchange leaves `item:TextBody` empty in SyncFolderItems, so `body_clean` was `""` for every row and full-text search plus embeddings ran on subject and sender only. The sync engine now fetches bodies in bulk with GetItem (100 per call) before cleaning; `scripts/backfill_bodies.py` repairs rows synced before the fix and re-queues them for embedding.
+- `archive_status` from the MCP reported `semantic_enabled: false` because only ewsd holds `GEMINI_API_KEY`; the flag is now copied from ewsd.
+- Recipients were empty on every mirrored row for the same reason as bodies (`message:ToRecipients` is absent from SyncFolderItems); the bulk GetItem now fetches `to_recipients` too and the backfill repairs `to_json` without re-embedding unchanged bodies.
+- `get_attachment` on live mail now stamps `source: "live"` (the archive path already stamped `archive`).
+- `get_raw_message` returned the ASCII-reduced filename (a Cyrillic subject became `Fwd_ _ - _.eml`); it now reports the real name, which the download already served through `filename*`.
+- `list_folders` documents `archived` as the number of messages the archive holds a copy of (captured, verified or deleted), which is what it always counted.
+- `bodyclean` drops Russian forward/reply header lines (От/Дата/Кому/Копия/Тема, "Начало переадресованного письма") while keeping the forwarded text, so `find_similar` stops ranking every forward next to every other forward. `scripts/backfill_bodies.py --all` re-cleans existing rows.
+- `get_raw_message` names no longer contain `:` or other filesystem-unsafe characters ("Fwd: X" → "Fwd - X.eml"), so the curl hint works on Windows.
+- `bodyclean` removes the corporate "external sender" banner (KZ/RU/EN lines) and invisible code points (U+FEFF, zero-width spaces, NBSP) before storing and embedding; on this mailbox the banner sat on 15% of messages and made unrelated external mail look alike to `find_similar`.
+- Gmail-style "On … wrote:" attribution lines longer than 80 characters (Outlook renders the address as `<a@b<mailto:a@b>>`) did not cut quoted history; the cap is now 200.
+- `archive_status` runner block reports `next_cycle_in_s`, so a flat backlog between five-minute cycles is distinguishable from a stalled worker.
 
 ## [5.0.0a1] - 2026-09-03 (pre-release, Phase 1.5 simplification)
 

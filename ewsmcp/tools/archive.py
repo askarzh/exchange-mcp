@@ -29,7 +29,7 @@ from .cache_reads import _row_card
 
 logger = logging.getLogger(__name__)
 
-KINDS = ("capture", "verify", "delete", "embed", "all")
+KINDS = ("capture", "verify", "delete", "embed", "gc", "all")
 ARCHIVED_MODES = ("any", "only", "exclude")
 # Characters no common filesystem accepts in a name (Windows is the strict
 # one: ':' from "Fwd: …" makes `curl -o` fail there). Replaced by " - ".
@@ -176,6 +176,9 @@ async def _archive_status(ctx: Context) -> dict[str, Any]:
         files.free_gb, ctx.settings.data_dir), 2)
     if ctx.archive is not None:
         out["runner"] = ctx.archive.status()
+        boilerplate = out["runner"].get("boilerplate")
+        if boilerplate:
+            out["boilerplate"] = boilerplate
     return out
 
 
@@ -352,7 +355,11 @@ TOOLS: list[ToolSpec] = [
             "data dir), verifies, embeds, and — only when "
             "ARCHIVE_DELETE_ENABLED=true and a message is verified, older than "
             "the cutoff and past the grace period — hard-deletes it from "
-            "Exchange, capped per run. dry_run=false is two-phase confirmed. "
+            "Exchange, capped per run. kind='gc' is the separate orphan "
+            "sweep: it removes archive files under the server's data dir "
+            "that no message or attachment row references any more (never "
+            "part of kind='all'; the daemon runs it weekly on its own). "
+            "dry_run=false is two-phase confirmed. "
             "`before` and `folders` narrow this pass only."
         ),
         side_effect_class="destructive",

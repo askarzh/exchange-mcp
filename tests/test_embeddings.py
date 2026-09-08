@@ -7,6 +7,7 @@ import httpx
 import pytest
 from conftest import FakeEmbedder
 
+from ewsmcp.boilerplate import GeminiCleaner
 from ewsmcp.embeddings import (
     GEMINI_MODEL,
     QUERY_PREFIX,
@@ -143,3 +144,44 @@ def test_api_key_never_appears_in_logs_or_exception_text(caplog):
     for record in caplog.records:
         if record.name == "ewsmcp.embeddings":
             assert "TOP-SECRET-KEY" not in record.getMessage()
+
+
+# --------------------------------------------------------------------------
+# GeminiCleaner (the boilerplate boundary call) — same fake-client pattern
+# --------------------------------------------------------------------------
+
+
+def _cleaner_client(seen, response):
+    def handler(request):
+        seen.append(request)
+        return response
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_cleaner_asks_for_deterministic_json_and_returns_the_parsed_answer():
+    answer = {"drop_from": 2, "reason": "legal footer"}
+    seen = []
+    client = _cleaner_client(seen, httpx.Response(200, json={"candidates": [
+        {"content": {"parts": [{"text": json.dumps(answer)}]}}]}))
+    cleaner = GeminiCleaner("SECRET", model="gemini-2.5-flash-lite", client=client)
+    assert cleaner.boundary("hello", ["a", "b", "footer"]) == answer
+    request = seen[0]
+    assert "gemini-2.5-flash-lite" in str(request.url)
+    assert str(request.url).endswith("generateContent")
+    assert "SECRET" not in str(request.url)
+    assert request.headers["x-goog-api-key"] == "SECRET"
+    body = json.loads(request.content)
+    cfg = body["generationConfig"]
+    assert cfg["temperature"] == 0
+    assert cfg["responseMimeType"] == "application/json"
+    assert cfg["responseSchema"]["properties"]["drop_from"]["nullable"] is True
+    assert cfg["responseSchema"]["required"] == ["reason"]
+    assert "[2] footer" in body["contents"][0]["parts"][0]["text"]
+
+
+def test_cleaner_raises_on_a_server_error():
+    client = _cleaner_client([], httpx.Response(500, text="boom"))
+    cleaner = GeminiCleaner("SECRET", model="gemini-2.5-flash-lite", client=client)
+    with pytest.raises(httpx.HTTPStatusError):
+        cleaner.boundary("hello", ["a"])

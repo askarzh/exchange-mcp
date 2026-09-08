@@ -138,7 +138,8 @@ async def search_messages(ctx: Context, **kw) -> dict[str, Any]:
             subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),
             is_unread=kw.get("is_unread"), has_attachments=kw.get("has_attachments"),
             offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20)),
-            archived=kw.get("archived", "any"))
+            archived=kw.get("archived", "any"),
+            include_calendar_items=bool(kw.get("include_calendar_items", False)))
     except (psycopg.Error, RuntimeError) as exc:
         raise ToolError("backend_unavailable", f"Postgres unreachable ({exc})",
                          hint="Check DATABASE_URL.", retry_after_s=15) from exc
@@ -247,6 +248,13 @@ async def archive_status(ctx: Context, **kw) -> dict[str, Any]:
     # semantic_enabled() is always false and would misreport the service.
     if "semantic_enabled" in archive_block:
         out["semantic_enabled"] = bool(archive_block["semantic_enabled"])
+    # `state_counts` is dropped below (the DB-derived counts in out["states"]
+    # already say the same thing) — except for `skipped_too_large`, which is
+    # ewsd's per-process capture counter with no DB row behind it and no
+    # other way to reach the reply.
+    too_large = (archive_block.get("state_counts") or {}).get("skipped_too_large")
+    if too_large is not None:
+        out.setdefault("states", {})["skipped_too_large"] = too_large
     runner_keys = {k: v for k, v in archive_block.items()
                    if k not in _ARCHIVE_RUNNER_KEYS_TO_DROP}
     if runner_keys:

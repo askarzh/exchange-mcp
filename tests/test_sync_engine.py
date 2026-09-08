@@ -1,11 +1,13 @@
 """SyncEngine: delta application, token persistence, degrade-not-die."""
 
 import asyncio
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from conftest import FakeGateway, make_settings
+from exchangelib import FileAttachment
 
 from ewsmcp.cache.store import CacheStore
 from ewsmcp.cache.sync import SyncEngine, row_from_message
@@ -151,7 +153,8 @@ def test_sync_fetches_bodies_in_bulk_because_the_delta_has_none(db):
     engine, store = _engine(db, account)
     asyncio.run(engine._cycle())
 
-    assert account.fetch_calls == [(5, ("text_body", "to_recipients"))]
+    assert account.fetch_calls == [
+        (5, ("text_body", "to_recipients", "item_class", "attachments"))]
     assert _body_of(store, "M-3") == "fetched body 3"
     assert store.stats()["rows"]["messages"] == 5
     # Recipients are just as absent from the sync delta as the body.
@@ -200,6 +203,50 @@ def test_a_fetch_that_blows_up_entirely_still_writes_the_rows(db):
     assert store.get_sync_state("item:F-IN") == "tok-1"
 
 
+class _RaisingContent(FileAttachment):
+    """A FileAttachment subclass whose `.content` is a lazy GetAttachment
+    call — the hydrator must NEVER touch it."""
+
+    @property
+    def content(self):
+        raise AssertionError("hydration must not download attachment bytes")
+
+
+def _file_attachment(name, size, content_type, inline=False):
+    att = _RaisingContent.__new__(_RaisingContent)
+    att.name, att.size, att.content_type, att.is_inline = name, size, content_type, inline
+    return att
+
+
+def test_hydration_fills_item_class_and_attachment_inventory(db):
+    account = _account()
+    account.inbox.queue([("create", _msg("M-1", body=None))], "tok-1")
+
+    def fetch(items, only_fields=None, **kw):
+        account.fetch_calls.append((len(list(items)), tuple(only_fields or ())))
+        return iter([SimpleNamespace(
+            id="M-1", text_body="hello", to_recipients=[],
+            item_class="IPM.Note",
+            attachments=[_file_attachment("шаблон.xlsx", 789198,
+                                          "application/vnd.ms-excel"),
+                         SimpleNamespace(name="fwd.eml", size=None,
+                                         is_inline=False)])])
+
+    account.fetch = fetch
+    engine, store = _engine(db, account)
+    asyncio.run(engine._cycle())
+    assert account.fetch_calls == [(1, ("text_body", "to_recipients",
+                                        "item_class", "attachments"))]
+    row = store.get_message("M-1")
+    assert row["item_class"] == "IPM.Note"
+    assert json.loads(row["attachments_json"]) == [
+        {"name": "шаблон.xlsx", "size": 789198,
+         "content_type": "application/vnd.ms-excel", "inline": False},
+        {"name": "fwd.eml", "size": None, "content_type": "message/rfc822",
+         "inline": False},
+    ]
+
+
 def test_update_bodies_requeues_the_message_for_embedding(db):
     """The backfill's store half: body written, chunks dropped, embedded_at
     cleared — all in one transaction."""
@@ -211,7 +258,9 @@ def test_update_bodies_requeues_the_message_for_embedding(db):
     assert store.embedding_backlog() == 0
     assert [r["ews_id"] for r in store.messages_missing_body(10)] == ["M-1"]
 
-    assert store.update_bodies({"M-1": "real body"}, {"M-1": '["x@corp.example"]'}) == 1
+    assert store.update_bodies(
+        {"M-1": "real body"}, {"M-1": '["x@corp.example"]'},
+        {"M-1": {"item_class": "IPM.Note", "attachments_json": "[]"}}) == 1
     assert _body_of(store, "M-1") == "real body"
     assert store.embedding_backlog() == 1
     assert store.messages_missing_body(10) == []

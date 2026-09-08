@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -32,6 +33,9 @@ from ..db import Database
 _ARCHIVED = {"any": "TRUE", "only": "m.archive_state <> 'live'",
              "exclude": "m.archive_state = 'live'"}
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+_CALENDAR_EXCLUDE = ("(m.item_class IS NULL OR NOT (m.item_class LIKE 'IPM.Schedule.Meeting%%' "
+                     "OR m.item_class LIKE 'IPM.Appointment%%'))")
 
 
 def _vector_literal(values: Any) -> str:
@@ -82,11 +86,12 @@ def _tokens(query: str | None) -> list[str]:
 _UPSERT_MESSAGE = """
 INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id, sender_name,
     sender_email, to_json, subject, date_ts, date_iso, is_read, has_attachments,
-    importance, categories_json, body_clean, internet_message_id)
+    importance, categories_json, body_clean, internet_message_id, item_class,
+    attachments_json)
 VALUES (%(ews_id)s, %(changekey)s, %(folder_id)s, %(conversation_id)s, %(sender_name)s,
     %(sender_email)s, %(to_json)s, %(subject)s, %(date_ts)s, %(date_iso)s, %(is_read)s,
     %(has_attachments)s, %(importance)s, %(categories_json)s, %(body_clean)s,
-    %(internet_message_id)s)
+    %(internet_message_id)s, %(item_class)s, %(attachments_json)s)
 ON CONFLICT (ews_id) DO UPDATE SET
     changekey = EXCLUDED.changekey, folder_id = EXCLUDED.folder_id,
     conversation_id = EXCLUDED.conversation_id, sender_name = EXCLUDED.sender_name,
@@ -94,7 +99,8 @@ ON CONFLICT (ews_id) DO UPDATE SET
     subject = EXCLUDED.subject, date_ts = EXCLUDED.date_ts, date_iso = EXCLUDED.date_iso,
     is_read = EXCLUDED.is_read, has_attachments = EXCLUDED.has_attachments,
     importance = EXCLUDED.importance, categories_json = EXCLUDED.categories_json,
-    body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id
+    body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id,
+    item_class = EXCLUDED.item_class, attachments_json = EXCLUDED.attachments_json
 """
 
 
@@ -109,6 +115,9 @@ class CacheStore:
     def upsert_messages(self, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
+        for row in rows:
+            row.setdefault("item_class", None)
+            row.setdefault("attachments_json", None)
         with self.db.conn() as c:
             c.cursor().executemany(_UPSERT_MESSAGE, rows)
         return len(rows)
@@ -261,12 +270,15 @@ class CacheStore:
         since_ts: int | None = None, until_ts: int | None = None,
         is_unread: bool | None = None, has_attachments: bool | None = None,
         archived: str = "any", offset: int = 0, limit: int = 20,
+        include_calendar_items: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
         """Full-text + structured search over the mirror. Every argument is
         optional and freely combinable; `folder_ids=None` searches every
         mirrored folder. Returns (page rows, exact total)."""
         where: list[str] = [_ARCHIVED.get(archived, "TRUE")]
         params: list[Any] = []
+        if not include_calendar_items:
+            where.append(_CALENDAR_EXCLUDE)
         tokens = _tokens(text) if text else []
         if tokens:
             where.append(f"m.search_tsv @@ {_TSQUERY}")
@@ -422,7 +434,8 @@ class CacheStore:
             WHERE lower(btrim(cat)) = ANY(%(exclude_categories)s))
     """
 
-    def _candidate_params(self, folder_ids, before_ts, exclude_categories):
+    def _candidate_params(self, folder_ids, before_ts, exclude_categories,
+                          exclude_ids=None):
         return {
             "before_ts": int(before_ts),
             # None means "every folder"; [] must mean "no folder" — do not
@@ -430,28 +443,42 @@ class CacheStore:
             "folder_ids": None if folder_ids is None else list(folder_ids),
             "exclude_categories": [c.strip().lower()
                                    for c in (exclude_categories or []) if c.strip()],
+            "exclude_ids": list(exclude_ids or []),
         }
 
+    @staticmethod
+    def _candidate_exclusion(params) -> str:
+        """`exclude_ids` is only ever the caller's in-memory skip list, so an
+        empty one adds no clause at all rather than an `<> ALL('{}')` the
+        planner has to carry."""
+        return " AND m.ews_id <> ALL(%(exclude_ids)s)" if params["exclude_ids"] else ""
+
     def archive_candidates(self, *, folder_ids: list[str] | None, before_ts: int,
-                           exclude_categories: list[str],
-                           limit: int) -> list[dict[str, Any]]:
-        params = self._candidate_params(folder_ids, before_ts, exclude_categories)
+                           exclude_categories: list[str], limit: int,
+                           exclude_ids: list[str] | None = None
+                           ) -> list[dict[str, Any]]:
+        params = self._candidate_params(folder_ids, before_ts, exclude_categories,
+                                        exclude_ids)
         params["limit"] = int(limit)
         with self.db.conn() as c:
             return c.execute(
                 "SELECT m.ews_id, m.changekey, m.folder_id, m.subject, m.date_iso, "
                 "m.date_ts, m.internet_message_id, m.has_attachments "
-                f"FROM ews.messages m WHERE {self._CANDIDATE_WHERE} "
+                f"FROM ews.messages m WHERE {self._CANDIDATE_WHERE}"
+                f"{self._candidate_exclusion(params)} "
                 "ORDER BY m.date_ts ASC LIMIT %(limit)s", params).fetchall()
 
     def archive_candidate_count(self, *, folder_ids: list[str] | None,
                                 before_ts: int,
-                                exclude_categories: list[str]) -> int:
-        params = self._candidate_params(folder_ids, before_ts, exclude_categories)
+                                exclude_categories: list[str],
+                                exclude_ids: list[str] | None = None) -> int:
+        params = self._candidate_params(folder_ids, before_ts, exclude_categories,
+                                        exclude_ids)
         with self.db.conn() as c:
             return int(c.execute(
                 "SELECT COUNT(*) AS n FROM ews.messages m "
-                f"WHERE {self._CANDIDATE_WHERE}", params).fetchone()["n"])
+                f"WHERE {self._CANDIDATE_WHERE}{self._candidate_exclusion(params)}",
+                params).fetchone()["n"])
 
     def mark_captured(self, ews_id: str, *, mime_sha256: str,
                       mime_path: str, changekey: str | None = None) -> int:
@@ -594,6 +621,24 @@ class CacheStore:
                       "sha256": r.get("sha256"),
                       "is_inline": int(r.get("is_inline") or 0)} for r in rows])
 
+    # ------------------------------------------------------------ gc roots
+
+    def referenced_mime_shas(self) -> list[str]:
+        """Every MIME file the mirror still points at — the GC keep-set."""
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT mime_sha256 FROM ews.messages "
+                "WHERE mime_sha256 IS NOT NULL").fetchall()
+        return [r["mime_sha256"] for r in rows]
+
+    def referenced_blob_shas(self) -> list[str]:
+        """Every attachment blob the mirror still points at."""
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT sha256 FROM ews.attachments "
+                "WHERE sha256 IS NOT NULL").fetchall()
+        return [r["sha256"] for r in rows]
+
     def attachments_for(self, ews_id: str) -> list[dict[str, Any]]:
         with self.db.conn() as c:
             return c.execute(
@@ -641,9 +686,19 @@ class CacheStore:
     def unembedded_messages(self, limit: int) -> list[dict[str, Any]]:
         with self.db.conn() as c:
             return c.execute(
-                "SELECT ews_id, subject, body_clean FROM ews.messages "
+                "SELECT ews_id, subject, body_clean, conversation_id FROM ews.messages "
                 "WHERE embedded_at IS NULL ORDER BY date_ts DESC NULLS LAST "
                 "LIMIT %s", (int(limit),)).fetchall()
+
+    def parent_in_thread(self, ews_id: str) -> dict[str, Any] | None:
+        """The latest message in the same conversation dated before this one."""
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT p.ews_id, p.subject, p.body_clean FROM ews.messages m "
+                "JOIN ews.messages p ON p.conversation_id = m.conversation_id "
+                "  AND p.date_ts < m.date_ts AND p.ews_id <> m.ews_id "
+                "WHERE m.ews_id = %s AND m.conversation_id IS NOT NULL "
+                "ORDER BY p.date_ts DESC, p.ews_id DESC LIMIT 1", (ews_id,)).fetchone()
 
     def replace_chunks(self, ews_id: str, chunks: list[dict[str, Any]]) -> None:
         """Rewrite one message's chunks and stamp `embedded_at`, atomically.
@@ -676,40 +731,67 @@ class CacheStore:
         with self.db.conn() as c:
             return c.execute(
                 "SELECT ews_id, changekey FROM ews.messages "
-                "WHERE (coalesce(body_clean, '') = '' OR coalesce(to_json, '[]') = '[]') "
+                "WHERE (coalesce(body_clean, '') = '' OR coalesce(to_json, '[]') = '[]' "
+                "OR item_class IS NULL) "
                 "AND archive_state <> 'deleted' "
                 "ORDER BY date_ts DESC NULLS LAST LIMIT %s", (int(limit),)).fetchall()
 
     def update_bodies(self, bodies: dict[str, str],
-                      recipients: dict[str, str] | None = None) -> int:
-        """Set `body_clean` (and `to_json` when given) for the ids in
-        `bodies`. A row whose body actually changed goes back on the
-        embedding backlog — its chunks were built from the old text, so they
-        are dropped and `embedded_at` cleared in the same transaction; a row
-        whose body is unchanged (recipients-only repair, or a re-run) keeps
-        its chunks and its stamp. Returns the number of rows updated."""
-        if not bodies:
-            return 0
+                      recipients: dict[str, str] | None = None,
+                      extra: dict[str, dict] | None = None) -> int:
+        """Set `body_clean` (and `to_json`, `item_class`, `attachments_json`
+        when given) for the UNION of the ids in `bodies`, `recipients` and
+        `extra`. A row whose body actually changed goes back on the embedding
+        backlog — its chunks were built from the old text, so they are dropped
+        and `embedded_at` cleared in the same transaction; a row whose body is
+        unchanged (recipients-only repair, or a re-run) keeps its chunks and
+        its stamp.
+
+        An id present in `recipients`/`extra` but NOT in `bodies` gets the
+        metadata columns alone: `body_clean` and `embedded_at` are left
+        exactly as they were. That is the body-less meeting response — GetItem
+        returns neither text nor recipients for it, and it is exactly the row
+        whose `item_class` the calendar filter needs — which a bodies-only
+        loop could never repair.
+
+        Returns the number of rows actually updated."""
         recipients = recipients or {}
+        extra = extra or {}
+        ids = list(dict.fromkeys([*bodies, *recipients, *extra]))
+        if not ids:
+            return 0
+        meta = ("  to_json = coalesce(%(to)s, to_json), "
+                "  item_class = coalesce(%(item_class)s, item_class), "
+                "  attachments_json = coalesce(%(atts)s, attachments_json) "
+                "WHERE ews_id = %(ews_id)s ")
+        updated = 0
         requeued: list[str] = []
         with self.db.conn() as c:
-            for ews_id, body in bodies.items():
-                row = c.execute(
-                    "UPDATE ews.messages SET "
-                    "  embedded_at = CASE WHEN body_clean IS DISTINCT FROM %(body)s "
-                    "                     THEN NULL ELSE embedded_at END, "
-                    "  body_clean = %(body)s, "
-                    "  to_json = coalesce(%(to)s, to_json) "
-                    "WHERE ews_id = %(ews_id)s "
-                    "RETURNING (embedded_at IS NULL) AS requeued",
-                    {"ews_id": ews_id, "body": body,
-                     "to": recipients.get(ews_id)}).fetchone()
-                if row and row["requeued"]:
+            for ews_id in ids:
+                ex = extra.get(ews_id) or {}
+                params = {"ews_id": ews_id, "to": recipients.get(ews_id),
+                          "item_class": ex.get("item_class"),
+                          "atts": ex.get("attachments_json")}
+                if ews_id in bodies:
+                    params["body"] = bodies[ews_id]
+                    sql = ("UPDATE ews.messages SET "
+                           "  embedded_at = CASE WHEN body_clean IS DISTINCT FROM "
+                           "    %(body)s THEN NULL ELSE embedded_at END, "
+                           "  body_clean = %(body)s, " + meta +
+                           "RETURNING (embedded_at IS NULL) AS requeued")
+                else:
+                    sql = ("UPDATE ews.messages SET " + meta +
+                           "RETURNING FALSE AS requeued")
+                row = c.execute(sql, params).fetchone()
+                if row is None:
+                    continue
+                updated += 1
+                if row["requeued"]:
                     requeued.append(ews_id)
             if requeued:
                 c.execute("DELETE FROM ews.chunks WHERE message_ews_id = ANY(%s)",
                           (requeued,))
-        return len(bodies)
+        return updated
 
     def mark_embedded(self, ews_ids: list[str]) -> None:
         """Stamp `embedded_at` directly. `replace_chunks` already does this per
@@ -734,9 +816,15 @@ class CacheStore:
 
     def similar_message_ids(self, embedding: list[float], *, limit: int,
                             archived: str = "any",
-                            exclude_ews_id: str | None = None
+                            exclude_ews_id: str | None = None,
+                            include_calendar_items: bool = False
                             ) -> list[tuple[str, float]]:
         """Nearest messages by cosine distance, best distance per message.
+
+        Calendar chatter (meeting responses and appointments) is excluded by
+        default, exactly as `search_messages` excludes it, so the two halves
+        of a hybrid search answer the same question; `include_calendar_items`
+        lifts that for the callers whose user asked for it.
 
         The ANN part (`ORDER BY <=> ... LIMIT`) runs in an inner subquery
         against `ews.chunks` ALONE, with no join, so pgvector's HNSW index
@@ -753,6 +841,8 @@ class CacheStore:
         truncated to `limit` messages.
         """
         clause = _ARCHIVED.get(archived, "TRUE")
+        if not include_calendar_items:
+            clause = f"{clause} AND {_CALENDAR_EXCLUDE}"
         candidate_limit = min(max(int(limit), 1) * 4, 400)
         vector = _vector_literal(embedding)
         params: list[Any] = [vector]
@@ -780,3 +870,56 @@ class CacheStore:
                 best[ews_id] = float(r["dist"])  # so the first hit is the best
                 order.append(ews_id)
         return [(i, best[i]) for i in order[:int(limit)]]
+
+    # --------------------------------------------------------- boilerplate
+
+    def boilerplate_refs_stamp(self) -> datetime | None:
+        """Newest `created_at` across the reference rows, or None when there
+        are none. The harness probes this once per message and reloads the
+        (768-dim) vectors themselves only when it moves."""
+        with self.db.conn() as c:
+            return c.execute("SELECT max(created_at) AS stamp "
+                             "FROM ews.boilerplate_refs").fetchone()["stamp"]
+
+    def boilerplate_refs(self) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            rows = c.execute("SELECT label, text, embedding::text AS embedding, created_at "
+                             "FROM ews.boilerplate_refs ORDER BY id").fetchall()
+        for r in rows:
+            r["embedding"] = json.loads(r["embedding"])
+        return rows
+
+    def upsert_boilerplate_ref(self, label: str, text: str, embedding: list[float]) -> None:
+        with self.db.conn() as c:
+            c.execute("INSERT INTO ews.boilerplate_refs (label, text, embedding) "
+                      "VALUES (%s, %s, %s::vector) ON CONFLICT (label) DO UPDATE SET "
+                      "text = EXCLUDED.text, embedding = EXCLUDED.embedding, "
+                      "created_at = now()", (label, text, _vector_literal(embedding)))
+
+    def log_boilerplate_hits(self, ews_id: str, hits: list[Any], dropped: bool) -> None:
+        if not hits:
+            return
+        with self.db.conn() as c:
+            c.cursor().executemany(
+                "INSERT INTO ews.boilerplate_hits (message_ews_id, detector, paragraph, "
+                "similarity, ref_label, dropped) VALUES (%s, %s, %s, %s, %s, %s)",
+                [(ews_id, h.detector, h.paragraph[:2000], h.similarity, h.ref_label,
+                  1 if dropped else 0) for h in hits])
+
+    def boilerplate_stats(self, days: int = 7) -> dict[str, dict[str, int]]:
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT detector, COUNT(*) AS hits, "
+                "  COUNT(*) FILTER (WHERE dropped = 1) AS dropped, "
+                "  COUNT(*) FILTER (WHERE ref_label LIKE 'error:%%') AS errors "
+                "FROM ews.boilerplate_hits WHERE created_at > now() - make_interval(days => %s) "
+                "GROUP BY detector", (int(days),)).fetchall()
+        out: dict[str, dict[str, int]] = {
+            "embedding": {"hits": 0, "dropped": 0},
+            "llm": {"hits": 0, "dropped": 0, "errors": 0}}
+        for r in rows:
+            d = out.setdefault(r["detector"], {})
+            d["hits"], d["dropped"] = int(r["hits"]), int(r["dropped"])
+            if r["detector"] == "llm":
+                d["errors"] = int(r["errors"])
+        return out

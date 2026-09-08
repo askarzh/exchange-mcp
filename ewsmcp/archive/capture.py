@@ -31,17 +31,26 @@ logger = logging.getLogger(__name__)
 # Never fetch the full item: without a projection exchangelib pulls every
 # field. `attachments` here is the metadata list (see module docstring) and
 # `changekey` is recorded so the verifier can detect a post-capture edit.
-CAPTURE_FIELDS = ["mime_content", "changekey", "attachments", "has_attachments"]
+CAPTURE_FIELDS = ["mime_content", "changekey", "attachments", "has_attachments",
+                  "size"]
 BATCH_SIZE = 25
 
 
 class Capturer:
     def __init__(self, settings: Any, gateway: Any, store: Any,
-                 policy: ArchivePolicy) -> None:
+                 policy: ArchivePolicy,
+                 too_large_ids: set[str] | None = None) -> None:
         self.settings = settings
         self.gateway = gateway
         self.store = store
         self.policy = policy
+        # Items over ARCHIVE_MAX_ITEM_MB stay `live` forever, and the
+        # candidate query is date-ordered and limited: 25 of them at the head
+        # of the queue would fill every page and stall capture for good. The
+        # runner owns this set so it survives across passes (and is dropped
+        # on restart, which is the intended way to retry after raising the
+        # cap).
+        self.too_large_ids = set() if too_large_ids is None else too_large_ids
 
     async def run(self, *, limit: int = BATCH_SIZE,
                   dry_run: bool = True) -> dict[str, Any]:
@@ -50,7 +59,8 @@ class Capturer:
         def select() -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
             sel = {"folder_ids": self.policy.folder_ids(self.store),
                    "before_ts": self.policy.capture_cutoff_ts(),
-                   "exclude_categories": list(self.policy.exclude_categories)}
+                   "exclude_categories": list(self.policy.exclude_categories),
+                   "exclude_ids": sorted(self.too_large_ids)}
             return (self.store.archive_candidate_count(**sel),
                     self.store.archive_candidates(**sel, limit=int(limit)), sel)
 
@@ -58,7 +68,7 @@ class Capturer:
         sample = [{"ews_id": r["ews_id"], "subject": r["subject"],
                    "date": r["date_iso"]} for r in rows[:10]]
         result: dict[str, Any] = {"candidates": total, "captured": 0, "failed": 0,
-                                  "sample": sample, "stopped": None}
+                                  "too_large": 0, "sample": sample, "stopped": None}
         if dry_run or not rows:
             return result
         try:
@@ -69,14 +79,20 @@ class Capturer:
             result["stopped"] = str(exc)
             return result
         ids = [r["ews_id"] for r in rows]
-        captured, failed = await self.gateway.call(
+        captured, failed, too_large = await self.gateway.call(
             lambda account: self._capture_batch(account, ids))
-        result["captured"], result["failed"] = captured, failed
+        result["captured"], result["failed"], result["too_large"] = (
+            captured, failed, len(too_large))
+        for ews_id in too_large:
+            result["sample"].append({"ews_id": ews_id, "reason": "too_large"})
         return result
 
     # Runs on the EWS pool (sync).
-    def _capture_batch(self, account: Any, ids: list[str]) -> tuple[int, int]:
+    def _capture_batch(self, account: Any,
+                       ids: list[str]) -> tuple[int, int, list[str]]:
         captured = failed = 0
+        too_large: list[str] = []
+        max_bytes = self.settings.archive_max_item_mb * 1024 * 1024
         fetched = account.fetch(ids=[(i, None) for i in ids],
                                 only_fields=CAPTURE_FIELDS)
         # zip(strict=True): a `fetched` shorter than `ids` (a malformed
@@ -86,13 +102,21 @@ class Capturer:
             try:
                 if isinstance(item, Exception):
                     raise item
+                size = getattr(item, "size", None)
+                if size and size > max_bytes:
+                    # Left `live`, retried never automatically — it stays a
+                    # visible skip (not a failure) until either the item
+                    # shrinks (unlikely) or an operator raises the cap.
+                    too_large.append(raw_id)
+                    self.too_large_ids.add(raw_id)
+                    continue
                 self._capture_one(raw_id, item)
                 captured += 1
             except Exception as exc:  # noqa: BLE001 - skip one, keep the batch
                 failed += 1
                 logger.warning("capture failed for %s: %s: %s", raw_id,
                                type(exc).__name__, exc)
-        return captured, failed
+        return captured, failed, too_large
 
     def _capture_one(self, raw_id: str, item: Any) -> None:
         mime = getattr(item, "mime_content", None)

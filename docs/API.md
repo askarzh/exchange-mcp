@@ -86,6 +86,7 @@ Search mail across the local mirror of the whole mailbox. `query` is full-text o
 | `limit` | integer | no | (default `20`) |
 | `archived` | string | no | any (default) searches live and archived mail; only restricts to archived; exclude to live. (one of: `any`, `only`, `exclude`; default `any`) |
 | `mode` | string | no | keyword = full-text over the mirror; semantic = hybrid (full-text + embedding similarity, RRF-fused). semantic falls back to keyword with meta.degraded=true when embeddings are unavailable. The embedding half reads a capped candidate set (limit*4 chunks, at most 400) BEFORE archived/date/sender filters are applied, so a highly selective filter can come back with fewer than `limit` hits — widen the filter or raise `limit` rather than reading the short page as 'no such mail'. (one of: `keyword`, `semantic`; default `keyword`) |
+| `include_calendar_items` | boolean | no | Meeting requests/responses (Accepted:, Declined:, cancellations) are hidden by default; set true to search them too. (default `False`) |
 
 #### `get_message` — read (min tier: read)
 
@@ -406,14 +407,14 @@ Set out-of-office auto-replies (externally visible → send class, two-phase con
 
 #### `archive_run` — destructive (min tier: full)
 
-Run one archive pass. dry_run=true (the default) only REPORTS: how many messages match the policy and which would go, touching neither Exchange nor disk — always start there. dry_run=false actually captures (raw MIME + attachment blobs to the server's data dir), verifies, embeds, and — only when ARCHIVE_DELETE_ENABLED=true and a message is verified, older than the cutoff and past the grace period — hard-deletes it from Exchange, capped per run. dry_run=false is two-phase confirmed. `before` and `folders` narrow this pass only.
+Run one archive pass. dry_run=true (the default) only REPORTS: how many messages match the policy and which would go, touching neither Exchange nor disk — always start there. dry_run=false actually captures (raw MIME + attachment blobs to the server's data dir), verifies, embeds, and — only when ARCHIVE_DELETE_ENABLED=true and a message is verified, older than the cutoff and past the grace period — hard-deletes it from Exchange, capped per run. kind='gc' is the separate orphan sweep: it removes archive files under the server's data dir that no message or attachment row references any more (never part of kind='all'; the daemon runs it weekly on its own). dry_run=false is two-phase confirmed. `before` and `folders` narrow this pass only.
 
 > Two-phase confirm for some argument combinations: the first call returns a preview + `confirm_token`; repeat the call with the token to execute.
 
 | parameter | type | required | description |
 |---|---|---|---|
 | `dry_run` | boolean | no | true reports without changing anything. (default `True`) |
-| `kind` | string | no | Which workers to run in this pass. (one of: `capture`, `verify`, `delete`, `embed`, `all`; default `all`) |
+| `kind` | string | no | Which workers to run in this pass. (one of: `capture`, `verify`, `delete`, `embed`, `gc`, `all`; default `all`) |
 | `before` | string | no | Override the age cutoff for this pass: YYYY-MM-DD, an ISO datetime, or '-Nd'. |
 | `folders` | array | no | Override ARCHIVE_FOLDERS for this pass (well-known keys, e.g. ['inbox']). Calendar, contacts, tasks, drafts and outbox are never archived. |
 

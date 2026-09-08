@@ -27,8 +27,18 @@ logger = logging.getLogger(__name__)
 
 def build_context(settings: Settings) -> Context:
     gateway = EWSGateway(settings)
-    db = Database(settings.database_url)
+    db = Database(settings.database_url, max_size=settings.db_pool_max)
     db.migrate()
+    # Archive lanes (capture, verify, embed, delete/gc) + HTTP handlers, on
+    # top of the EWS thread pool — every one of these can hold a connection
+    # at once, so the pool needs to cover their sum.
+    consumers = settings.ews_max_concurrency + 4 + 2
+    logger.info("db pool max=%d, expected concurrent consumers=%d",
+                settings.db_pool_max, consumers)
+    if consumers > settings.db_pool_max:
+        logger.warning(
+            "db pool max=%d is below expected concurrent consumers=%d — "
+            "raise DB_POOL_MAX", settings.db_pool_max, consumers)
     aliaser = IdAliaser(db)
     # Audit is a quality-of-life layer — its storage failing (bad volume,
     # permissions) degrades it to pass-through, never prevents boot: the
@@ -48,11 +58,22 @@ def build_context(settings: Settings) -> Context:
         db=db,
     )
     if settings.semantic_enabled():
+        from .boilerplate import BoilerplateHarness, GeminiCleaner, LlmDetector
         from .embeddings import GeminiEmbedder
         from .semantic import SemanticIndex
-        ctx.semantic = SemanticIndex(
-            ctx.cache, GeminiEmbedder(settings.gemini_api_key,
-                                      dims=settings.embed_dims))
+        embedder = GeminiEmbedder(settings.gemini_api_key, dims=settings.embed_dims)
+        # The LLM detector is optional and always additive: it only ever
+        # LOGS unless ARCHIVE_BOILERPLATE_DROP names it.
+        llm = None
+        if settings.archive_boilerplate_llm and settings.gemini_api_key:
+            llm = LlmDetector(GeminiCleaner(settings.gemini_api_key,
+                                            model=settings.gemini_clean_model))
+        harness = BoilerplateHarness(
+            ctx.cache, embedder,
+            threshold=settings.embed_boilerplate_threshold,
+            drop=settings.archive_boilerplate_drop, llm=llm,
+            llm_per_cycle=settings.archive_boilerplate_llm_per_cycle)
+        ctx.semantic = SemanticIndex(ctx.cache, embedder, harness=harness)
     else:
         logger.info("GEMINI_API_KEY unset — semantic search disabled, "
                     "keyword search unaffected")

@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .boilerplate import BoilerplateHarness
 from .cache.store import CacheStore
 from .embeddings import (
     CHUNK_CHARS,
@@ -34,16 +35,47 @@ RRF_K = 60
 CANDIDATE_MULTIPLIER = 5
 MAX_CANDIDATES = 100
 
+# Short replies ("Добрый день. 1. 33,3 млрд тенге.") embed as almost nothing
+# and rank below background on topical queries. Below this body length, and
+# only when there's an earlier message in the same conversation, chunk 0
+# gets the parent's subject and opening lines appended for context.
+THREAD_CONTEXT_MAX_BODY = 600
+THREAD_CONTEXT_PARENT_CHARS = 300
+
+
+def _thread_context(store: CacheStore, row: dict[str, Any]) -> str | None:
+    body = row.get("body_clean") or ""
+    if len(body) >= THREAD_CONTEXT_MAX_BODY or not row.get("conversation_id"):
+        return None
+    parent = store.parent_in_thread(row["ews_id"])
+    if parent is None:
+        return None
+    head = (parent.get("body_clean") or "")[:THREAD_CONTEXT_PARENT_CHARS].strip()
+    return f"In reply to: {(parent.get('subject') or '').strip()}\n{head}".rstrip()
+
 
 class SemanticIndex:
     def __init__(self, store: CacheStore, embedder: Embedder, *,
-                 chunk_chars: int = CHUNK_CHARS, batch: int = MAX_BATCH) -> None:
+                 chunk_chars: int = CHUNK_CHARS, batch: int = MAX_BATCH,
+                 harness: BoilerplateHarness | None = None) -> None:
         self.store = store
         self.embedder = embedder
         self.chunk_chars = int(chunk_chars)
         self.batch = max(1, min(int(batch), MAX_BATCH))
+        # Log-only by default: the harness always records what it found, and
+        # only shortens the text handed to `chunk_text` when its `drop`
+        # setting names the detector that found it. The stored body never
+        # changes — this affects the index alone.
+        self.harness = harness
 
     # ------------------------------------------------------------- indexing
+
+    def begin_pass(self) -> None:
+        """Called once per backlog pass by `EmbedWorker`. Only the boilerplate
+        harness cares today: it re-arms the LLM detector's per-pass call
+        budget so one pass can never make a call per message."""
+        if self.harness is not None:
+            self.harness.begin_pass()
 
     def index_messages(self, rows: list[dict[str, Any]]) -> int:
         """Chunk, embed and store `rows`; returns the number of messages done.
@@ -55,11 +87,14 @@ class SemanticIndex:
         so a crash mid-run never leaves fully-embedded chunks looking
         unembedded to the backlog query.
         """
-        planned: list[tuple[str, list[str]]] = [
-            (r["ews_id"], chunk_text(r.get("subject") or "",
-                                     r.get("body_clean") or "", self.chunk_chars))
-            for r in rows
-        ]
+        planned: list[tuple[str, list[str]]] = []
+        for r in rows:
+            text = r.get("body_clean") or ""
+            if self.harness is not None:
+                text, _hits = self.harness.analyse(r["ews_id"], text)
+            planned.append((r["ews_id"], chunk_text(
+                r.get("subject") or "", text, self.chunk_chars,
+                context=_thread_context(self.store, r))))
         done: list[str] = []
         pending: list[tuple[str, list[str]]] = []
         pending_size = 0
@@ -95,10 +130,12 @@ class SemanticIndex:
     # -------------------------------------------------------------- reading
 
     def vector_ids(self, text: str, *, limit: int, archived: str = "any",
-                   exclude_ews_id: str | None = None) -> list[tuple[str, float]]:
+                   exclude_ews_id: str | None = None,
+                   include_calendar_items: bool = False) -> list[tuple[str, float]]:
         vector = self.embedder.embed([QUERY_PREFIX + (text or "")])[0]
         return self.store.similar_message_ids(
-            vector, limit=limit, archived=archived, exclude_ews_id=exclude_ews_id)
+            vector, limit=limit, archived=archived, exclude_ews_id=exclude_ews_id,
+            include_calendar_items=include_calendar_items)
 
     def similar_to_message(self, ews_id: str, *, limit: int,
                            archived: str = "any") -> list[dict[str, Any]]:
@@ -129,7 +166,9 @@ class SemanticIndex:
         vector_ids: list[str] = []
         try:
             vector_ids = [i for i, _d in self.vector_ids(
-                query, limit=depth, archived=archived)]
+                query, limit=depth, archived=archived,
+                include_calendar_items=bool(
+                    filters.get("include_calendar_items", False)))]
         except Exception as exc:  # noqa: BLE001 - degrade, never fail the search
             logger.warning("semantic half unavailable (%s) — keyword only", exc)
             degraded = True
@@ -139,8 +178,13 @@ class SemanticIndex:
             fused_ids = rrf([keyword_ids, vector_ids])
         # Structured filters live on the keyword side; a vector-only hit must
         # still satisfy them, so intersect with what the store would return.
+        # `include_calendar_items` is excluded from this check: it is never
+        # None (always a bool) and both halves already apply it themselves
+        # (keyword_rows above, `vector_ids` just now), so it would otherwise
+        # force the intersection on every call.
         allowed = set(keyword_ids)
-        if any(v is not None for v in filters.values()):
+        structured = {k: v for k, v in filters.items() if k != "include_calendar_items"}
+        if any(v is not None for v in structured.values()):
             fused_ids = [i for i in fused_ids if i in allowed]
         window = fused_ids[offset:offset + limit]
         by_id = self.store.messages_by_ids(window)

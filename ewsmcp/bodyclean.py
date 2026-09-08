@@ -9,7 +9,8 @@ Public API:
     strip_quoted_history(text) -> (latest_reply_text, markers_stripped)
     strip_signature(text)      -> text without a trailing signature
     clean_body(text, max_chars) -> {"text", "quoted_blocks_stripped",
-                                    "truncated", "original_chars"}
+                                    "truncated", "original_chars",
+                                    "disclaimer_cut"}
     html_to_text(html)         -> minimal readable plain text
 """
 
@@ -176,6 +177,15 @@ _CLOSERS_EN: list[tuple[str, int]] = [
     ("sent from my", 40),
 ]
 
+# Russian sign-off closers, same mechanism as _CLOSERS_EN.
+_CLOSERS_RU: list[tuple[str, int]] = [
+    ("с уважением", 4),
+    ("с наилучшими пожеланиями", 4),
+    ("с благодарностью", 4),
+]
+
+_CLOSERS: list[tuple[str, int]] = _CLOSERS_EN + _CLOSERS_RU
+
 _MAX_SIG_LINES = 6
 _MAX_SIG_LINE_LEN = 80
 
@@ -183,7 +193,7 @@ _MAX_SIG_LINE_LEN = 80
 def _is_closer_line(s: str) -> bool:
     cf = s.casefold()
     return any(cf.startswith(prefix) and len(cf) - len(prefix) <= max_rest
-               for prefix, max_rest in _CLOSERS_EN)
+               for prefix, max_rest in _CLOSERS)
 
 
 def strip_signature(text: str) -> str:
@@ -261,9 +271,71 @@ _BANNER_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE)
 
 
+# Outlook's auto-inserted horizontal rule line ("________________________")
+# separating a forwarded/replied message from the rest of the body. Purely
+# decorative, so it is dropped line by line like the RU header lines.
+_OUTLOOK_RULE_LINE_RE = re.compile(r"^_{10,}\s*$", re.MULTILINE)
+
+
 def strip_header_lines(text: str) -> str:
     text = _RU_HEADER_LINE_RE.sub("", text)
-    return _BANNER_LINE_RE.sub("", text)
+    text = _BANNER_LINE_RE.sub("", text)
+    return _OUTLOOK_RULE_LINE_RE.sub("", text)
+
+
+# --------------------------------------------------------------------------
+# Disclaimer tail cut
+# --------------------------------------------------------------------------
+
+_PARA_SPLIT_RE = re.compile(r"\n[ \t]*\n+")
+TAIL_MIN_CHARS = 400
+TAIL_MAX_PARAGRAPHS = 8
+TAIL_START_FRACTION = 0.6
+
+_DISCLAIMER_ANCHOR_RE = re.compile(
+    r"(?:не является предложением|предназначено только для получател|"
+    r"является конфиденциальн|если вы не являетесь адресатом|"
+    r"получили это сообщение по ошибке|"
+    r"тек хабарламада көрсетілген алушыларға|құпия ақпарат|"
+    r"қателесіп алсаңыз|"
+    r"intended solely for|intended only for the|confidentiality notice|"
+    r"if you are not the intended recipient|"
+    r"received this (?:e-?mail|message) in error|privileged and confidential)",
+    re.IGNORECASE)
+
+
+def _paragraphs(text: str) -> list[tuple[int, str]]:
+    """(char offset, paragraph) for every non-empty blank-line-separated block."""
+    out, pos = [], 0
+    for m in _PARA_SPLIT_RE.finditer(text):
+        chunk = text[pos:m.start()]
+        if chunk.strip():
+            out.append((pos, chunk))
+        pos = m.end()
+    if text[pos:].strip():
+        out.append((pos, text[pos:]))
+    return out
+
+
+def tail_paragraphs(text: str) -> list[tuple[int, str]]:
+    """The tail window the disclaimer rules and detectors may act on: the
+    last TAIL_MAX_PARAGRAPHS paragraphs that start in the last 40% of the
+    text. Never includes the first paragraph. Empty for short messages."""
+    if len(text) < TAIL_MIN_CHARS:
+        return []
+    paras = _paragraphs(text)
+    if len(paras) < 2:
+        return []
+    floor = int(len(text) * TAIL_START_FRACTION)
+    tail = [(off, p) for off, p in paras[1:] if off >= floor]
+    return tail[-TAIL_MAX_PARAGRAPHS:]
+
+
+def strip_disclaimer_tail(text: str) -> tuple[str, bool]:
+    for off, para in tail_paragraphs(text):
+        if _DISCLAIMER_ANCHOR_RE.search(para):
+            return text[:off].rstrip(), True
+    return text, False
 
 
 def clean_body(text: str, max_chars: int = 4000) -> dict:
@@ -277,6 +349,7 @@ def clean_body(text: str, max_chars: int = 4000) -> dict:
     t = _normalize_newlines(raw)
     t, quoted_blocks = strip_quoted_history(t)
     t = strip_header_lines(t)
+    t, disclaimer_cut = strip_disclaimer_tail(t)
     t = strip_signature(t)
     t = _BLANK_RUN_RE.sub("\n\n", t)
     t = t.strip()
@@ -298,6 +371,7 @@ def clean_body(text: str, max_chars: int = 4000) -> dict:
         "quoted_blocks_stripped": quoted_blocks,
         "truncated": truncated,
         "original_chars": original_chars,
+        "disclaimer_cut": disclaimer_cut,
     }
 
 

@@ -23,7 +23,7 @@ def test_version_is_51_line():
         "_v5_init", V5_ROOT / "ewsmcp" / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.__version__.startswith("5.1."), mod.__version__
+    assert mod.__version__.startswith("5.2."), mod.__version__
     pyproject = (V5_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert f'version = "{mod.__version__}"' in pyproject
 
@@ -38,7 +38,7 @@ def test_docs_describe_the_archive():
                 "ARCHIVE_MIN_FREE_GB", "ARCHIVE_CYCLE_SECONDS", "EMBED_DIMS"):
         assert key in readme, key
     changelog = (V5_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "## [5.1.0a1]" in changelog
+    assert "## [5.2.0a1]" in changelog
 
 
 FORBIDDEN = ["SQLite", "FTS5", "700×", "700x", "norm_text",
