@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+import logging
 
-from conftest import make_context, make_row
+from conftest import make_context, make_row, make_settings
 
 from ewsmcp.daemon import build_daemon_app
+from ewsmcp.server import build_context
 
 
 def _drive(app, path, method="GET", body=None, headers=()):
@@ -367,3 +369,21 @@ def test_download_disposition_carries_a_non_ascii_filename(db):
     assert value.startswith(b'attachment; filename="pdf"; ')
     assert b"filename*=UTF-8''%D0%9E" in value
     assert b"\r" not in value and b"\n" not in value
+
+
+def test_build_context_sizes_pool_from_settings_and_warns_when_undersized(
+        pg_dsn, caplog):
+    """The daemon's Database must honor DB_POOL_MAX (not the psycopg default
+    of 4), and warn loudly when it's set below the concurrency the daemon
+    itself expects to throw at it (EWS thread pool + archive lanes + HTTP)."""
+    settings = make_settings(database_url=pg_dsn, db_pool_max=3,
+                              ews_max_concurrency=8)
+    with caplog.at_level(logging.WARNING, logger="ewsmcp.server"):
+        ctx = build_context(settings)
+    try:
+        assert ctx.db.pool.max_size == 3
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno >= logging.WARNING]
+        assert any("pool" in m and "consumers" in m for m in warnings)
+    finally:
+        ctx.db.close()

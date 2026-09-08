@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_mcp_context(settings: Settings) -> Context:
-    db = Database(settings.database_url)
+    db = Database(settings.database_url, max_size=4)  # behaviour unchanged, just explicit
     try:
         db.require_version(SCHEMA_VERSION)
     except SchemaOutdated:

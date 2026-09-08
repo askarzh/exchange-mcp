@@ -27,8 +27,18 @@ logger = logging.getLogger(__name__)
 
 def build_context(settings: Settings) -> Context:
     gateway = EWSGateway(settings)
-    db = Database(settings.database_url)
+    db = Database(settings.database_url, max_size=settings.db_pool_max)
     db.migrate()
+    # Archive lanes (capture, verify, embed, delete/gc) + HTTP handlers, on
+    # top of the EWS thread pool — every one of these can hold a connection
+    # at once, so the pool needs to cover their sum.
+    consumers = settings.ews_max_concurrency + 4 + 2
+    logger.info("db pool max=%d, expected concurrent consumers=%d",
+                settings.db_pool_max, consumers)
+    if consumers > settings.db_pool_max:
+        logger.warning(
+            "db pool max=%d is below expected concurrent consumers=%d — "
+            "raise DB_POOL_MAX", settings.db_pool_max, consumers)
     aliaser = IdAliaser(db)
     # Audit is a quality-of-life layer — its storage failing (bad volume,
     # permissions) degrades it to pass-through, never prevents boot: the
