@@ -38,11 +38,19 @@ BATCH_SIZE = 25
 
 class Capturer:
     def __init__(self, settings: Any, gateway: Any, store: Any,
-                 policy: ArchivePolicy) -> None:
+                 policy: ArchivePolicy,
+                 too_large_ids: set[str] | None = None) -> None:
         self.settings = settings
         self.gateway = gateway
         self.store = store
         self.policy = policy
+        # Items over ARCHIVE_MAX_ITEM_MB stay `live` forever, and the
+        # candidate query is date-ordered and limited: 25 of them at the head
+        # of the queue would fill every page and stall capture for good. The
+        # runner owns this set so it survives across passes (and is dropped
+        # on restart, which is the intended way to retry after raising the
+        # cap).
+        self.too_large_ids = set() if too_large_ids is None else too_large_ids
 
     async def run(self, *, limit: int = BATCH_SIZE,
                   dry_run: bool = True) -> dict[str, Any]:
@@ -51,7 +59,8 @@ class Capturer:
         def select() -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
             sel = {"folder_ids": self.policy.folder_ids(self.store),
                    "before_ts": self.policy.capture_cutoff_ts(),
-                   "exclude_categories": list(self.policy.exclude_categories)}
+                   "exclude_categories": list(self.policy.exclude_categories),
+                   "exclude_ids": sorted(self.too_large_ids)}
             return (self.store.archive_candidate_count(**sel),
                     self.store.archive_candidates(**sel, limit=int(limit)), sel)
 
@@ -99,6 +108,7 @@ class Capturer:
                     # visible skip (not a failure) until either the item
                     # shrinks (unlikely) or an operator raises the cap.
                     too_large.append(raw_id)
+                    self.too_large_ids.add(raw_id)
                     continue
                 self._capture_one(raw_id, item)
                 captured += 1

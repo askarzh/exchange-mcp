@@ -434,7 +434,8 @@ class CacheStore:
             WHERE lower(btrim(cat)) = ANY(%(exclude_categories)s))
     """
 
-    def _candidate_params(self, folder_ids, before_ts, exclude_categories):
+    def _candidate_params(self, folder_ids, before_ts, exclude_categories,
+                          exclude_ids=None):
         return {
             "before_ts": int(before_ts),
             # None means "every folder"; [] must mean "no folder" — do not
@@ -442,28 +443,42 @@ class CacheStore:
             "folder_ids": None if folder_ids is None else list(folder_ids),
             "exclude_categories": [c.strip().lower()
                                    for c in (exclude_categories or []) if c.strip()],
+            "exclude_ids": list(exclude_ids or []),
         }
 
+    @staticmethod
+    def _candidate_exclusion(params) -> str:
+        """`exclude_ids` is only ever the caller's in-memory skip list, so an
+        empty one adds no clause at all rather than an `<> ALL('{}')` the
+        planner has to carry."""
+        return " AND m.ews_id <> ALL(%(exclude_ids)s)" if params["exclude_ids"] else ""
+
     def archive_candidates(self, *, folder_ids: list[str] | None, before_ts: int,
-                           exclude_categories: list[str],
-                           limit: int) -> list[dict[str, Any]]:
-        params = self._candidate_params(folder_ids, before_ts, exclude_categories)
+                           exclude_categories: list[str], limit: int,
+                           exclude_ids: list[str] | None = None
+                           ) -> list[dict[str, Any]]:
+        params = self._candidate_params(folder_ids, before_ts, exclude_categories,
+                                        exclude_ids)
         params["limit"] = int(limit)
         with self.db.conn() as c:
             return c.execute(
                 "SELECT m.ews_id, m.changekey, m.folder_id, m.subject, m.date_iso, "
                 "m.date_ts, m.internet_message_id, m.has_attachments "
-                f"FROM ews.messages m WHERE {self._CANDIDATE_WHERE} "
+                f"FROM ews.messages m WHERE {self._CANDIDATE_WHERE}"
+                f"{self._candidate_exclusion(params)} "
                 "ORDER BY m.date_ts ASC LIMIT %(limit)s", params).fetchall()
 
     def archive_candidate_count(self, *, folder_ids: list[str] | None,
                                 before_ts: int,
-                                exclude_categories: list[str]) -> int:
-        params = self._candidate_params(folder_ids, before_ts, exclude_categories)
+                                exclude_categories: list[str],
+                                exclude_ids: list[str] | None = None) -> int:
+        params = self._candidate_params(folder_ids, before_ts, exclude_categories,
+                                        exclude_ids)
         with self.db.conn() as c:
             return int(c.execute(
                 "SELECT COUNT(*) AS n FROM ews.messages m "
-                f"WHERE {self._CANDIDATE_WHERE}", params).fetchone()["n"])
+                f"WHERE {self._CANDIDATE_WHERE}{self._candidate_exclusion(params)}",
+                params).fetchone()["n"])
 
     def mark_captured(self, ews_id: str, *, mime_sha256: str,
                       mime_path: str, changekey: str | None = None) -> int:

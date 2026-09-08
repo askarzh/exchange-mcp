@@ -72,6 +72,10 @@ class ArchiveRunner:
         # a durable state (the row itself stays `live`, so nothing is
         # tracked in Postgres for it).
         self._too_large_last: int = 0
+        # The ids behind that counter, remembered for the life of the
+        # process so they stop re-filling every candidate page (see
+        # Capturer.__init__). Cleared by a restart.
+        self._too_large_ids: set[str] = set()
 
     # ------------------------------------------------------------ one pass
 
@@ -122,12 +126,13 @@ class ArchiveRunner:
             try:
                 if kind in ("capture", "all"):
                     res = await Capturer(self.settings, self.gateway, self.store,
-                                         policy).run(dry_run=dry_run)
+                                         policy, self._too_large_ids
+                                         ).run(dry_run=dry_run)
                     out["candidates"] = res["candidates"]
                     out["captured"] = res["captured"]
                     out["failed"] += res["failed"]
                     out["too_large"] = res["too_large"]
-                    self._too_large_last = res["too_large"]
+                    self._too_large_last = len(self._too_large_ids)
                     out["stopped"] = res["stopped"]
                     out["sample"] = res["sample"]
                 if kind in ("verify", "all") and not dry_run:
@@ -283,9 +288,11 @@ class ArchiveRunner:
             "boilerplate": dict(self._boilerplate_cache),
             # Last orphan sweep; empty until one has run.
             "gc": dict(self._gc_status),
-            # Per-process counter from the last capture pass — the row
-            # itself stays `live`, so this is the only place an operator
-            # sees how many items are stuck behind ARCHIVE_MAX_ITEM_MB.
+            # Per-process counter: how many distinct items this process has
+            # skipped for size since it started. The rows stay `live` (and
+            # are held out of later candidate pages), so this is the only
+            # place an operator sees what is stuck behind
+            # ARCHIVE_MAX_ITEM_MB.
             "state_counts": {"skipped_too_large": self._too_large_last},
         }
 

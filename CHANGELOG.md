@@ -118,6 +118,14 @@ store cleans up after itself. Design:
   pair from `ewsmcp/cache/store.py` (the exclusion lives in SQL,
   `_CALENDAR_EXCLUDE`), and the duplicate `test_schema_version_is_four`
   in `tests/test_migrations.py` — `tests/test_archive_schema.py` owns it.
+- Capture remembers the items it skipped for size (in memory, per ewsd
+  process) and excludes them from later candidate pages via a new
+  `exclude_ids` argument on `archive_candidates`/`archive_candidate_count`.
+  The candidate query is date-ordered and limited to 25, so a handful of
+  oversized items at the head of the queue used to re-fill every page and
+  stall capture indefinitely. `state_counts.skipped_too_large` now counts
+  the distinct items skipped since the process started; a restart clears
+  the list, which is how you retry them after raising `ARCHIVE_MAX_ITEM_MB`.
 - `/v1/status` no longer overwrote the runner's `state_counts` wholesale
   with the DB-derived counts, which destroyed `skipped_too_large` before it
   could be reported; the two are merged.
