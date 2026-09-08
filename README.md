@@ -11,7 +11,7 @@ tamper-evident. This is a personal fork-off of
 [`azizmazrou/ews-mcp`](https://github.com/azizmazrou/ews-mcp) 4.5,
 released under the same MIT license.
 
-> The release line is **5.1.x** (pre-release, `5.1.0a1`). Architecture:
+> The release line is **5.2.x** (pre-release, `5.2.0a1`). Architecture:
 > [DESIGN.md](DESIGN.md). Full API reference: [docs/API.md](docs/API.md).
 
 ## Quick start
@@ -211,6 +211,57 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `ARCHIVE_MAX_DELETE_PER_RUN` | `200` | Deletion rail 2 of 3 — the cap on ONE pass, whether that pass is a manual `archive_run` or a background cycle |
 | `ARCHIVE_MIN_FREE_GB` | `2.0` | Minimum free disk space required before each archive batch |
 | `ARCHIVE_CYCLE_SECONDS` | `300` | Archive pipeline run cadence |
+| `EMBED_BOILERPLATE_THRESHOLD` | `0.80` | Cosine similarity at which a tail paragraph counts as a match against a row in `ews.boilerplate_refs` (the embedding detector). Lower catches more, at the cost of false positives |
+| `ARCHIVE_BOILERPLATE_DROP` | `off` | Which detector's hits are actually cut from the text handed to the chunker: `off` \| `embedding` \| `llm` \| `both`. **`off` changes no index content** — hits are only logged to `ews.boilerplate_hits` so the cut can be judged from data first (`scripts/boilerplate_report.py`). The stored body is never modified either way |
+| `ARCHIVE_BOILERPLATE_LLM` | `true` | Whether the Gemini boundary detector runs at all. It also needs `GEMINI_API_KEY`; without one it is simply absent |
+| `GEMINI_CLEAN_MODEL` | `gemini-2.5-flash-lite` | Model the boundary detector asks for the paragraph index where boilerplate begins (temperature 0, JSON `responseSchema`). Any answer that is not a validated in-range index is logged as an error and can never cut a paragraph |
+| `ARCHIVE_GC_INTERVAL_HOURS` | `168` | Cadence of the orphan-blob GC lane (weekly). It walks the whole blob store, so it runs on its own clock — never inside `archive_run(kind="all")` — and removes only `mime/`/`blobs/` files that nothing references and that are older than a day. The clock starts at daemon start, so a fresh process never sweeps on its first cycle |
+| `ARCHIVE_MAX_ITEM_MB` | `50` | Items larger than this are skipped by capture before any MIME or blob is written: the row stays `live`, the skip is counted (not failed) and reported as `state_counts.skipped_too_large` |
+| `DB_POOL_MAX` | `8` | `ewsd`'s Postgres connection pool size. The daemon logs its expected concurrent consumer count (EWS thread pool + 4 archive lanes + 2 HTTP handlers) at boot and warns when it exceeds this. The thin `ewsmcp` keeps a fixed pool of 4 |
+
+## Upgrading to 5.2 (Phase 3 rollout)
+
+Phase 3 adds boilerplate detection, thread context for short replies, an
+attachment inventory in the mirror and a blob GC lane. The detectors ship
+**log-only** (`ARCHIVE_BOILERPLATE_DROP=off`): nothing is cut from the index
+until the hit log says which detector deserves it.
+
+1. Deploy the image (`EWS_MCP_TAG=5.2-<sha>`; `docker compose up -d --build
+   ewsd ews-mcp`). Migration `004_phase3.sql` applies on boot — watch the log
+   for `applying migration 004_phase3.sql` — and re-queues short in-thread
+   replies so their chunk 0 picks up thread context.
+2. Seed the reference disclaimers (the refs table starts empty, and an empty
+   table makes the detector a no-op):
+
+   ```bash
+   docker exec -i ewsd python - < scripts/seed_boilerplate.py
+   ```
+3. Backfill the existing mirror — fills `item_class` and `attachments_json`
+   on every row and applies the new disclaimer cut; rows whose body changed
+   are re-queued for embedding:
+
+   ```bash
+   docker exec -i ewsd python - --all < scripts/backfill_bodies.py
+   ```
+4. Verify: `archive_status` shows `boilerplate.drop_detector = "off"` and a
+   draining backlog; `search_messages(subject=...)` no longer leads with
+   `Accepted:` meeting responses; `get_message` on a mirrored message lists
+   its attachments.
+5. After about two weeks of hits, read the evidence and decide:
+
+   ```bash
+   docker exec -i ewsd python - < scripts/boilerplate_report.py
+   ```
+
+   Set `ARCHIVE_BOILERPLATE_DROP` to the winning detector, then re-queue the
+   affected messages so the cut reaches the index:
+
+   ```sql
+   UPDATE ews.messages SET embedded_at = NULL
+    WHERE ews_id IN (SELECT DISTINCT message_ews_id FROM ews.boilerplate_hits);
+   ```
+
+   The losing detector comes out in a follow-up.
 
 ## The send flow (two-phase, content-bound)
 

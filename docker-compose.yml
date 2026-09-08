@@ -28,6 +28,10 @@ services:
       EWSD_PORT: "8790"
       EWSD_API_KEY: ${EWSD_API_KEY:?set EWSD_API_KEY in .env}
       DATA_DIR: /data
+      # Phase 3 boilerplate detectors — log-only until you pick a winner from
+      # scripts/boilerplate_report.py. off | embedding | llm | both.
+      # ARCHIVE_BOILERPLATE_DROP: "off"
+      # GEMINI_CLEAN_MODEL: gemini-2.5-flash-lite
     volumes:
       - ewsdata:/data
     depends_on:

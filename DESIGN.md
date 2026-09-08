@@ -367,3 +367,41 @@ because a remote API is rate-limiting us. `find_similar` errors instead
 name "find similar" would be trusted as a semantic answer. The MCP process
 deliberately holds no `GEMINI_API_KEY`: both are forwarded to `ewsd`
 unconditionally, whether or not an embedder is actually configured there.
+
+## §Search quality — boilerplate, thread context, hygiene
+
+What the index sees is not the message: a legal disclaimer, a gateway
+banner or an "Accepted:" meeting response says nothing about the mail and
+everything about the sender's mail system, and a two-line reply says
+almost nothing at all. So `bodyclean` cuts trailing disclaimers inside a
+bounded tail window (the last 40% of the body, at most 8 paragraphs, never
+the first, bodies of 400 characters or more), and beside chunking a
+harness runs two independent detectors over those same tail paragraphs —
+an embedding one (cosine against `ews.boilerplate_refs` at
+`EMBED_BOILERPLATE_THRESHOLD`) and a Gemini boundary one
+(`GEMINI_CLEAN_MODEL`, asked for the paragraph index where boilerplate
+starts). Both are log-only by default: every hit is written to
+`ews.boilerplate_hits`, and a paragraph is removed from the text handed to
+the chunker — never from the stored body — only when
+`ARCHIVE_BOILERPLATE_DROP` names the detector that found it, so the choice
+between them is made from two weeks of evidence rather than from taste.
+Anything the LLM returns that is not a validated in-range index becomes a
+`paragraph_index = -1` hit, which the harness skips: a bad answer is
+counted, never acted on. In the other direction, chunk 0 of a reply under
+600 characters that has a parent in its conversation is prefixed with `In
+reply to: <subject>` plus the parent's first 300 characters, so a short
+reply embeds as its thread's topic instead of as noise. Calendar item
+classes are excluded from `search_messages` unless
+`include_calendar_items=true` and always from `find_similar`'s vector half
+(the flag is not a structured filter, so it does not force the hybrid
+intersection gate), and the mirror now carries `item_class` and an
+attachment inventory hydrated by the same bulk `GetItem` that fetches
+bodies — `SyncFolderItems` carries neither, and `FileAttachment.content`
+is never touched, since reading it is a lazy `GetAttachment` round trip
+per attachment. Finally, hygiene: a verification failure resets a row to
+`live` and forgets its capture, so `GcWorker` sweeps `mime/` and `blobs/`
+on its own `ARCHIVE_GC_INTERVAL_HOURS` clock (weekly, started at daemon
+start, never inside `kind="all"` because it walks the whole store),
+removing only files nothing references that are older than a day, and
+`archive_run(kind="gc")` exposes it manually under the same two-phase
+confirmation as any other destructive run.
