@@ -111,7 +111,7 @@ Runs alongside the embedding check on the same tail paragraphs, so the two can
 be compared on real data before either is allowed to drop anything.
 
 **Model.** Gemini Flash-Lite (`GEMINI_CLEAN_MODEL`, default
-`gemini-2.5-flash-lite`) through the same API key as the embedder, from the
+`gemini-3.5-flash-lite`) through the same API key as the embedder, from the
 daemon only. `temperature = 0`, JSON response schema.
 
 **Prompt.** The model receives the tail paragraphs numbered `0..n-1` plus the
@@ -270,7 +270,7 @@ if it exceeds the pool. The MCP process keeps `max_size=4`.
 |---|---|---|
 | `EMBED_BOILERPLATE_THRESHOLD` | `0.80` | §2 |
 | `ARCHIVE_BOILERPLATE_DROP` | `off` (`off` \| `embedding` \| `llm` \| `both`) | §2, §2b |
-| `GEMINI_CLEAN_MODEL` | `gemini-2.5-flash-lite` | §2b |
+| `GEMINI_CLEAN_MODEL` | `gemini-3.5-flash-lite` | §2b |
 | `ARCHIVE_BOILERPLATE_LLM` | `true` (run the LLM detector at all) | §2b |
 | `ARCHIVE_GC_INTERVAL_HOURS` | `168` | §7 |
 | `ARCHIVE_MAX_ITEM_MB` | `50` | §7 |

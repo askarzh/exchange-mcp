@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     # and blocking while the runner lock is held, so a whole page of
     # messages calling out would hold that lock for page * timeout seconds.
     archive_boilerplate_llm_per_cycle: int = 40
-    gemini_clean_model: str = "gemini-2.5-flash-lite"
+    gemini_clean_model: str = "gemini-3.5-flash-lite"
     # --- Phase 3: hygiene ----------------------------------------------------
     archive_gc_interval_hours: int = 168
     archive_max_item_mb: int = 50

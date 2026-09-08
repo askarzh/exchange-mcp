@@ -6,6 +6,9 @@ this file starts from the point this repository was extracted.
 
 ## [5.2.0a1] - 2026-09-08 (pre-release)
 
+### Changed
+- `GEMINI_CLEAN_MODEL` default is `gemini-3.5-flash-lite`: Google returns 404 for `gemini-2.5-flash-lite` to new users as of 2026-09.
+
 Phase 3: search quality and archive hygiene. Boilerplate (legal
 disclaimers, gateway banners) stops dominating what the index sees, short
 replies carry their thread's topic, calendar chatter leaves the default

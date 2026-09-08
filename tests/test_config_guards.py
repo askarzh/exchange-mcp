@@ -94,6 +94,6 @@ def test_phase3_settings_defaults_and_drop_enum():
     s = make_settings()
     assert s.archive_boilerplate_drop == "off" and s.embed_boilerplate_threshold == 0.80
     assert s.archive_gc_interval_hours == 168 and s.archive_max_item_mb == 50
-    assert s.db_pool_max == 8 and s.gemini_clean_model == "gemini-2.5-flash-lite"
+    assert s.db_pool_max == 8 and s.gemini_clean_model == "gemini-3.5-flash-lite"
     with pytest.raises(ValueError):
         make_settings(archive_boilerplate_drop="yes")

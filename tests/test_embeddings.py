@@ -164,10 +164,10 @@ def test_cleaner_asks_for_deterministic_json_and_returns_the_parsed_answer():
     seen = []
     client = _cleaner_client(seen, httpx.Response(200, json={"candidates": [
         {"content": {"parts": [{"text": json.dumps(answer)}]}}]}))
-    cleaner = GeminiCleaner("SECRET", model="gemini-2.5-flash-lite", client=client)
+    cleaner = GeminiCleaner("SECRET", model="gemini-3.5-flash-lite", client=client)
     assert cleaner.boundary("hello", ["a", "b", "footer"]) == answer
     request = seen[0]
-    assert "gemini-2.5-flash-lite" in str(request.url)
+    assert "gemini-3.5-flash-lite" in str(request.url)
     assert str(request.url).endswith("generateContent")
     assert "SECRET" not in str(request.url)
     assert request.headers["x-goog-api-key"] == "SECRET"
@@ -182,6 +182,6 @@ def test_cleaner_asks_for_deterministic_json_and_returns_the_parsed_answer():
 
 def test_cleaner_raises_on_a_server_error():
     client = _cleaner_client([], httpx.Response(500, text="boom"))
-    cleaner = GeminiCleaner("SECRET", model="gemini-2.5-flash-lite", client=client)
+    cleaner = GeminiCleaner("SECRET", model="gemini-3.5-flash-lite", client=client)
     with pytest.raises(httpx.HTTPStatusError):
         cleaner.boundary("hello", ["a"])

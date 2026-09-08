@@ -31,7 +31,7 @@ services:
       # Phase 3 boilerplate detectors — log-only until you pick a winner from
       # scripts/boilerplate_report.py. off | embedding | llm | both.
       # ARCHIVE_BOILERPLATE_DROP: "off"
-      # GEMINI_CLEAN_MODEL: gemini-2.5-flash-lite
+      # GEMINI_CLEAN_MODEL: gemini-3.5-flash-lite
     volumes:
       - ewsdata:/data
     depends_on:
