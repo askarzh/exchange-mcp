@@ -39,7 +39,7 @@ def _runner(db, tmp_path, account=None, index=None, **over):
 
 
 def test_kinds_cover_the_spec(tmp_path, db):
-    assert KINDS == ("capture", "verify", "delete", "embed", "all")
+    assert KINDS == ("capture", "verify", "delete", "embed", "gc", "all")
 
 
 def test_dry_run_records_a_run_row_and_counts_candidates(tmp_path, db):
@@ -342,3 +342,46 @@ def test_status_carries_the_boilerplate_counters_after_a_cycle(tmp_path, db):
     assert block["threshold"] == float(runner.settings.embed_boilerplate_threshold)
     assert block["embedding"] == {"hits": 0, "dropped": 0}
     assert block["llm"] == {"hits": 0, "dropped": 0, "errors": 0}
+
+
+# --- the GC lane --------------------------------------------------------------
+
+
+def test_run_once_gc_records_a_gc_run_row(tmp_path, db):
+    runner, store = _runner(db, tmp_path)
+    out = asyncio.run(runner.run_once(kind="gc", dry_run=True))
+    assert out["ok"] and out["gc"] == {"scanned": 0, "removed_files": 0,
+                                       "removed_bytes": 0, "kept_recent": 0}
+    row = store.get_run(out["run_id"])
+    assert row["kind"] == "gc" and row["dry_run"] == 1
+    assert row["finished_at"] is not None
+    assert '"removed_files": 0' in row["sample_json"]
+
+
+def test_gc_is_never_part_of_a_regular_all_pass(tmp_path, db):
+    account = FakeAccount({"OLD-1": FakeItem("OLD-1")})
+    runner, _store_ = _runner(db, tmp_path, account=account)
+    out = asyncio.run(runner.run_once(kind="all", dry_run=False))
+    assert out["gc"] is None
+
+
+def test_the_loop_runs_the_gc_lane_on_its_own_interval(tmp_path, db):
+    """archive_gc_interval_hours=0 is the lever: GC then runs every cycle."""
+    account = FakeAccount({"OLD-1": FakeItem("OLD-1")})
+    runner, store = _runner(db, tmp_path, account=account,
+                            archive_cycle_seconds=1,
+                            archive_gc_interval_hours=0)
+    _drive_one_cycle(runner)
+    kinds = [r["kind"] for r in store.recent_runs(10)]
+    assert "gc" in kinds
+    assert runner.status()["gc"]["last_run_ts"] is not None
+
+
+def test_the_loop_skips_the_gc_lane_before_its_interval_elapses(tmp_path, db):
+    account = FakeAccount({"OLD-1": FakeItem("OLD-1")})
+    runner, store = _runner(db, tmp_path, account=account,
+                            archive_cycle_seconds=1)
+    assert runner.status()["gc"] == {}
+    _drive_one_cycle(runner)
+    assert [r["kind"] for r in store.recent_runs(10)].count("gc") == 0
+    assert runner.status()["gc"] == {}

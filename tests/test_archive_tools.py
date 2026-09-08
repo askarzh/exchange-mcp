@@ -122,6 +122,16 @@ def test_archive_run_without_a_runner_is_unavailable(db):
     assert res["error"]["code"] == "upstream_unavailable"
 
 
+def test_archive_run_accepts_the_gc_kind(db):
+    ctx = _ctx(db)
+    ctx.archive = _FakeRunner()
+    res = _run(ctx, "archive_run", dry_run=True, kind="gc")
+    assert res["ok"] is True
+    assert ctx.archive.calls[0]["kind"] == "gc"
+    assert "gc" in ctx.registry["archive_run"].input_schema[
+        "properties"]["kind"]["enum"]
+
+
 def test_archive_run_rejects_an_unknown_kind(db):
     ctx = _ctx(db)
     ctx.archive = _FakeRunner()

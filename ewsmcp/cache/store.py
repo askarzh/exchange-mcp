@@ -610,6 +610,24 @@ class CacheStore:
                       "sha256": r.get("sha256"),
                       "is_inline": int(r.get("is_inline") or 0)} for r in rows])
 
+    # ------------------------------------------------------------ gc roots
+
+    def referenced_mime_shas(self) -> list[str]:
+        """Every MIME file the mirror still points at — the GC keep-set."""
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT mime_sha256 FROM ews.messages "
+                "WHERE mime_sha256 IS NOT NULL").fetchall()
+        return [r["mime_sha256"] for r in rows]
+
+    def referenced_blob_shas(self) -> list[str]:
+        """Every attachment blob the mirror still points at."""
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT DISTINCT sha256 FROM ews.attachments "
+                "WHERE sha256 IS NOT NULL").fetchall()
+        return [r["sha256"] for r in rows]
+
     def attachments_for(self, ews_id: str) -> list[dict[str, Any]]:
         with self.db.conn() as c:
             return c.execute(
