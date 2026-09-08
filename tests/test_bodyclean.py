@@ -7,6 +7,7 @@ outputs (not just lengths) so any behavior drift fails loudly.
 from ewsmcp.bodyclean import (
     clean_body,
     html_to_text,
+    strip_header_lines,
     strip_quoted_history,
     strip_signature,
 )
@@ -250,6 +251,7 @@ def test_clean_body_full_email_quote_and_signature():
         "quoted_blocks_stripped": 1,
         "truncated": False,
         "original_chars": len(FULL_EMAIL),
+        "disclaimer_cut": False,
     }
 
 
@@ -292,6 +294,7 @@ def test_clean_body_empty_and_none():
         "quoted_blocks_stripped": 0,
         "truncated": False,
         "original_chars": 0,
+        "disclaimer_cut": False,
     }
     assert clean_body("") == expected
     assert clean_body(None) == expected
@@ -398,3 +401,107 @@ def test_gmail_attribution_with_outlook_rendered_address_still_cuts_history():
     out = clean_body(text)
     assert out["text"] == "Please find attached the signed NDA from our side."
     assert out["quoted_blocks_stripped"] == 1
+
+
+def test_outlook_rule_line_is_dropped_between_paragraphs():
+    """Outlook's auto-inserted horizontal rule separating a forwarded
+    message from the rest of the body is decorative and must go, while both
+    surrounding paragraphs survive."""
+    text = (
+        "Коллеги, посмотрите, пожалуйста.\n"
+        "________________________________\n"
+        "От кого: Иванов Иван\n"
+    )
+    out = strip_header_lines(text)
+    assert "________________________________" not in out
+    assert "Коллеги, посмотрите, пожалуйста." in out
+    assert "От кого: Иванов Иван" in out
+
+
+# ---------------------------------------------------------------------------
+# RU signature closers
+# ---------------------------------------------------------------------------
+
+SIG_RU = (
+    "Договор подписан и передан в архив.\n"
+    "Финансовый отдел уведомлен.\n"
+    "\n"
+    "С уважением,\n"
+    "Аскар Жакенов\n"
+    "BCC-HUB\n"
+    "Mobile: +7 701 0000000\n"
+)
+SIG_RU_KEPT = "Договор подписан и передан в архив.\nФинансовый отдел уведомлен."
+
+
+def test_signature_ru_closer_block_stripped():
+    assert strip_signature(SIG_RU) == SIG_RU_KEPT
+
+
+# ---------------------------------------------------------------------------
+# Disclaimer tail cut
+# ---------------------------------------------------------------------------
+
+RU_FOOTER = (
+    "Предоставляемая АО «BCC Invest» информация не является предложением о покупке "
+    "и/или обязательством по продаже.\n\n"
+    "Содержание этого электронного письма предназначено только для получателей, "
+    "указанных в сообщении.\n\n"
+    "Бұл электрондық хаттың мазмұны тек хабарламада көрсетілген алушыларға арналған.\n"
+)
+
+
+def _long_body(n_paragraphs=6):
+    return "\n\n".join(f"Абзац номер {i}: обсуждаем условия сделки и сроки поставки, "
+                       f"а также вопросы по документам." for i in range(n_paragraphs))
+
+
+def test_disclaimer_tail_is_cut_in_ru_and_kz():
+    body = _long_body() + "\n\n" + RU_FOOTER
+    out = clean_body(body)
+    assert out["disclaimer_cut"] is True
+    assert "BCC Invest" not in out["text"] and "алушыларға" not in out["text"]
+    assert out["text"].endswith("вопросы по документам.")
+
+
+def test_disclaimer_anchor_in_the_middle_of_the_body_does_not_cut():
+    body = ("Коллеги, документ является конфиденциальным, прошу не пересылать.\n\n"
+            + _long_body(8))
+    out = clean_body(body)
+    assert out["disclaimer_cut"] is False and "Абзац номер 7" in out["text"]
+
+
+def test_short_message_is_never_cut():
+    body = "Ок.\n\nThis message is intended solely for the addressee."
+    out = clean_body(body)
+    assert out["disclaimer_cut"] is False and "intended solely" in out["text"]
+
+
+def test_first_paragraph_is_protected_even_when_it_matches():
+    body = ("If you are not the intended recipient please tell us — that is the whole "
+            "message.\n\n" + _long_body(2))
+    out = clean_body(body)
+    assert out["text"].startswith("If you are not the intended recipient")
+
+
+def test_tail_paragraphs_window():
+    from ewsmcp.bodyclean import tail_paragraphs
+    text = "\n\n".join(f"p{i} " + "x" * 90 for i in range(20))
+    tail = tail_paragraphs(text)
+    assert 1 <= len(tail) <= 8
+    assert all(off >= int(len(text) * 0.6) for off, _p in tail)
+    assert tail[-1][1].startswith("p19")
+    assert tail_paragraphs("short") == []
+
+
+def test_kazakh_disclaimer_anchor_is_cut():
+    """Kazakh 'if you received this by mistake, please delete it' anchor."""
+    kz_footer = (
+        "Егер сіз бұл хабарламаны қателесіп алсаңыз, оны кез келген түрде "
+        "пайдаланбауды және жоюды өтінеміз.\n"
+    )
+    body = _long_body(6) + "\n\n" + kz_footer
+    out = clean_body(body)
+    assert out["disclaimer_cut"] is True
+    assert "қателесіп" not in out["text"]
+    assert out["text"].endswith("вопросы по документам.")
