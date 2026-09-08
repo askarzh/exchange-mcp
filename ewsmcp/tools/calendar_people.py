@@ -481,7 +481,13 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
                 counts, backlog = await asyncio.to_thread(
                     lambda: (ctx.cache.archive_state_counts(),
                              ctx.cache.embedding_backlog()))
-                archive_block["state_counts"] = counts
+                # Merge, don't replace: the runner's own state_counts (e.g.
+                # skipped_too_large — a per-process counter, not a DB state)
+                # must survive alongside the DB-derived live/captured/
+                # verified/deleted keys.
+                merged = dict(archive_block.get("state_counts") or {})
+                merged.update(counts)
+                archive_block["state_counts"] = merged
                 archive_block["embedding_backlog"] = backlog
             except Exception as exc:
                 archive_block["error"] = str(exc)

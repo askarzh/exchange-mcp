@@ -136,6 +136,29 @@ def test_status_route_includes_the_archive_block(db):
     assert archive["free_gb"] == 12.5
 
 
+def test_status_route_merges_runner_state_counts_with_db_state_counts(db):
+    """The runner's own state_counts (e.g. skipped_too_large, a per-process
+    counter with no DB row) must survive the merge with the DB-derived
+    live/captured/verified/deleted counts, not be clobbered by it."""
+    class _RunnerWithTooLarge:
+        def status(self):
+            return {"running": True, "cycles": 4, "cycle_seconds": 300,
+                    "last_cycle_age_s": 12, "last_run_id": 7,
+                    "last_error": None, "delete_enabled": False,
+                    "state_counts": {"skipped_too_large": 3}}
+
+    ctx = make_context(db, ewsd_api_key="k")
+    ctx.archive = _RunnerWithTooLarge()
+    ctx.cache.upsert_messages([make_row("A1"), make_row("A2")])
+    ctx.cache.mark_captured("A1", mime_sha256="a" * 64, mime_path="/x.eml")
+    app = build_daemon_app(ctx, ctx.settings)
+    status, body = _drive(app, "/v1/status", headers=AUTH)
+    assert status == 200
+    assert body["archive"]["state_counts"] == {
+        "skipped_too_large": 3, "live": 1, "captured": 1, "verified": 0,
+        "deleted": 0}
+
+
 def test_status_route_omits_disk_stats_when_the_runner_lacks_them(db):
     """A runner stub without disk_stats() (older/fake) must not crash the
     status route — the archive block simply lacks blob_store_bytes/free_gb."""
