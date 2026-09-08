@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -835,6 +836,14 @@ class CacheStore:
         return [(i, best[i]) for i in order[:int(limit)]]
 
     # --------------------------------------------------------- boilerplate
+
+    def boilerplate_refs_stamp(self) -> datetime | None:
+        """Newest `created_at` across the reference rows, or None when there
+        are none. The harness probes this once per message and reloads the
+        (768-dim) vectors themselves only when it moves."""
+        with self.db.conn() as c:
+            return c.execute("SELECT max(created_at) AS stamp "
+                             "FROM ews.boilerplate_refs").fetchone()["stamp"]
 
     def boilerplate_refs(self) -> list[dict[str, Any]]:
         with self.db.conn() as c:

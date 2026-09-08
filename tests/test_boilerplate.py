@@ -146,3 +146,44 @@ def test_embed_pass_caps_llm_calls_and_the_next_pass_rearms_them(db):
         c.execute("UPDATE ews.messages SET embedded_at = NULL")
     asyncio.run(EmbedWorker(store, index).run(limit=10))
     assert len(cleaner.calls) == 4          # budget re-armed, capped again
+
+
+class _CountingStore:
+    """Transparent proxy that counts the store methods the harness calls."""
+
+    def __init__(self, store):
+        self._store = store
+        self.calls: dict[str, int] = {}
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if not callable(attr):
+            return attr
+
+        def counted(*a, **kw):
+            self.calls[name] = self.calls.get(name, 0) + 1
+            return attr(*a, **kw)
+        return counted
+
+
+def test_refs_are_reloaded_only_when_the_stamp_moves(db):
+    """`refresh_refs` runs per message; re-selecting every 768-dim vector each
+    time is the expensive part, so only the `max(created_at)` probe repeats."""
+    real = CacheStore(db)
+    emb = FakeEmbedder()
+    footer = BODY.split("\n\n")[-1]
+    real.upsert_boilerplate_ref("bcc", footer, emb.embed([footer])[0])
+    spy = _CountingStore(real)
+
+    h = BoilerplateHarness(spy, emb, threshold=0.80, drop="off")
+    assert spy.calls["boilerplate_refs"] == 1        # once, at construction
+    h.analyse("A1", BODY)
+    h.analyse("A2", BODY)
+    assert spy.calls["boilerplate_refs"] == 1        # no vector reload
+    assert spy.calls["boilerplate_refs_stamp"] == 3  # one cheap probe each
+
+    real.upsert_boilerplate_ref("other", "Some other disclaimer text",
+                                emb.embed(["Some other disclaimer text"])[0])
+    h.analyse("A3", BODY)
+    assert spy.calls["boilerplate_refs"] == 2        # the stamp moved
+    assert len(h._detector.refs) == 2

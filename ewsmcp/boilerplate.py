@@ -65,6 +65,7 @@ class BoilerplateHarness:
         # "a new pass starts now" — see begin_pass().
         self.llm_per_cycle = llm_per_cycle
         self._refs_stamp: Any = None
+        self._refs_loaded = False
         self._detector = EmbeddingDetector([], threshold)
         self.refresh_refs()
 
@@ -80,12 +81,19 @@ class BoilerplateHarness:
                 reset(int(self.llm_per_cycle))
 
     def refresh_refs(self) -> None:
+        """Reload the reference vectors only when they actually changed.
+
+        This runs per message, so the probe has to be cheap: `max(created_at)`
+        is one scalar, where `boilerplate_refs()` drags every 768-dim vector
+        out of Postgres and re-parses it as JSON."""
+        stamp = self.store.boilerplate_refs_stamp()
+        if self._refs_loaded and stamp == self._refs_stamp:
+            return
         rows = self.store.boilerplate_refs()
-        stamp = max((r["created_at"] for r in rows), default=None)
-        if stamp != self._refs_stamp or not self._detector.refs:
-            self._detector = EmbeddingDetector(
-                [(r["label"], list(r["embedding"])) for r in rows], self.threshold)
-            self._refs_stamp = stamp
+        self._detector = EmbeddingDetector(
+            [(r["label"], list(r["embedding"])) for r in rows], self.threshold)
+        self._refs_stamp = stamp
+        self._refs_loaded = True
 
     def analyse(self, ews_id: str, text: str) -> tuple[str, list[Hit]]:
         tail = tail_paragraphs(text)

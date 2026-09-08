@@ -94,6 +94,10 @@ store cleans up after itself. Design:
   is serial and blocking while the archive runner holds its lock, so a full
   200-message page could previously hold that lock for ~2000 s when Gemini
   stalled; messages past the budget are indexed without the LLM's opinion.
+- `BoilerplateHarness.refresh_refs()` no longer pulls every reference
+  vector out of Postgres for every message it analyses: a new
+  `CacheStore.boilerplate_refs_stamp()` (`max(created_at)`) is the per-
+  message probe, and the 768-dim rows are reloaded only when it moves.
 - `/v1/status` no longer overwrote the runner's `state_counts` wholesale
   with the DB-derived counts, which destroyed `skipped_too_large` before it
   could be reported; the two are merged.
