@@ -41,13 +41,16 @@ class Embedder(Protocol):
         """Return one vector per input text, in order."""
 
 
-def chunk_text(subject: str, body: str,
-                chunk_chars: int = CHUNK_CHARS) -> list[str]:
-    """``subject + "\\n" + body`` split into fixed-width character chunks."""
+def chunk_text(subject: str, body: str, chunk_chars: int = CHUNK_CHARS,
+               context: str | None = None) -> list[str]:
+    """``subject + "\\n" + body`` (+ an optional context block appended to
+    the text before chunking) split into fixed-width character chunks."""
     subject = (subject or "").strip()
     body = body or ""
     text = f"{subject}\n{body}" if subject and body else (subject or body)
     text = text.strip("\n") if not subject or not body else text
+    if context:
+        text = f"{text}\n\n{context}"
     if not text.strip():
         return []
     size = max(1, int(chunk_chars))

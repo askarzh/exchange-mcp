@@ -34,6 +34,24 @@ RRF_K = 60
 CANDIDATE_MULTIPLIER = 5
 MAX_CANDIDATES = 100
 
+# Short replies ("Добрый день. 1. 33,3 млрд тенге.") embed as almost nothing
+# and rank below background on topical queries. Below this body length, and
+# only when there's an earlier message in the same conversation, chunk 0
+# gets the parent's subject and opening lines appended for context.
+THREAD_CONTEXT_MAX_BODY = 600
+THREAD_CONTEXT_PARENT_CHARS = 300
+
+
+def _thread_context(store: CacheStore, row: dict[str, Any]) -> str | None:
+    body = row.get("body_clean") or ""
+    if len(body) >= THREAD_CONTEXT_MAX_BODY or not row.get("conversation_id"):
+        return None
+    parent = store.parent_in_thread(row["ews_id"])
+    if parent is None:
+        return None
+    head = (parent.get("body_clean") or "")[:THREAD_CONTEXT_PARENT_CHARS].strip()
+    return f"In reply to: {(parent.get('subject') or '').strip()}\n{head}".rstrip()
+
 
 class SemanticIndex:
     def __init__(self, store: CacheStore, embedder: Embedder, *,
@@ -56,8 +74,8 @@ class SemanticIndex:
         unembedded to the backlog query.
         """
         planned: list[tuple[str, list[str]]] = [
-            (r["ews_id"], chunk_text(r.get("subject") or "",
-                                     r.get("body_clean") or "", self.chunk_chars))
+            (r["ews_id"], chunk_text(r.get("subject") or "", r.get("body_clean") or "",
+                                     self.chunk_chars, context=_thread_context(self.store, r)))
             for r in rows
         ]
         done: list[str] = []

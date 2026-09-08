@@ -353,3 +353,13 @@ def test_upsert_never_touches_archive_columns(store):
     row = store.get_message("M1")
     assert row["subject"] == "edited"
     assert row["archive_state"] == "captured" and row["mime_sha256"] == "abc"
+
+
+def test_parent_in_thread_is_the_latest_earlier_message(db):
+    store = CacheStore(db)
+    store.upsert_messages([make_row("P0", conv="C", date_ts=100),
+                           make_row("P1", conv="C", date_ts=200),
+                           make_row("R", conv="C", date_ts=300),
+                           make_row("X", conv="D", date_ts=250)])
+    assert store.parent_in_thread("R")["ews_id"] == "P1"
+    assert store.parent_in_thread("P0") is None

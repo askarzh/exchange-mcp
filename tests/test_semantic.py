@@ -189,3 +189,23 @@ def test_hybrid_passes_structured_filters_through(indexed):
     _store, index = indexed
     rows, _ = index.hybrid_search("budget", limit=5, sender="nobody@example.com")
     assert rows == []
+
+
+def test_short_reply_chunk0_carries_parent_context(db):
+    store = CacheStore(db)
+    store.upsert_messages([
+        make_row("P", conv="C", date_ts=100, subject="Прогноз - инвестиции в ДО",
+                 body="Просим предоставить прогнозы по докапитализации ваших ДО. " * 3),
+        make_row("R", conv="C", date_ts=200, subject="RE: Прогноз - инвестиции в ДО",
+                 body="Добрый день. 1. 33,3 млрд тенге."),
+        make_row("L", conv="C", date_ts=300, subject="RE: long", body="x " * 400),
+    ])
+    index = SemanticIndex(store, FakeEmbedder())
+    index.index_messages(store.unembedded_messages(10))
+    with store.db.conn() as c:
+        texts = {r["message_ews_id"]: r["text"] for r in c.execute(
+            "SELECT message_ews_id, text FROM ews.chunks WHERE seq = 0")}
+    assert "In reply to: Прогноз - инвестиции в ДО" in texts["R"]
+    assert "докапитализации" in texts["R"]
+    assert "In reply to" not in texts["P"]          # no parent
+    assert "In reply to" not in texts["L"]          # too long

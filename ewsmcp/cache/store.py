@@ -657,9 +657,19 @@ class CacheStore:
     def unembedded_messages(self, limit: int) -> list[dict[str, Any]]:
         with self.db.conn() as c:
             return c.execute(
-                "SELECT ews_id, subject, body_clean FROM ews.messages "
+                "SELECT ews_id, subject, body_clean, conversation_id FROM ews.messages "
                 "WHERE embedded_at IS NULL ORDER BY date_ts DESC NULLS LAST "
                 "LIMIT %s", (int(limit),)).fetchall()
+
+    def parent_in_thread(self, ews_id: str) -> dict[str, Any] | None:
+        """The latest message in the same conversation dated before this one."""
+        with self.db.conn() as c:
+            return c.execute(
+                "SELECT p.ews_id, p.subject, p.body_clean FROM ews.messages m "
+                "JOIN ews.messages p ON p.conversation_id = m.conversation_id "
+                "  AND p.date_ts < m.date_ts AND p.ews_id <> m.ews_id "
+                "WHERE m.ews_id = %s AND m.conversation_id IS NOT NULL "
+                "ORDER BY p.date_ts DESC, p.ews_id DESC LIMIT 1", (ews_id,)).fetchone()
 
     def replace_chunks(self, ews_id: str, chunks: list[dict[str, Any]]) -> None:
         """Rewrite one message's chunks and stamp `embedded_at`, atomically.
