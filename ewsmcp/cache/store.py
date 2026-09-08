@@ -815,3 +815,48 @@ class CacheStore:
                 best[ews_id] = float(r["dist"])  # so the first hit is the best
                 order.append(ews_id)
         return [(i, best[i]) for i in order[:int(limit)]]
+
+    # --------------------------------------------------------- boilerplate
+
+    def boilerplate_refs(self) -> list[dict[str, Any]]:
+        with self.db.conn() as c:
+            rows = c.execute("SELECT label, text, embedding::text AS embedding, created_at "
+                             "FROM ews.boilerplate_refs ORDER BY id").fetchall()
+        for r in rows:
+            r["embedding"] = json.loads(r["embedding"])
+        return rows
+
+    def upsert_boilerplate_ref(self, label: str, text: str, embedding: list[float]) -> None:
+        with self.db.conn() as c:
+            c.execute("INSERT INTO ews.boilerplate_refs (label, text, embedding) "
+                      "VALUES (%s, %s, %s::vector) ON CONFLICT (label) DO UPDATE SET "
+                      "text = EXCLUDED.text, embedding = EXCLUDED.embedding, "
+                      "created_at = now()", (label, text, _vector_literal(embedding)))
+
+    def log_boilerplate_hits(self, ews_id: str, hits: list[Any], dropped: bool) -> None:
+        if not hits:
+            return
+        with self.db.conn() as c:
+            c.cursor().executemany(
+                "INSERT INTO ews.boilerplate_hits (message_ews_id, detector, paragraph, "
+                "similarity, ref_label, dropped) VALUES (%s, %s, %s, %s, %s, %s)",
+                [(ews_id, h.detector, h.paragraph[:2000], h.similarity, h.ref_label,
+                  1 if dropped else 0) for h in hits])
+
+    def boilerplate_stats(self, days: int = 7) -> dict[str, dict[str, int]]:
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT detector, COUNT(*) AS hits, "
+                "  COUNT(*) FILTER (WHERE dropped = 1) AS dropped, "
+                "  COUNT(*) FILTER (WHERE ref_label LIKE 'error:%%') AS errors "
+                "FROM ews.boilerplate_hits WHERE created_at > now() - make_interval(days => %s) "
+                "GROUP BY detector", (int(days),)).fetchall()
+        out: dict[str, dict[str, int]] = {
+            "embedding": {"hits": 0, "dropped": 0},
+            "llm": {"hits": 0, "dropped": 0, "errors": 0}}
+        for r in rows:
+            d = out.setdefault(r["detector"], {})
+            d["hits"], d["dropped"] = int(r["hits"]), int(r["dropped"])
+            if r["detector"] == "llm":
+                d["errors"] = int(r["errors"])
+        return out

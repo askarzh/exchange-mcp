@@ -1,0 +1,35 @@
+# Reference texts for the embedding boilerplate detector (Phase 3 §2).
+#
+# Human-readable source of truth. Format: a "## <label>" line, the text, a
+# blank line between blocks. scripts/seed_boilerplate.py carries the SAME
+# texts in a module-level REFS list because it is piped into the container
+# (docker exec -i ewsd python - < scripts/seed_boilerplate.py) and cannot
+# read this file. Keep the two in sync.
+
+## bcc_invest_ru
+Предоставляемая АО «BCC Invest» информация не является предложением о покупке и/или обязательством по продаже того или иного финансового инструмента, побуждением к заключению сделки.
+Перед совершением сделок с финансовыми инструментами просим ознакомиться с их характеристиками и информацией, размещенной на сайте АО «BCC Invest» https://www.bcc-invest.kz/documents?page=1
+Государственная лицензия № 3.2.235/12 от 10.07.2018 года на осуществление деятельности на рынке ценных бумаг.
+
+## confidentiality_ru
+Содержание этого электронного письма предназначено только для получателей, указанных в сообщении.
+Если вы получили это сообщение по ошибке, пожалуйста сообщите об этом отправителю и затем удалите письмо.
+
+## confidentiality_kz
+Бұл электрондық хаттың мазмұны тек хабарламада көрсетілген алушыларға арналған.
+Егер сіз бұл хабарламаны қателесіп алсаңыз, бұл жөнінде жөнелтушіге хабарлауды және содан кейін хатты жоюды өтінеміз.
+
+## gateway_banner_kz
+Назар аударыңыз! Бұл хатты сыртқы адресат жіберген. Салынған файлдармен және сілтемелермен жұмыс істегенде, сақ болыңыз! Егер хатты күдікті деп ойласаңыз, АҚҚО-на дереу хабарласыңыз: АҚҚО
+
+## gateway_banner_ru
+Внимание! Данное письмо отправлено внешним адресатом. Будьте осторожны при работе с вложениями и ссылками! Если считаете письмо подозрительным, незамедлительно обратитесь в ЦОИБ
+
+## gateway_banner_en
+Attention! This message was sent by an external sender. Be careful when working with attachments and links! If you consider this message suspicious, contact the information security centre immediately.
+
+## confidentiality_en
+CONFIDENTIALITY NOTICE This e-mail message and any attachments are only for the use of the intended recipient and may contain information that is privileged, confidential or exempt from disclosure under applicable law. If you are not the intended recipient, any disclosure, distribution or other use of this e-mail message or attachments is prohibited. If you have received this e-mail message in error, please delete and notify the sender immediately. Thank you.
+
+## intended_recipient_en
+This e-mail and any files transmitted with it are intended solely for the use of the individual or entity to whom they are addressed. If you have received this email in error please notify the sender and delete it from your system. Any unauthorised copying, disclosure or distribution of the material in this e-mail is strictly forbidden.

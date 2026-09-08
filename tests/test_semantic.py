@@ -209,3 +209,43 @@ def test_short_reply_chunk0_carries_parent_context(db):
     assert "докапитализации" in texts["R"]
     assert "In reply to" not in texts["P"]          # no parent
     assert "In reply to" not in texts["L"]          # too long
+
+
+BOILERPLATE_BODY = (
+    "Коллеги, добрый день.\n\n"
+    "По итогам встречи направляю обновлённую модель бюджета на следующий квартал. "
+    "Прошу посмотреть допущения на вкладке 2 и вернуться с комментариями до пятницы.\n\n"
+    "Отдельно обращаю внимание на сроки согласования с юристами: они просят две недели, "
+    "поэтому финальную версию нужно собрать заранее и разослать участникам.\n\n"
+    "С уважением, Аскар.\n\n"
+    "Предоставляемая АО «BCC Invest» информация не является предложением о покупке "
+    "и/или обязательством по продаже ценных бумаг.")
+
+
+def _harnessed(db, drop):
+    from ewsmcp.boilerplate import BoilerplateHarness
+    store = CacheStore(db)
+    store.upsert_messages([make_row("M-FOOT", body=BOILERPLATE_BODY)])
+    emb = FakeEmbedder()
+    footer = BOILERPLATE_BODY.split("\n\n")[-1]
+    store.upsert_boilerplate_ref("bcc_invest_ru", footer, emb.embed([footer])[0])
+    harness = BoilerplateHarness(store, emb, threshold=0.80, drop=drop)
+    index = SemanticIndex(store, emb, harness=harness)
+    rows = [r for r in store.messages_by_ids(["M-FOOT"]).values()]
+    assert index.index_messages(rows) == 1
+    with db.conn() as c:
+        chunks = c.execute("SELECT text FROM ews.chunks WHERE message_ews_id = 'M-FOOT' "
+                           "ORDER BY seq").fetchall()
+    return store, " ".join(r["text"] for r in chunks)
+
+
+def test_index_messages_drops_the_footer_when_drop_names_the_detector(db):
+    store, text = _harnessed(db, "embedding")
+    assert "BCC Invest" not in text
+    assert store.boilerplate_stats()["embedding"] == {"hits": 1, "dropped": 1}
+
+
+def test_index_messages_keeps_the_footer_but_still_logs_when_drop_is_off(db):
+    store, text = _harnessed(db, "off")
+    assert "BCC Invest" in text
+    assert store.boilerplate_stats()["embedding"] == {"hits": 1, "dropped": 0}

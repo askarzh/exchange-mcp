@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .boilerplate import BoilerplateHarness
 from .cache.store import CacheStore
 from .embeddings import (
     CHUNK_CHARS,
@@ -55,11 +56,17 @@ def _thread_context(store: CacheStore, row: dict[str, Any]) -> str | None:
 
 class SemanticIndex:
     def __init__(self, store: CacheStore, embedder: Embedder, *,
-                 chunk_chars: int = CHUNK_CHARS, batch: int = MAX_BATCH) -> None:
+                 chunk_chars: int = CHUNK_CHARS, batch: int = MAX_BATCH,
+                 harness: BoilerplateHarness | None = None) -> None:
         self.store = store
         self.embedder = embedder
         self.chunk_chars = int(chunk_chars)
         self.batch = max(1, min(int(batch), MAX_BATCH))
+        # Log-only by default: the harness always records what it found, and
+        # only shortens the text handed to `chunk_text` when its `drop`
+        # setting names the detector that found it. The stored body never
+        # changes — this affects the index alone.
+        self.harness = harness
 
     # ------------------------------------------------------------- indexing
 
@@ -73,11 +80,14 @@ class SemanticIndex:
         so a crash mid-run never leaves fully-embedded chunks looking
         unembedded to the backlog query.
         """
-        planned: list[tuple[str, list[str]]] = [
-            (r["ews_id"], chunk_text(r.get("subject") or "", r.get("body_clean") or "",
-                                     self.chunk_chars, context=_thread_context(self.store, r)))
-            for r in rows
-        ]
+        planned: list[tuple[str, list[str]]] = []
+        for r in rows:
+            text = r.get("body_clean") or ""
+            if self.harness is not None:
+                text, _hits = self.harness.analyse(r["ews_id"], text)
+            planned.append((r["ews_id"], chunk_text(
+                r.get("subject") or "", text, self.chunk_chars,
+                context=_thread_context(self.store, r))))
         done: list[str] = []
         pending: list[tuple[str, list[str]]] = []
         pending_size = 0
