@@ -27,7 +27,12 @@ import sys
 
 from ewsmcp.bodyclean import clean_body
 from ewsmcp.cache.store import CacheStore
-from ewsmcp.cache.sync import BODY_CLEAN_MAX, hydrate_bodies, recipients_json
+from ewsmcp.cache.sync import (
+    BODY_CLEAN_MAX,
+    attachments_json,
+    hydrate_bodies,
+    recipients_json,
+)
 from ewsmcp.config import Settings
 from ewsmcp.db import Database
 from ewsmcp.gateway.client import EWSGateway
@@ -36,14 +41,17 @@ log = logging.getLogger("backfill_bodies")
 
 
 class _Ref:
-    """The (id, changekey) pair `Account.fetch` wants, with `text_body` and
-    `to_recipients` slots for `hydrate_bodies` to fill."""
+    """The (id, changekey) pair `Account.fetch` wants, with `text_body`,
+    `to_recipients`, `item_class` and `attachments` slots for
+    `hydrate_bodies` to fill."""
 
-    __slots__ = ("id", "changekey", "text_body", "to_recipients")
+    __slots__ = ("id", "changekey", "text_body", "to_recipients", "item_class",
+                "attachments")
 
     def __init__(self, ews_id: str, changekey: str | None):
         self.id, self.changekey = ews_id, changekey
         self.text_body, self.to_recipients = None, None
+        self.item_class, self.attachments = None, None
 
 
 _ALL_ROWS: list[dict] | None = None
@@ -96,10 +104,16 @@ def main(argv: list[str] | None = None) -> int:
         hydrate_bodies(account, refs)
         bodies: dict[str, str] = {}
         tos: dict[str, str] = {}
+        extra: dict[str, dict] = {}
         for ref in refs:
             seen.add(ref.id)
             if ref.to_recipients is not None:
                 tos[ref.id] = recipients_json(ref)
+            extra[ref.id] = {
+                "item_class": ref.item_class,
+                "attachments_json": attachments_json(ref) if ref.attachments is not None
+                else None,
+            }
             if ref.text_body is None:
                 missing += 1
                 if ref.id in tos:
@@ -113,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         # row out of the next pass (it is selected by body_clean = '') only
         # for this run, via `seen`; across runs it is simply re-fetched, which
         # is cheap and correct. An unchanged body keeps its embedding.
-        filled += store.update_bodies(bodies, tos)
+        filled += store.update_bodies(bodies, tos, extra)
         done += len(rows)
         log.info("backfilled %d/%d rows so far (%d with no text body on Exchange)",
                  filled, done, missing)

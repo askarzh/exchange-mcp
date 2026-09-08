@@ -82,11 +82,12 @@ def _tokens(query: str | None) -> list[str]:
 _UPSERT_MESSAGE = """
 INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id, sender_name,
     sender_email, to_json, subject, date_ts, date_iso, is_read, has_attachments,
-    importance, categories_json, body_clean, internet_message_id)
+    importance, categories_json, body_clean, internet_message_id, item_class,
+    attachments_json)
 VALUES (%(ews_id)s, %(changekey)s, %(folder_id)s, %(conversation_id)s, %(sender_name)s,
     %(sender_email)s, %(to_json)s, %(subject)s, %(date_ts)s, %(date_iso)s, %(is_read)s,
     %(has_attachments)s, %(importance)s, %(categories_json)s, %(body_clean)s,
-    %(internet_message_id)s)
+    %(internet_message_id)s, %(item_class)s, %(attachments_json)s)
 ON CONFLICT (ews_id) DO UPDATE SET
     changekey = EXCLUDED.changekey, folder_id = EXCLUDED.folder_id,
     conversation_id = EXCLUDED.conversation_id, sender_name = EXCLUDED.sender_name,
@@ -94,7 +95,8 @@ ON CONFLICT (ews_id) DO UPDATE SET
     subject = EXCLUDED.subject, date_ts = EXCLUDED.date_ts, date_iso = EXCLUDED.date_iso,
     is_read = EXCLUDED.is_read, has_attachments = EXCLUDED.has_attachments,
     importance = EXCLUDED.importance, categories_json = EXCLUDED.categories_json,
-    body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id
+    body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id,
+    item_class = EXCLUDED.item_class, attachments_json = EXCLUDED.attachments_json
 """
 
 
@@ -109,6 +111,9 @@ class CacheStore:
     def upsert_messages(self, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
+        for row in rows:
+            row.setdefault("item_class", None)
+            row.setdefault("attachments_json", None)
         with self.db.conn() as c:
             c.cursor().executemany(_UPSERT_MESSAGE, rows)
         return len(rows)
@@ -676,34 +681,43 @@ class CacheStore:
         with self.db.conn() as c:
             return c.execute(
                 "SELECT ews_id, changekey FROM ews.messages "
-                "WHERE (coalesce(body_clean, '') = '' OR coalesce(to_json, '[]') = '[]') "
+                "WHERE (coalesce(body_clean, '') = '' OR coalesce(to_json, '[]') = '[]' "
+                "OR item_class IS NULL) "
                 "AND archive_state <> 'deleted' "
                 "ORDER BY date_ts DESC NULLS LAST LIMIT %s", (int(limit),)).fetchall()
 
     def update_bodies(self, bodies: dict[str, str],
-                      recipients: dict[str, str] | None = None) -> int:
-        """Set `body_clean` (and `to_json` when given) for the ids in
-        `bodies`. A row whose body actually changed goes back on the
-        embedding backlog — its chunks were built from the old text, so they
-        are dropped and `embedded_at` cleared in the same transaction; a row
-        whose body is unchanged (recipients-only repair, or a re-run) keeps
-        its chunks and its stamp. Returns the number of rows updated."""
+                      recipients: dict[str, str] | None = None,
+                      extra: dict[str, dict] | None = None) -> int:
+        """Set `body_clean` (and `to_json`, `item_class`, `attachments_json`
+        when given) for the ids in `bodies`. A row whose body actually
+        changed goes back on the embedding backlog — its chunks were built
+        from the old text, so they are dropped and `embedded_at` cleared in
+        the same transaction; a row whose body is unchanged (recipients-only
+        repair, or a re-run) keeps its chunks and its stamp. Returns the
+        number of rows updated."""
         if not bodies:
             return 0
         recipients = recipients or {}
+        extra = extra or {}
         requeued: list[str] = []
         with self.db.conn() as c:
             for ews_id, body in bodies.items():
+                ex = extra.get(ews_id, {})
                 row = c.execute(
                     "UPDATE ews.messages SET "
                     "  embedded_at = CASE WHEN body_clean IS DISTINCT FROM %(body)s "
                     "                     THEN NULL ELSE embedded_at END, "
                     "  body_clean = %(body)s, "
-                    "  to_json = coalesce(%(to)s, to_json) "
+                    "  to_json = coalesce(%(to)s, to_json), "
+                    "  item_class = coalesce(%(item_class)s, item_class), "
+                    "  attachments_json = coalesce(%(atts)s, attachments_json) "
                     "WHERE ews_id = %(ews_id)s "
                     "RETURNING (embedded_at IS NULL) AS requeued",
                     {"ews_id": ews_id, "body": body,
-                     "to": recipients.get(ews_id)}).fetchone()
+                     "to": recipients.get(ews_id),
+                     "item_class": ex.get("item_class"),
+                     "atts": ex.get("attachments_json")}).fetchone()
                 if row and row["requeued"]:
                     requeued.append(ews_id)
             if requeued:

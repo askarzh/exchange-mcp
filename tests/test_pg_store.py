@@ -323,6 +323,16 @@ def test_archived_filter(store):
     assert store.get_message("M2")["archive_state"] == "verified"
 
 
+def test_update_bodies_extra_sets_item_class_and_inventory(store):
+    store.upsert_messages([make_row("A1")])
+    store.update_bodies({"A1": "body"}, None,
+                        {"A1": {"item_class": "IPM.Schedule.Meeting.Resp.Pos",
+                                "attachments_json": "[]"}})
+    row = store.get_message("A1")
+    assert row["item_class"] == "IPM.Schedule.Meeting.Resp.Pos"
+    assert row["attachments_json"] == "[]"
+
+
 def test_upsert_never_touches_archive_columns(store):
     store.upsert_messages([make_row("M1")])
     with store.db.conn() as c:

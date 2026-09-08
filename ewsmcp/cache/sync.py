@@ -43,6 +43,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from exchangelib import FileAttachment
 from exchangelib.folders import Messages
 
 from ..bodyclean import clean_body
@@ -110,7 +111,27 @@ def _ts(dt: Any) -> int | None:
 
 BODY_FETCH_CHUNK = 100
 # What SyncFolderItems leaves empty and GetItem must supply.
-HYDRATE_FIELDS = ["text_body", "to_recipients"]
+HYDRATE_FIELDS = ["text_body", "to_recipients", "item_class", "attachments"]
+
+
+def attachments_json(item: Any) -> str:
+    """Attachment metadata only — `.content` is a lazy GetAttachment round
+    trip and must never be touched here. FileAttachment carries a real MIME
+    `content_type`; anything else (ItemAttachment: a forwarded/embedded
+    message) is reported as `message/rfc822`."""
+    out = []
+    for att in list(getattr(item, "attachments", None) or []):
+        if isinstance(att, FileAttachment):
+            out.append({"name": getattr(att, "name", None) or "attachment",
+                        "size": getattr(att, "size", None),
+                        "content_type": getattr(att, "content_type", None),
+                        "inline": bool(getattr(att, "is_inline", False))})
+        else:
+            out.append({"name": getattr(att, "name", None) or "attachment",
+                        "size": getattr(att, "size", None),
+                        "content_type": "message/rfc822",
+                        "inline": bool(getattr(att, "is_inline", False))})
+    return json.dumps(out, ensure_ascii=False)
 
 
 def hydrate_bodies(account: Any, items: list[Any]) -> int:
@@ -146,6 +167,11 @@ def hydrate_bodies(account: Any, items: list[Any]) -> int:
             to = getattr(res, "to_recipients", None)
             if to is not None:
                 item.to_recipients = list(to)
+            ic = getattr(res, "item_class", None)
+            if isinstance(ic, str):
+                item.item_class = ic
+            if getattr(res, "attachments", None) is not None:
+                item.attachments = list(res.attachments)
     return filled
 
 
@@ -192,6 +218,8 @@ def row_from_message(item: Any, folder_id: str, tz: str) -> dict[str, Any]:
                                       ensure_ascii=False),
         "body_clean": body_clean,
         "internet_message_id": imid if isinstance(imid, str) else None,
+        "item_class": getattr(item, "item_class", None) or None,
+        "attachments_json": attachments_json(item),
     }
 
 
