@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -309,3 +310,57 @@ def test_a_sender_with_no_address_is_not_offered_as_a_contact(db):
     r = _client(db).get("/bridge/v1/contacts",
                         headers={"Authorization": "Bearer t"}).json()
     assert r["contacts"] == []
+
+
+def test_a_non_ascii_token_is_refused_and_not_a_500(db):
+    """Starlette decodes headers as latin-1 and `hmac.compare_digest` raises
+    TypeError on a str with a character above U+007F, so a header of
+    `Bearer café` used to come back as a 500 from inside the credential
+    check. A bad token is a 401, whatever bytes it is made of."""
+    c = _client(db)
+    # Sent as bytes because httpx will not encode a non-ASCII header itself;
+    # latin-1 is what a real client's bytes look like on the wire and what
+    # Starlette decodes them back with.
+    r = c.get("/bridge/v1/health",
+              headers={"Authorization": "Bearer café".encode("latin-1")})
+    assert r.status_code == 401
+
+
+def test_health_is_connected_when_the_store_synced_recently(db):
+    with db.conn() as conn:
+        conn.execute("INSERT INTO ews.sync_state (key, token, as_of)"
+                     " VALUES ('item:inbox', 'tok', %s)", (int(time.time()) - 30,))
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["connected"] is True and h["detail"] is None and h["since"]
+
+
+def test_health_is_disconnected_when_the_store_has_gone_stale(db):
+    """Postgres answering says the bridge can read a store, not that the store
+    is alive. If `ewsd` died a week ago the mailbox is frozen — and Mindet
+    gates its whole tick on `connected`, so claiming true here would let the
+    mail source read as healthy while nothing arrived."""
+    with db.conn() as conn:
+        conn.execute("INSERT INTO ews.sync_state (key, token, as_of)"
+                     " VALUES ('item:inbox', 'tok', %s)",
+                     (int(time.time()) - 7 * 24 * 3600,))
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["connected"] is False and "synced" in h["detail"]
+
+
+def test_health_on_a_store_that_never_synced_is_not_connected(db):
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["connected"] is False and h["detail"] == "the mail store has never synced"
+
+
+def test_health_reports_a_send_time_of_zero_rather_than_null(db):
+    """`max(date_ts)` came back under the key `max` and was tested for truth,
+    so an epoch-zero send time — which the store really does hold for a mail
+    whose header would not parse — reported no last message at all."""
+    with db.conn() as conn:
+        _msg(conn, "m1", date_ts=0)
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["last_message_at"] == "1970-01-01T00:00:00+00:00"

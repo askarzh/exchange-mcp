@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hmac
+import time
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -21,6 +22,13 @@ CONTRACT = 1
 SOURCE = "ews"
 CAPABILITIES = ["messages", "chats", "contacts"]
 PAGE_LIMIT = 500
+
+# How stale `ews.sync_state` may get before the bridge stops calling itself
+# connected. `ewsd` runs its item lane every EWS_CACHE_SYNC_SECONDS (45s by
+# default), so twenty missed cycles is far past a transient Exchange hiccup or
+# a container restart, and still short enough that a store frozen overnight is
+# on the owner's morning list rather than reading as healthy.
+STALE_AFTER_SECONDS = 15 * 60
 
 
 class _Bad(Exception):
@@ -82,7 +90,11 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
     def guard(request: Request) -> None:
         header = request.headers.get("Authorization", "")
         given = header[7:] if header.startswith("Bearer ") else ""
-        if not hmac.compare_digest(given, token):
+        # Compared as bytes: Starlette decodes headers as latin-1, and
+        # `compare_digest` raises TypeError on a str with a character above
+        # U+007F, so `Authorization: Bearer café` would 500 out of the
+        # credential check instead of being refused.
+        if not hmac.compare_digest(given.encode("latin-1"), token.encode()):
             raise _Bad(401, "unauthorized", "bad token")
 
     async def health(request: Request):
@@ -92,15 +104,36 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         # write locks on every poll for no effect on the response. Don't add
         # it back.
         with pool.conn() as c:
-            row = c.execute("SELECT max(date_ts) FROM ews.messages"
+            row = c.execute("SELECT max(date_ts) AS last_ts FROM ews.messages"
                             " WHERE deleted_at IS NULL").fetchone()
-        last = row["max"] if row else None
+            state = c.execute(
+                "SELECT max(as_of) AS as_of FROM ews.sync_state").fetchone()
+        last = row["last_ts"] if row else None
+        # `connected` is about the source, not about Postgres. Postgres
+        # answering says only that the bridge can read a store; if `ewsd` died
+        # a week ago that store is frozen, and Mindet gates its whole tick on
+        # this field — so a bridge that always said `true` would let the mail
+        # source read as healthy while nothing at all arrived. `sync_state`
+        # carries the watermark `ewsd` stamps on every sync cycle; that is the
+        # honest answer.
+        as_of = state["as_of"] if state else None
+        now = time.time()
+        if as_of is None:
+            connected, detail = False, "the mail store has never synced"
+        elif now - float(as_of) > STALE_AFTER_SECONDS:
+            age = int(now - float(as_of))
+            connected, detail = False, f"the mail store last synced {age}s ago"
+        else:
+            connected, detail = True, None
         return JSONResponse({
-            "contract": CONTRACT, "source": SOURCE, "connected": True, "auth": "ok",
-            "since": None,
+            "contract": CONTRACT, "source": SOURCE, "connected": connected, "auth": "ok",
+            "since": (dt.datetime.fromtimestamp(float(as_of), dt.timezone.utc).isoformat()
+                      if as_of is not None else None),
+            # A date_ts of 0 is a real (if absurd) timestamp and falsy, so this
+            # asks whether there is a value, not whether it is truthy.
             "last_message_at": (dt.datetime.fromtimestamp(last, dt.timezone.utc).isoformat()
-                                if last else None),
-            "capabilities": CAPABILITIES, "detail": None})
+                                if last is not None else None),
+            "capabilities": CAPABILITIES, "detail": detail})
 
     async def messages(request: Request):
         guard(request)
