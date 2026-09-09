@@ -199,3 +199,30 @@ def test_the_cursor_generation_is_this_stores_own_and_survives_a_restart(db):
     db.reapply_migration_for_tests(5)
     with db.conn() as c:
         assert arrival.generation(c) != first
+
+
+def test_a_send_date_in_the_future_does_not_arrive_in_the_future(db):
+    """A sender whose clock is wrong writes a mail dated next year, and it
+    reaches the store today like any other. Backfilled unclamped, it took an
+    arrival time in 2027 and a sequence below everything the store learned of
+    afterwards — so the ledger read by `seq` and the ledger read by
+    `first_seen` disagreed, and a bounded page could hand back a cursor with
+    that mail sitting below it, never to be delivered.
+
+    Found by tests/bridge/test_invariant.py on its first run, which is what a
+    property test is for."""
+    now = dt.datetime.now(dt.timezone.utc)
+    with db.conn() as c:
+        _msg(c, "ordinary", date_ts=int((now - dt.timedelta(days=30)).timestamp()))
+        _msg(c, "from-a-wrong-clock", date_ts=int((now + dt.timedelta(days=200)).timestamp()))
+        c.execute("TRUNCATE ews.bridge_arrival")
+    db.reapply_migration_for_tests(5)
+    db.reapply_migration_for_tests(6)
+    with db.conn() as c:
+        rows = arrival.page(c, after_seq=None, until=None, limit=10)
+        # it still reports the send time its header claims…
+        assert rows[1]["date_ts"] > int(now.timestamp())
+    # …but it did not arrive after now, and the two orders agree
+    assert rows[1]["first_seen"] <= dt.datetime.now(dt.timezone.utc)
+    assert [r["seq"] for r in rows] == sorted(r["seq"] for r in rows)
+    assert [r["first_seen"] for r in rows] == sorted(r["first_seen"] for r in rows)

@@ -26,23 +26,32 @@ CREATE SEQUENCE IF NOT EXISTS ews.bridge_arrival_seq;
 -- the consumer's bootstrap keeps the last sequence a bounded page returned,
 -- and anything in the window sitting below that number is lost for good.
 --
--- NULLS LAST, not FIRST. A mail with no send date — Exchange writes those for
--- drafts, calendar notices and headers it could not parse — takes first_seen =
--- now(), so it arrives at the head of the ledger and its sequence has to sit
--- there too. Sequenced at the front instead, it would be excluded from every
--- bounded bootstrap page (its arrival is now, not before the window) while the
--- bootstrap cursor ended far above it, leaving it behind the cursor for ever.
+-- Sequence and arrival time come from one expression, so they cannot disagree
+-- — and they must not, because `until` filters a bounded page on `first_seen`
+-- while the page is ordered and cut by `seq`. The moment the two orders differ,
+-- a bounded walk can end on a cursor with mail sitting below it, undelivered
+-- for ever, with no error anywhere.
+--
+-- `least(…, now())` because a mail cannot have arrived after now, and this
+-- store really does hold send dates in the future: a sender whose clock is
+-- wrong writes one and it reaches us today like any other mail. Unclamped, it
+-- took an arrival in 2027 and a sequence below everything discovered
+-- afterwards — exactly the disagreement above.
+--
+-- `coalesce(…, now())` because a mail with no send date at all — Exchange
+-- writes those for drafts, calendar notices and headers it could not parse —
+-- also arrived now. Both land on now(), tie there, and are separated by
+-- ews_id, so the sequence still follows the arrival time exactly.
 --
 -- Guarded on an empty ledger so this is a first-migration backfill and nothing
 -- else; once rows exist, sweep() owns every later arrival.
 INSERT INTO ews.bridge_arrival (ews_id, seq, changekey, first_seen)
-SELECT m.ews_id,
-       row_number() OVER (ORDER BY m.date_ts NULLS LAST, m.ews_id),
-       m.changekey,
-       coalesce(to_timestamp(m.date_ts), now())
-  FROM ews.messages m
- WHERE m.deleted_at IS NULL
-   AND NOT EXISTS (SELECT 1 FROM ews.bridge_arrival);
+SELECT ews_id, row_number() OVER (ORDER BY arrived, ews_id), changekey, arrived
+  FROM (SELECT m.ews_id, m.changekey,
+               least(coalesce(to_timestamp(m.date_ts), now()), now()) AS arrived
+          FROM ews.messages m
+         WHERE m.deleted_at IS NULL) t
+ WHERE NOT EXISTS (SELECT 1 FROM ews.bridge_arrival);
 
 -- Whatever the backfill consumed, nextval() must continue past it.
 SELECT setval('ews.bridge_arrival_seq',
