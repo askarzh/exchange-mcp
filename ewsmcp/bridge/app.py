@@ -114,17 +114,15 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
             # Spec §3.2: an empty page still has to say where to resume, and
             # the terminal page echoes the cursor it was given rather than
             # moving it, so two polls with nothing between them never skip a
-            # message.  With `until` set, a full page (== limit) means the
-            # bounded stream is not exhausted yet — more sits inside the
-            # bound, so the cursor stays on the last row returned, exactly as
-            # it does without `until`. Only when `until` cut the page short
-            # (fewer rows than asked for) is the bounded stream known to be
-            # exhausted, and then the cursor must jump past everything
-            # `until` excluded — to the live head — or a bounded replay
-            # would re-offer the tail of history it just finished walking.
-            if until is not None and len(rows) < limit:
-                seq = arrival.head(c)
-            elif rows:
+            # message. `until` does not change that rule. It does not exclude
+            # old mail from a page — it is how a consumer *walks* old mail:
+            # bootstrap pages with `until` at the edge of its ingestion window,
+            # posting nothing, and keeps the cursor the walk ends on so the
+            # live cursor starts at that edge. A cursor that jumped to the live
+            # head on the last bounded page would carry the consumer straight
+            # past every message inside the window, for ever, with no error
+            # anywhere. So: the last row returned, or the cursor we were given.
+            if rows:
                 seq = rows[-1]["seq"]
             else:
                 seq = after if after is not None else arrival.head(c)

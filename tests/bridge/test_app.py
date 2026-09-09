@@ -127,32 +127,6 @@ def test_until_without_a_timezone_is_refused(db):
     assert r.status_code == 400
 
 
-def test_a_bounded_page_that_until_cut_short_jumps_the_cursor_past_the_exclusion(db):
-    """Spec §3.2, learned in plan 4: the cursor a page with `until` returns
-    jumps past everything `until` excluded, so a following poll on the live
-    cursor never re-offers the excluded message. Two messages, an `until`
-    that excludes the later one, and the page comes back short of `limit`
-    (the bounded stream is exhausted) — so `next` must be at or past the
-    excluded message's sequence, not merely at the last returned row."""
-    with db.conn() as conn:
-        _msg(conn, "in-window", date_ts=1_700_000_000)
-        bridge_app.arrival.sweep(conn)
-        conn.execute("UPDATE ews.bridge_arrival SET first_seen = %s WHERE ews_id = %s",
-                    (dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), "in-window"))
-        _msg(conn, "excluded", date_ts=1_700_009_000)
-        bridge_app.arrival.sweep(conn)
-        excluded_seq = bridge_app.arrival.head(conn)
-        conn.execute("UPDATE ews.bridge_arrival SET first_seen = %s WHERE ews_id = %s",
-                    (dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc), "excluded"))
-    c = _client(db)
-    r = c.get("/bridge/v1/messages",
-              params={"until": "2026-03-01T00:00:00+00:00", "limit": "10"},
-              headers={"Authorization": "Bearer t"}).json()
-    assert [m["native_id"] for m in r["messages"]] == ["in-window"]
-    _, _, next_seq = r["next"].split(":")
-    assert int(next_seq) >= excluded_seq
-
-
 def test_a_full_page_bounded_by_until_does_not_jump_past_the_bound(db):
     """The opposite side of the same rule: when `until` did not cut the page
     short (a full page came back), there is more inside the bound still to
