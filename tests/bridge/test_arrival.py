@@ -45,11 +45,23 @@ def test_an_edited_message_is_re_emitted_with_a_new_sequence(db):
         assert [r["ews_id"] for r in rows] == ["m1"]
 
 
-def test_until_stops_the_page_at_the_send_time_it_names(db):
+def test_until_bounds_the_page_by_arrival_not_by_send_time(db):
+    """Spec §3.2: `until` bounds arrival. A mail sent in March and discovered
+    today arrived today, and a replay bounded by the send date would leave it
+    out of a window it genuinely belongs to."""
     with db.conn() as c:
-        _msg(c, "early", date_ts=1_700_000_000)
-        _msg(c, "late", date_ts=1_700_009_000)
+        # 'old' was sent long before 'recent' and learned of afterwards, which
+        # is the ordinary shape of a folder sync catching up.
+        _msg(c, "recent", date_ts=1_700_009_000)
         arrival.sweep(c)
-        cut = dt.datetime.fromtimestamp(1_700_005_000, dt.timezone.utc)
+        _msg(c, "old", date_ts=1_600_000_000)
+        arrival.sweep(c)
+        c.execute("UPDATE ews.bridge_arrival SET first_seen = %s WHERE ews_id = %s",
+                  (dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), "recent"))
+        c.execute("UPDATE ews.bridge_arrival SET first_seen = %s WHERE ews_id = %s",
+                  (dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc), "old"))
+        cut = dt.datetime(2026, 3, 1, tzinfo=dt.timezone.utc)
         rows = arrival.page(c, after_seq=None, until=cut, limit=10)
-        assert [r["ews_id"] for r in rows] == ["early"]
+        # only 'recent' arrived before the cut, even though 'old' was sent
+        # thirteen years earlier by the send clock
+        assert [r["ews_id"] for r in rows] == ["recent"]

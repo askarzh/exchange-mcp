@@ -52,8 +52,11 @@ def page(conn, *, after_seq: int | None, until: dt.datetime | None,
         sql += " AND a.seq > %s"
         args.append(after_seq)
     if until is not None:
-        sql += " AND m.date_ts < %s"
-        args.append(int(until.timestamp()))
+        # Bound by arrival, not send (spec §3.2): a mail sent in March and
+        # discovered today arrived today, and a replay bounded by send time
+        # would drop it from a window it genuinely belongs to.
+        sql += " AND a.first_seen < %s"
+        args.append(until)
     sql += " ORDER BY a.seq LIMIT %s"
     args.append(limit)
     return [dict(r) for r in conn.execute(sql, args)]
