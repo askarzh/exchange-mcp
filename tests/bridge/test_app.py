@@ -285,6 +285,27 @@ def test_a_malformed_to_json_does_not_fail_the_whole_page(db):
     assert "conv-bad" in ids
 
 
+def test_a_same_second_tie_on_name_breaks_by_ews_id_and_stays_stable(db):
+    """Two messages in one conversation sharing a `date_ts` (rapid replies
+    are ordinary) with no tiebreaker would let Postgres pick either subject
+    for `name`, and it could differ between polls. `ews_id DESC` makes the
+    choice deterministic — always the higher native id — and repeated calls
+    must agree."""
+    with db.conn() as conn:
+        _msg(conn, "aaa", date_ts=1_700_000_000)
+        conn.execute("UPDATE ews.messages SET conversation_id='tie',"
+                     " subject='from aaa' WHERE ews_id='aaa'")
+        _msg(conn, "zzz", date_ts=1_700_000_000)
+        conn.execute("UPDATE ews.messages SET conversation_id='tie',"
+                     " subject='from zzz' WHERE ews_id='zzz'")
+    c = _client(db)
+    names = set()
+    for _ in range(3):
+        r = c.get("/bridge/v1/chats", headers={"Authorization": "Bearer t"}).json()
+        names.add(next(x["name"] for x in r["chats"] if x["native_id"] == "tie"))
+    assert names == {"from zzz"}
+
+
 def test_contacts_are_addresses_seen_as_senders_with_their_names(db):
     with db.conn() as conn:
         _msg(conn, "m1")

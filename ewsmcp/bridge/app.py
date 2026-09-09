@@ -138,21 +138,40 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         # change constantly and this store is small enough to answer in
         # full every time, so a cursor here would be a promise the bridge
         # does not keep.
-        #
+        limit = _parse_limit(request.query_params.get("limit"))
         # A conversation's membership is the union of every sender and
-        # recipient it has ever had, not its latest message's recipient
-        # list (see mapping.chats_from_rows). Computing that union requires
-        # every row of every conversation, not one aggregated row per
-        # conversation, so this selects raw messages — bounded generously
-        # (5000 rows is ample for this store) — and folds them in Python.
+        # recipient it has ever had (see mapping.chats_from_rows), and that
+        # cannot be decided from a window over the whole store: a single
+        # bounded scan (e.g. the most recent N rows) drops a long thread's
+        # older senders once the store outgrows the window, silently
+        # shrinking a group back to a false "direct" the same way the
+        # byte-wise max() bug did. So this is two queries — first which
+        # conversations to return, then every row of exactly those
+        # conversations, unbounded — rather than one bounded scan folded
+        # in Python.
         with pool.conn() as c:
-            rows = c.execute(
-                "SELECT coalesce(conversation_id, ews_id) AS native_id,"
-                " subject, sender_email, to_json, date_ts"
+            top = c.execute(
+                "SELECT coalesce(conversation_id, ews_id) AS native_id"
                 " FROM ews.messages WHERE deleted_at IS NULL"
-                " ORDER BY date_ts DESC LIMIT 5000").fetchall()
+                " GROUP BY 1 ORDER BY max(date_ts) DESC, 1 LIMIT %s",
+                (limit,)).fetchall()
+            native_ids = [r["native_id"] for r in top]
+            rows = []
+            if native_ids:
+                rows = c.execute(
+                    "SELECT coalesce(conversation_id, ews_id) AS native_id,"
+                    " subject, sender_email, to_json, date_ts, ews_id"
+                    " FROM ews.messages WHERE deleted_at IS NULL"
+                    " AND coalesce(conversation_id, ews_id) = ANY(%s)"
+                    # ews_id DESC breaks a same-second tie deterministically
+                    # (spec §3.2 does the same for the cursor, and for the
+                    # same reason): without it, which subject becomes a
+                    # conversation's `name` would depend on Postgres's
+                    # arbitrary tie order and could change between polls.
+                    " ORDER BY date_ts DESC, ews_id DESC",
+                    (native_ids,)).fetchall()
         return JSONResponse({
-            "chats": mapping.chats_from_rows([dict(r) for r in rows], limit=PAGE_LIMIT)})
+            "chats": mapping.chats_from_rows([dict(r) for r in rows], limit=limit)})
 
     async def contacts(request: Request):
         guard(request)
