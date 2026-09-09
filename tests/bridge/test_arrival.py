@@ -67,31 +67,35 @@ def test_until_bounds_the_page_by_arrival_not_by_send_time(db):
         assert [r["ews_id"] for r in rows] == ["recent"]
 
 
-def test_a_sweep_gives_a_pre_existing_store_the_arrival_times_it_can_reconstruct(db):
-    """Spec §3.2. `first_seen` used to default to now(), so a store the ledger
-    met for the first time had its whole history stamped as having arrived at
-    that moment — and a consumer bootstrapping to the edge of its window would
-    find nothing before that edge, take a cursor at the live head, and never be
-    offered a message again. A mail that carries a send time arrived, as far as
-    anyone can now reconstruct, when it was sent; and it enters the sequence in
-    that order, so `until` stays a prefix of the stream."""
+def test_a_sweep_records_a_discovery_as_arriving_now_whatever_its_send_date(db):
+    """This test replaced one that asserted the opposite, and the reversal is
+    the point.
+
+    It used to be `…_gives_a_pre_existing_store_the_arrival_times_it_can_
+    reconstruct`: it seeded four mails across months, swept, and asserted that
+    `page(until=<a cutoff between them>)` returned the two sent before the
+    cutoff — i.e. that sweep() reconstructed an arrival time from the send
+    date. That is a first-migration job, and doing it in sweep() as well broke
+    the invariant everywhere else: a folder sync discovering genuinely old mail
+    after in-window mail already held lower sequences handed that old mail a
+    *higher* seq with an *older* first_seen, and a bootstrap that met one ended
+    with its cursor above the entire ingestion window.
+
+    So sweep() stamps now(). A mail discovered today arrived today — which is
+    the sentence the whole ledger exists for. Migration 005 reconstructs the
+    history that was already there, once; nothing else ever does."""
     months = {"jan": dt.datetime(2026, 1, 15, tzinfo=dt.timezone.utc),
-              "mar": dt.datetime(2026, 3, 15, tzinfo=dt.timezone.utc),
-              "jun": dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc),
-              "sep": dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc)}
+              "jun": dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)}
     with db.conn() as c:
-        # written in a deliberately unhelpful order
-        for name in ("jun", "jan", "sep", "mar"):
+        for name in ("jun", "jan"):
             _msg(c, name, date_ts=int(months[name].timestamp()))
-        assert arrival.sweep(c) == 4
-        cut = dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc)
-        rows = arrival.page(c, after_seq=None, until=cut, limit=10)
-        assert [r["ews_id"] for r in rows] == ["jan", "mar"]
-        seqs = [r["seq"] for r in rows]
-        assert seqs == sorted(seqs)
-        # and the rest of history sits after them in the same order
-        rest = arrival.page(c, after_seq=seqs[-1], until=None, limit=10)
-        assert [r["ews_id"] for r in rest] == ["jun", "sep"]
+        assert arrival.sweep(c) == 2
+        # Nothing arrived before today, however old the send dates are.
+        assert arrival.page(c, after_seq=None, until=months["jun"], limit=10) == []
+        rows = arrival.page(c, after_seq=None, until=None, limit=10)
+    # Still ordered oldest-sent-first within the batch, and both arrived now.
+    assert [r["ews_id"] for r in rows] == ["jan", "jun"]
+    assert rows[0]["first_seen"] == rows[1]["first_seen"]
 
 
 def test_a_mail_with_no_send_time_arrives_now(db):
@@ -115,11 +119,15 @@ def test_an_amendment_takes_a_new_sequence_and_a_new_arrival_time(db):
     time inside the bound makes `until` stop being a prefix of the stream — and
     a bootstrap that meets one finishes with its cursor above the whole
     ingestion window."""
+    # Two transactions on purpose: now() is the transaction's clock, so a sweep
+    # and its amendment sharing one would share a timestamp. Each request the
+    # bridge serves is its own transaction, which is what this mirrors.
     with db.conn() as c:
         _msg(c, "m1", date_ts=int(dt.datetime(2026, 1, 15,
                                               tzinfo=dt.timezone.utc).timestamp()))
         arrival.sweep(c)
         was = arrival.page(c, after_seq=None, until=None, limit=1)[0]
+    with db.conn() as c:
         c.execute("UPDATE ews.messages SET changekey='ck2' WHERE ews_id='m1'")
         arrival.sweep(c)
         now_row = arrival.page(c, after_seq=None, until=None, limit=1)[0]

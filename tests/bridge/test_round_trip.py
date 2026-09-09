@@ -30,6 +30,22 @@ def _msg(conn, ews_id, sent: dt.datetime, *, changekey="ck1"):
         (ews_id, changekey, "conv-" + ews_id, int(sent.timestamp())))
 
 
+def _as_existing_history(db):
+    """Make the mail already in the store into history the ledger reconstructs.
+
+    This is the real shape of first contact and the only way history exists:
+    the mailbox is years old, and the bridge's ledger arrives afterwards.
+    Migration 005 reconstructs an arrival time from each mail's send date,
+    once. `sweep()` never does — a mail it meets for the first time arrived
+    now, whatever its send date says — so a test that seeds old mail and simply
+    sweeps is testing a store with no history at all.
+    """
+    with db.conn() as c:
+        c.execute("TRUNCATE ews.bridge_arrival")
+    db.reapply_migration_for_tests(5)
+    db.reapply_migration_for_tests(6)
+
+
 def _bootstrap(client, window_start: dt.datetime, *, limit: int) -> str:
     """Mindet's own `_bootstrap` (mindet/connectors/generic.py), transcribed:
     page to the window's edge with `until`, post nothing, keep the cursor the
@@ -76,6 +92,7 @@ def test_bootstrap_then_poll_delivers_every_message_in_the_window_exactly_once(d
         # of the order rows happened to be written in.
         for ews_id in ("new-2", "old-1", "new-3", "old-3", "new-1", "old-2"):
             _msg(conn, ews_id, {**old, **fresh}[ews_id])
+    _as_existing_history(db)
     c = _client(db)
 
     # limit=2 so the bootstrap walk takes several pages: a walk that only ever
@@ -96,6 +113,7 @@ def test_a_second_poll_on_the_same_cursor_delivers_nothing_further(db):
     with db.conn() as conn:
         _msg(conn, "old-1", now - dt.timedelta(days=90))
         _msg(conn, "new-1", now - dt.timedelta(days=1))
+    _as_existing_history(db)
     c = _client(db)
     cursor, _ = _bootstrap(c, window_start, limit=500)
     delivered, cursor = _poll(c, cursor, limit=500)
@@ -114,6 +132,7 @@ def test_an_amended_mail_reaches_a_consumer_holding_a_live_cursor_once(db):
     with db.conn() as conn:
         _msg(conn, "old-1", now - dt.timedelta(days=90))
         _msg(conn, "new-1", now - dt.timedelta(days=1))
+    _as_existing_history(db)
     c = _client(db)
     cursor, _ = _bootstrap(c, window_start, limit=500)
     delivered, cursor = _poll(c, cursor, limit=500)
@@ -166,6 +185,10 @@ def test_a_mail_with_no_send_date_reaches_the_consumer_exactly_once(db):
         _msg(conn, "old-1", now - dt.timedelta(days=200))
         _msg(conn, "old-2", now - dt.timedelta(days=100))
         _msg(conn, "new-1", now - dt.timedelta(days=5))
+    _as_existing_history(db)
+    with db.conn() as conn:
+        # …and the undated one turns up afterwards, so it is a discovery the
+        # sweep has to place, not history the migration reconstructed.
         conn.execute(
             "INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id,"
             " sender_email, subject, date_ts, body_clean)"
@@ -201,6 +224,7 @@ def test_a_mail_amended_mid_bootstrap_does_not_skip_the_ingestion_window(db):
             _msg(conn, ews_id, now - dt.timedelta(days=60 - i))
         for i, ews_id in enumerate(fresh):
             _msg(conn, ews_id, now - dt.timedelta(days=10 - i * 3))
+    _as_existing_history(db)
     c = _client(db)
 
     params = {"until": window_start.isoformat(), "limit": "2"}
@@ -225,5 +249,55 @@ def test_a_mail_amended_mid_bootstrap_does_not_skip_the_ingestion_window(db):
     delivered, token = _poll(c, token, limit=2)
     assert sorted(delivered) == sorted(fresh + ["old-1"])
     assert len(delivered) == len(set(delivered))
+    again, _ = _poll(c, token, limit=2)
+    assert again == []
+
+
+def test_old_mail_discovered_mid_bootstrap_does_not_skip_the_ingestion_window(db):
+    """The shape that has now caught three separate bugs, in its third form.
+
+    A folder sync discovers genuinely old mail while the consumer is still
+    walking history. If that mail entered the ledger with an arrival time
+    reconstructed from its send date, it would take a sequence at the live head
+    *and* an arrival inside the bound: the next bounded page would return it,
+    come back short, and bootstrap would finish with a cursor above the whole
+    fourteen-day window. Discovered today means arrived today, and then the
+    bounded page correctly leaves it alone."""
+    now = dt.datetime.now(dt.timezone.utc)
+    window_start = now - dt.timedelta(days=WINDOW_DAYS)
+    fresh = ["new-1", "new-2", "new-3"]
+    with db.conn() as conn:
+        for i, ews_id in enumerate(("old-1", "old-2")):
+            _msg(conn, ews_id, now - dt.timedelta(days=60 - i))
+        for i, ews_id in enumerate(fresh):
+            _msg(conn, ews_id, now - dt.timedelta(days=10 - i * 3))
+    _as_existing_history(db)
+    c = _client(db)
+
+    params = {"until": window_start.isoformat(), "limit": "1"}
+    page = c.get("/bridge/v1/messages", params=params, headers=AUTH).json()
+    assert [m["native_id"] for m in page["messages"]] == ["old-1"]
+    token = page["next"]
+
+    # …and a folder sync lands three-month-old mail, mid-walk.
+    with db.conn() as conn:
+        _msg(conn, "found-1", now - dt.timedelta(days=90))
+        _msg(conn, "found-2", now - dt.timedelta(days=80))
+
+    walked = []
+    while True:
+        params = {"until": window_start.isoformat(), "limit": "1", "since": token}
+        page = c.get("/bridge/v1/messages", params=params, headers=AUTH).json()
+        if not page["messages"]:
+            break
+        walked += [m["native_id"] for m in page["messages"]]
+        token = page["next"]
+    assert walked == ["old-2"], "mail discovered today is not history"
+
+    delivered, token = _poll(c, token, limit=2)
+    assert len(delivered) == len(set(delivered))
+    for ews_id in fresh:
+        assert delivered.count(ews_id) == 1
+    assert set(delivered) == set(fresh) | {"found-1", "found-2"}
     again, _ = _poll(c, token, limit=2)
     assert again == []

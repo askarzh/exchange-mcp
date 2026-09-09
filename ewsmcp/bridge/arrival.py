@@ -47,13 +47,17 @@ def sweep(conn) -> int:
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SWEEP_LOCK_KEY,))
     cur = conn.execute(
         "INSERT INTO ews.bridge_arrival (ews_id, seq, changekey, first_seen)"
-        # A mail whose send time is known arrived, as far as anyone can now
-        # reconstruct, when it was sent — that is what lets a bootstrap walk an
-        # existing history to its window edge instead of finding the whole
-        # store stamped 'arrived now'. One with no send time at all genuinely
-        # arrives now; there is nothing better to say about it.
+        # A mail this sweep is meeting for the first time arrived now, whatever
+        # its send date says — that is the whole reason this ledger exists,
+        # since a folder sync discovers three-week-old mail today and a cursor
+        # over the send date would step straight past it. Reconstructing an
+        # arrival from the send time is a *first migration* concern (005 does
+        # exactly that, once, for the history that was already there); doing it
+        # here as well would hand freshly discovered old mail a high sequence
+        # with an old arrival time, and a bootstrap that met one would end with
+        # its cursor above the whole ingestion window.
         " SELECT m.ews_id, nextval('ews.bridge_arrival_seq'), m.changekey,"
-        "        coalesce(to_timestamp(m.date_ts), now())"
+        "        now()"
         "   FROM ews.messages m"
         "   LEFT JOIN ews.bridge_arrival a ON a.ews_id = m.ews_id"
         "  WHERE m.deleted_at IS NULL"
@@ -65,11 +69,10 @@ def sweep(conn) -> int:
         # 005 assigns the pre-existing store's sequence with an explicit
         # row_number() instead of relying on an ORDER BY here.
         #
-        # NULLS LAST, because a mail with no send date takes first_seen =
-        # now() above and so belongs at the head of the ledger, not before
-        # five months of history. Sequenced first, it would be excluded from
-        # every bounded bootstrap page while the cursor ended far above it —
-        # behind the cursor for ever, undelivered, with no error anywhere.
+        # NULLS LAST keeps a mail with no send date at the end of the batch
+        # rather than before five months of history, which matters because
+        # `date_ts` is still what orders a batch even though it no longer sets
+        # the arrival time.
         "  ORDER BY m.date_ts NULLS LAST, m.ews_id"
         " ON CONFLICT (ews_id) DO UPDATE"
         # first_seen moves to now() together with the new seq, and the two must
