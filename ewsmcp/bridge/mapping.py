@@ -50,7 +50,7 @@ def recipients(row: dict) -> list[dict]:
     return out
 
 
-def chats_from_rows(rows: list[dict], *, limit: int) -> list[dict]:
+def chats_from_rows(rows: list[dict]) -> list[dict]:
     """Fold a page of `ews.messages` rows (most recent first) into the
     conversations they belong to.
 
@@ -84,13 +84,12 @@ def chats_from_rows(rows: list[dict], *, limit: int) -> list[dict]:
             if email:
                 convo["members"].add(email.strip().lower())
     out = []
-    for native_id in order[:limit]:
+    for native_id in order:
         convo = convos[native_id]
         count = len(convo["members"])
         out.append({
             "native_id": native_id,
-            # Same threshold mapping.chat() uses for a single row, so the
-            # two never disagree on what counts as a group.
+            # Two people or fewer is a direct conversation; more is a group.
             "kind": "group" if count > 2 else "direct",
             "name": convo["name"],
             "member_count": count,
@@ -98,19 +97,21 @@ def chats_from_rows(rows: list[dict], *, limit: int) -> list[dict]:
     return out
 
 
-def chat(row: dict) -> dict:
-    # A mail with no conversation id is its own thread. Bucketing every such
-    # mail under one nameless chat would put unrelated correspondents in one
-    # conversation, and Mindet links promises to a chat.
-    recips = recipients(row)
-    return {"native_id": row.get("conversation_id") or row["ews_id"],
-            # Zero recipients collapse into direct deliberately, since mail only
-            # uses direct and group, and a mail with genuinely no named recipients
-            # is better modelled as a message with an unknown counterpart than as
-            # an error.
-            "kind": "group" if len(recips) > 1 else "direct",
-            "name": row.get("subject") or None,
-            "member_count": len(recips) + 1}
+def chat_native_id(row: dict) -> str:
+    """Which conversation a single mail belongs to.
+
+    Only the id: `kind`, `name` and `member_count` for a conversation come from
+    `chats_from_rows`, which folds every row of a thread together. This used to
+    return a whole chat object as well, with its own (different) idea of
+    membership — one row's recipients plus the sender — and nothing ever read
+    it. Two definitions of `member_count` in one module is a bug waiting to be
+    exported, so there is now one, and it lives where the union is computed.
+
+    A mail with no conversation id is its own thread. Bucketing every such mail
+    under one nameless chat would put unrelated correspondents in one
+    conversation, and Mindet links promises to a chat.
+    """
+    return row.get("conversation_id") or row["ews_id"]
 
 
 def message(row: dict, *, owner_key: str | None = None) -> dict:
@@ -133,11 +134,18 @@ def message(row: dict, *, owner_key: str | None = None) -> dict:
 
     author_key = identity(row.get("sender_email"))
     sender_email = row.get("sender_email")
-    native_id = (sender_email or row.get("sender_name") or row["ews_id"]).strip().lower()
+    if sender_email:
+        native_id = sender_email.strip().lower()
+    elif row.get("sender_name"):
+        native_id = row["sender_name"].strip().lower()
+    else:
+        # An ews_id is case-sensitive — it is an opaque Exchange handle, not a
+        # name — so this last resort is left exactly as the store holds it.
+        native_id = row["ews_id"]
     raw = [{"type": "smtp", "value": sender_email}] if sender_email else []
     return {
         "native_id": row["ews_id"],
-        "chat": chat(row)["native_id"],
+        "chat": chat_native_id(row),
         "author": {
             "native_id": native_id,
             "key": author_key,

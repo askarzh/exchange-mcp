@@ -364,3 +364,66 @@ def test_health_reports_a_send_time_of_zero_rather_than_null(db):
     h = _client(db).get("/bridge/v1/health",
                         headers={"Authorization": "Bearer t"}).json()
     assert h["last_message_at"] == "1970-01-01T00:00:00+00:00"
+
+
+def test_a_legacy_distinguished_name_is_not_offered_as_a_contact(db):
+    """Exchange puts an `/o=…/cn=…` legacy DN in sender_email for a sender it
+    could not resolve. Minting `email:/o=…` from it would put a person on the
+    roster that no other source can ever match — spec §4: a bridge never
+    fabricates a key. mapping.identity refuses those, and this route must
+    refuse them the same way rather than build the string itself."""
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        conn.execute("UPDATE ews.messages SET sender_email=%s WHERE ews_id='m1'",
+                     ("/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=x",))
+        _msg(conn, "m2", sender_email="real@example.test")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert [c["key"] for c in r["contacts"]] == ["email:real@example.test"]
+
+
+def test_a_contacts_name_comes_from_the_most_recent_message_not_the_alphabet(db):
+    """`max(sender_name)` is a byte-wise text max, so an address that once
+    signed itself 'zzz' would keep that name for ever."""
+    with db.conn() as conn:
+        _msg(conn, "old", date_ts=1_700_000_000, sender_email="p@example.test")
+        conn.execute("UPDATE ews.messages SET sender_name='zzz old name'"
+                     " WHERE ews_id='old'")
+        _msg(conn, "new", date_ts=1_700_009_000, sender_email="p@example.test")
+        conn.execute("UPDATE ews.messages SET sender_name='aaa new name'"
+                     " WHERE ews_id='new'")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert [c["name"] for c in r["contacts"]] == ["aaa new name"]
+
+
+def test_every_conversation_the_message_stream_can_name_appears_in_chats(db):
+    """The consumer classifies a message by its chat and skips one whose chat
+    the bridge did not name — advancing its cursor past it, so the message is
+    gone for good. A `chats` capped at the 500 most recent conversations lost
+    exactly the case the arrival ledger exists for: a folder sync discovering
+    months-old mail, landing a message in a conversation whose last activity
+    is far outside the top 500."""
+    with db.conn() as conn:
+        conn.execute(
+            "INSERT INTO ews.messages (ews_id, changekey, folder_id,"
+            " conversation_id, sender_email, subject, date_ts, body_clean)"
+            " SELECT 'm' || i, 'ck', 'inbox', 'conv-' || i, 'a@example.test',"
+            "        's', 1700000000 + i, 'b' FROM generate_series(1, 520) i")
+    c = _client(db)
+    named = {x["native_id"] for x in
+             c.get("/bridge/v1/chats", headers={"Authorization": "Bearer t"}).json()["chats"]}
+    streamed = set()
+    cursor = None
+    while True:
+        params = {"limit": "500"}
+        if cursor:
+            params["since"] = cursor
+        page = c.get("/bridge/v1/messages", params=params,
+                     headers={"Authorization": "Bearer t"}).json()
+        cursor = page["next"]
+        if not page["messages"]:
+            break
+        streamed |= {m["chat"] for m in page["messages"]}
+    assert len(streamed) == 520
+    assert streamed <= named

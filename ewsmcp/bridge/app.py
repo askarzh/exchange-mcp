@@ -169,57 +169,72 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         # change constantly and this store is small enough to answer in
         # full every time, so a cursor here would be a promise the bridge
         # does not keep.
-        limit = _parse_limit(request.query_params.get("limit"))
-        # A conversation's membership is the union of every sender and
-        # recipient it has ever had (see mapping.chats_from_rows), and that
-        # cannot be decided from a window over the whole store: a single
-        # bounded scan (e.g. the most recent N rows) drops a long thread's
-        # older senders once the store outgrows the window, silently
-        # shrinking a group back to a false "direct" the same way the
-        # byte-wise max() bug did. So this is two queries — first which
-        # conversations to return, then every row of exactly those
-        # conversations, unbounded — rather than one bounded scan folded
-        # in Python.
+        #
+        # And answered in full it is — no cap, not even a large one. The
+        # consumer classifies each message by its chat and *skips* a message
+        # whose chat this route did not name, advancing its cursor past it;
+        # the message is then gone for good. A cap by recency loses exactly
+        # the case the arrival ledger exists for: a folder sync discovering
+        # months-old mail lands a message in a conversation whose last
+        # activity is far outside the most recent N. Every conversation the
+        # `messages` stream can name must appear here, so the answer is every
+        # conversation.
+        #
+        # A conversation's membership is likewise the union of every sender
+        # and recipient it has ever had (see mapping.chats_from_rows), which
+        # a bounded scan cannot decide either: it drops a long thread's older
+        # senders and silently shrinks a group back to a false "direct", the
+        # same way the byte-wise max() bug did.
         with pool.conn() as c:
-            top = c.execute(
-                "SELECT coalesce(conversation_id, ews_id) AS native_id"
+            rows = c.execute(
+                "SELECT coalesce(conversation_id, ews_id) AS native_id,"
+                " subject, sender_email, to_json"
                 " FROM ews.messages WHERE deleted_at IS NULL"
-                " GROUP BY 1 ORDER BY max(date_ts) DESC, 1 LIMIT %s",
-                (limit,)).fetchall()
-            native_ids = [r["native_id"] for r in top]
-            rows = []
-            if native_ids:
-                rows = c.execute(
-                    "SELECT coalesce(conversation_id, ews_id) AS native_id,"
-                    " subject, sender_email, to_json, date_ts, ews_id"
-                    " FROM ews.messages WHERE deleted_at IS NULL"
-                    " AND coalesce(conversation_id, ews_id) = ANY(%s)"
-                    # ews_id DESC breaks a same-second tie deterministically
-                    # (spec §3.2 does the same for the cursor, and for the
-                    # same reason): without it, which subject becomes a
-                    # conversation's `name` would depend on Postgres's
-                    # arbitrary tie order and could change between polls.
-                    " ORDER BY date_ts DESC, ews_id DESC",
-                    (native_ids,)).fetchall()
-        return JSONResponse({
-            "chats": mapping.chats_from_rows([dict(r) for r in rows], limit=limit)})
+                # Most recent first, so the first row met for a conversation
+                # carries its newest subject and the conversations come back
+                # in recency order. ews_id DESC breaks a same-second tie
+                # deterministically (spec §3.2 does the same for the cursor,
+                # and for the same reason): without it, which subject becomes
+                # a conversation's `name` would depend on Postgres's arbitrary
+                # tie order and could change between polls.
+                " ORDER BY date_ts DESC NULLS LAST, ews_id DESC").fetchall()
+        return JSONResponse({"chats": mapping.chats_from_rows([dict(r) for r in rows])})
 
     async def contacts(request: Request):
         guard(request)
         # Spec §3.4: a directory of tens of thousands of senders is never
         # dumped in full, so this list is capped at PAGE_LIMIT rather than
-        # answering with everyone mail has ever seen.
+        # answering with everyone mail has ever seen. Unlike `chats`, dropping
+        # a contact costs a roster suggestion, not a message.
         with pool.conn() as c:
             rows = c.execute(
-                "SELECT lower(sender_email) AS email, max(sender_name) AS name"
-                " FROM ews.messages"
-                " WHERE deleted_at IS NULL AND sender_email IS NOT NULL"
-                "   AND sender_email <> ''"
-                " GROUP BY lower(sender_email) ORDER BY max(date_ts) DESC LIMIT %s",
+                # DISTINCT ON takes the name from the address's most recent
+                # message. `max(sender_name)` picked it byte-wise instead —
+                # alphabetically, i.e. arbitrarily — the same class of bug as
+                # the `max(to_json)` one this branch already fixed.
+                "SELECT * FROM ("
+                "  SELECT DISTINCT ON (lower(sender_email))"
+                "         lower(sender_email) AS email, sender_name AS name,"
+                "         date_ts"
+                "    FROM ews.messages"
+                "   WHERE deleted_at IS NULL AND sender_email IS NOT NULL"
+                "     AND sender_email <> ''"
+                "   ORDER BY lower(sender_email), date_ts DESC NULLS LAST, ews_id DESC"
+                ") t ORDER BY date_ts DESC NULLS LAST LIMIT %s",
                 (PAGE_LIMIT,)).fetchall()
-        return JSONResponse({"contacts": [
-            {"native_id": r["email"], "key": f"email:{r['email']}",
-             "name": r["name"] or r["email"], "aliases": []} for r in rows]})
+        out = []
+        for r in rows:
+            # Spec §4: a bridge never fabricates a key. Exchange stores legacy
+            # distinguished names in sender_email for addresses it could not
+            # resolve, and mapping.identity refuses those on purpose; minting
+            # `email:/o=ExchangeLabs/...` here would put a phantom person on
+            # the roster that can never match the real one.
+            key = mapping.identity(r["email"])
+            if key is None:
+                continue
+            out.append({"native_id": r["email"], "key": key,
+                        "name": r["name"] or r["email"], "aliases": []})
+        return JSONResponse({"contacts": out})
 
     async def on_error(request: Request, exc: Exception):
         if isinstance(exc, _Bad):

@@ -53,11 +53,15 @@ def test_a_sender_with_no_address_keeps_its_name_and_gets_no_key():
 
 
 def test_two_recipients_make_it_a_group_and_one_makes_it_direct():
+    """A conversation's kind is decided once, by the union across its whole
+    thread — `mapping.chat()` used to decide it a second time from a single
+    row's recipients, and the two answers could differ."""
     # Real shape: to_json is a list of plain address strings.
     one = json.dumps(["owner@example.test"])
     two = json.dumps(["owner@example.test", "another@example.test"])
-    assert mapping.chat(_row(to_json=one))["kind"] == "direct"
-    assert mapping.chat(_row(to_json=two))["kind"] == "group"
+    row = {"native_id": "conv1", "subject": "s", "sender_email": "sender@example.test"}
+    assert mapping.chats_from_rows([{**row, "to_json": one}])[0]["kind"] == "direct"
+    assert mapping.chats_from_rows([{**row, "to_json": two}])[0]["kind"] == "group"
 
 
 def test_recipients_accept_both_shapes():
@@ -87,10 +91,10 @@ def test_recipients_handle_null_json():
 
 
 def test_the_chat_is_the_conversation_and_falls_back_to_the_message():
-    assert mapping.chat(_row())["native_id"] == "conv1"
+    assert mapping.chat_native_id(_row()) == "conv1"
     # a mail with no conversation id is its own thread rather than joining a
     # nameless bucket with every other such mail
-    assert mapping.chat(_row(conversation_id=None))["native_id"] == "m1"
+    assert mapping.chat_native_id(_row(conversation_id=None)) == "m1"
 
 
 def test_the_timestamp_is_rendered_from_the_epoch_not_the_stored_string():
