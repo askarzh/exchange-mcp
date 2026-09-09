@@ -24,7 +24,11 @@ def _row(**kw):
         "item_class": "IPM.Note",
         "changekey": "ck1",
         "seq": 7,
-        "first_seen": dt.datetime(2023, 11, 14, 22, 13, 20, tzinfo=dt.timezone.utc),
+        "chat_id": "conv1",
+        # `first_seen` moves on every amendment; `first_arrival` is written
+        # once. A message's fallback send time reads the one that stands still.
+        "first_seen": dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc),
+        "first_arrival": dt.datetime(2023, 11, 14, 22, 13, 20, tzinfo=dt.timezone.utc),
     }
     return base | kw
 
@@ -102,19 +106,40 @@ def test_the_timestamp_is_rendered_from_the_epoch_not_the_stored_string():
     assert m["sent_at"] == "2023-11-14T22:13:20+00:00"
 
 
-def test_timestamp_falls_back_to_first_seen_when_date_ts_is_none():
+def test_timestamp_falls_back_to_first_arrival_when_date_ts_is_none():
     """A mail whose send time couldn't be parsed falls back to when the store
-    first saw it, rather than silently using epoch."""
-    first_seen = dt.datetime(2023, 9, 15, 10, 30, 45, tzinfo=dt.timezone.utc)
-    m = mapping.message(_row(date_ts=None, first_seen=first_seen))
+    first met it, rather than silently using epoch."""
+    first_arrival = dt.datetime(2023, 9, 15, 10, 30, 45, tzinfo=dt.timezone.utc)
+    m = mapping.message(_row(date_ts=None, first_arrival=first_arrival))
     assert m["sent_at"] == "2023-09-15T10:30:45+00:00"
 
 
+def test_the_fallback_send_time_is_the_one_that_does_not_move():
+    """`first_seen` moves to now() on every amendment, because it orders the
+    arrival stream. `first_arrival` is written once. An undated draft that
+    reported the moving one appeared to have been sent a little later every
+    time the owner flagged it in Outlook."""
+    m = mapping.message(_row(date_ts=None,
+                             first_arrival=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+                             first_seen=dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)))
+    assert m["sent_at"] == "2026-01-01T00:00:00+00:00"
+
+
 def test_message_raises_when_no_timestamp_at_all():
-    """A message with neither date_ts nor first_seen has no place in a ledger
-    of deadlines."""
-    with pytest.raises(ValueError, match="has no date_ts or first_seen"):
-        mapping.message(_row(date_ts=None, first_seen=None))
+    """A message with neither date_ts nor first_arrival has no place in a
+    ledger of deadlines."""
+    with pytest.raises(ValueError, match="has no date_ts or first_arrival"):
+        mapping.message(_row(date_ts=None, first_arrival=None))
+
+
+def test_the_chat_is_the_pinned_one_not_a_fresh_coalesce():
+    """Exchange fills a conversation id in late for a draft or an unindexed
+    item. If the chat were recomputed per read, that mail would be handed over
+    under one chat and later under another — and the consumer, keying on
+    (venue, native_id), would record it twice: one mail, two directives."""
+    m = mapping.message(_row(chat_id="pinned-at-first-sight",
+                             conversation_id="the-one-exchange-learned-later"))
+    assert m["chat"] == "pinned-at-first-sight"
 
 
 def test_a_subject_with_no_body_still_carries_the_subject():

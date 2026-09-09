@@ -133,6 +133,9 @@ def test_an_amendment_takes_a_new_sequence_and_a_new_arrival_time(db):
         now_row = arrival.page(c, after_seq=None, until=None, limit=1)[0]
     assert now_row["seq"] > was["seq"]
     assert now_row["first_seen"] > was["first_seen"]
+    # …but when we first met this mail at all has not changed, and that is what
+    # an undated mail reports as its send time.
+    assert now_row["first_arrival"] == was["first_arrival"]
 
 
 def test_a_mail_with_no_send_date_is_sequenced_at_the_head_not_before_history(db):

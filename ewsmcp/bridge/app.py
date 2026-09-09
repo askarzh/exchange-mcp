@@ -220,9 +220,19 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         # same way the byte-wise max() bug did.
         with pool.conn() as c:
             rows = c.execute(
-                "SELECT coalesce(conversation_id, ews_id) AS native_id,"
-                " subject, sender_email, to_json"
-                " FROM ews.messages WHERE deleted_at IS NULL"
+                # The same pinned id `messages` hands out — from the arrival
+                # ledger, not a fresh coalesce. If the two ever disagreed,
+                # `chats` would name a conversation under one id while the
+                # message stream named it under another; the consumer would
+                # find that message's chat unknown, skip it, and advance its
+                # cursor past it. The coalesce is the fallback for a row that
+                # has not been swept yet, and applies the rule that row will be
+                # given when it is.
+                "SELECT coalesce(a.chat_id, m.conversation_id, m.ews_id) AS native_id,"
+                " m.subject, m.sender_email, m.to_json"
+                " FROM ews.messages m"
+                " LEFT JOIN ews.bridge_arrival a ON a.ews_id = m.ews_id"
+                " WHERE m.deleted_at IS NULL"
                 # Most recent first, so the first row met for a conversation
                 # carries its newest subject and the conversations come back
                 # in recency order. ews_id DESC breaks a same-second tie
@@ -230,7 +240,7 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
                 # and for the same reason): without it, which subject becomes
                 # a conversation's `name` would depend on Postgres's arbitrary
                 # tie order and could change between polls.
-                " ORDER BY date_ts DESC NULLS LAST, ews_id DESC").fetchall()
+                " ORDER BY m.date_ts DESC NULLS LAST, m.ews_id DESC").fetchall()
         return JSONResponse({"chats": mapping.chats_from_rows([dict(r) for r in rows])})
 
     async def contacts(request: Request):

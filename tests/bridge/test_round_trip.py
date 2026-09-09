@@ -301,3 +301,40 @@ def test_old_mail_discovered_mid_bootstrap_does_not_skip_the_ingestion_window(db
     assert set(delivered) == set(fresh) | {"found-1", "found-2"}
     again, _ = _poll(c, token, limit=2)
     assert again == []
+
+
+def test_a_conversation_id_learned_late_does_not_move_a_mail_to_another_chat(db):
+    """Exchange fills a conversation id in later for a draft or an unindexed
+    item. Recomputed per read, the same mail reached the consumer under one
+    chat and then, after an amendment, under another — and the consumer keys an
+    item on (venue, native_id), so the second delivery missed the first and
+    inserted a second item. One mail, two directives in the owner's morning
+    list. The chat is pinned at first sight instead.
+
+    The honest cost, asserted here too: the mail stays in a chat of its own for
+    good, apart from the thread it turned out to belong to. A stable wrong
+    grouping the owner can fix; a moving one he cannot."""
+    now = dt.datetime.now(dt.timezone.utc)
+    with db.conn() as conn:
+        conn.execute(
+            "INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id,"
+            " sender_email, subject, date_ts, body_clean)"
+            " VALUES ('draft-1','ck1','inbox',NULL,'a@example.test','s',%s,'b')",
+            (int((now - dt.timedelta(days=1)).timestamp()),))
+    c = _client(db)
+    first = c.get("/bridge/v1/messages", headers=AUTH).json()
+    assert [m["chat"] for m in first["messages"]] == ["draft-1"]
+    cursor = first["next"]
+
+    with db.conn() as conn:
+        conn.execute("UPDATE ews.messages SET conversation_id='CONV-LATE',"
+                     " changekey='ck2' WHERE ews_id='draft-1'")
+    again = c.get("/bridge/v1/messages", params={"since": cursor}, headers=AUTH).json()
+    assert [m["native_id"] for m in again["messages"]] == ["draft-1"]
+    assert [m["chat"] for m in again["messages"]] == ["draft-1"]
+
+    # and `chats` names it the same way, or the consumer would skip it as a
+    # message whose chat the bridge never mentioned
+    named = {x["native_id"] for x in
+             c.get("/bridge/v1/chats", headers=AUTH).json()["chats"]}
+    assert "draft-1" in named and "CONV-LATE" not in named

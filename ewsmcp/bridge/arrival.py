@@ -13,8 +13,8 @@ import datetime as dt
 # `internet_message_id` and `item_class` used to ride along here; no consumer
 # ever reads them, and every one of them is mail plumbing that the contract
 # deliberately does not speak.
-_COLS = ("m.ews_id, m.conversation_id, m.sender_name, m.sender_email,"
-         " m.to_json, m.subject, m.date_ts, m.body_clean")
+_COLS = ("m.ews_id, m.sender_name, m.sender_email, m.to_json, m.subject,"
+         " m.date_ts, m.body_clean")
 
 # Any 64-bit constant unique to this lane; see sweep().
 _SWEEP_LOCK_KEY = 0x6577735F73776570        # "ews_swep"
@@ -46,7 +46,8 @@ def sweep(conn) -> int:
     """
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SWEEP_LOCK_KEY,))
     cur = conn.execute(
-        "INSERT INTO ews.bridge_arrival (ews_id, seq, changekey, first_seen)"
+        "INSERT INTO ews.bridge_arrival"
+        " (ews_id, seq, changekey, first_seen, first_arrival, chat_id)"
         # A mail this sweep is meeting for the first time arrived now, whatever
         # its send date says — that is the whole reason this ledger exists,
         # since a folder sync discovers three-week-old mail today and a cursor
@@ -57,7 +58,7 @@ def sweep(conn) -> int:
         # with an old arrival time, and a bootstrap that met one would end with
         # its cursor above the whole ingestion window.
         " SELECT m.ews_id, nextval('ews.bridge_arrival_seq'), m.changekey,"
-        "        now()"
+        "        now(), now(), coalesce(m.conversation_id, m.ews_id)"
         "   FROM ews.messages m"
         "   LEFT JOIN ews.bridge_arrival a ON a.ews_id = m.ews_id"
         "  WHERE m.deleted_at IS NULL"
@@ -88,6 +89,12 @@ def sweep(conn) -> int:
         # An amendment genuinely is a new arrival; that is why it earns a new
         # sequence in the first place. Any path that moves one column without
         # the other reopens this.
+        #
+        # `first_arrival` and `chat_id` are absent on purpose and must stay
+        # absent. They answer questions an amendment does not change — when we
+        # first met this mail at all, and which chat it has always belonged to —
+        # and moving either is what made a timestamp wander and a mail change
+        # conversations behind the consumer's back.
         "   SET seq = excluded.seq, changekey = excluded.changekey,"
         "       first_seen = now(), updated_at = now()")
     return cur.rowcount
@@ -95,7 +102,13 @@ def sweep(conn) -> int:
 
 def page(conn, *, after_seq: int | None, until: dt.datetime | None,
          limit: int) -> list[dict]:
-    sql = ("SELECT " + _COLS + ", a.seq, a.first_seen FROM ews.bridge_arrival a"
+    sql = ("SELECT " + _COLS + ", a.seq, a.first_seen, a.first_arrival,"
+           # Pinned at first sight, so a conversation id Exchange learns later
+           # cannot move a mail to a different chat behind the consumer's back.
+           # The coalesce covers only a row written before migration 006, and
+           # applies the same rule that row would be given today.
+           " coalesce(a.chat_id, m.conversation_id, m.ews_id) AS chat_id"
+           " FROM ews.bridge_arrival a"
            " JOIN ews.messages m ON m.ews_id = a.ews_id"
            " WHERE m.deleted_at IS NULL")
     args: list = []

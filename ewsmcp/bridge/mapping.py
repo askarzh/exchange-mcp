@@ -98,14 +98,16 @@ def chats_from_rows(rows: list[dict]) -> list[dict]:
 
 
 def chat_native_id(row: dict) -> str:
-    """Which conversation a single mail belongs to.
+    """Which conversation a mail belongs to, from a raw `ews.messages` row.
 
-    Only the id: `kind`, `name` and `member_count` for a conversation come from
-    `chats_from_rows`, which folds every row of a thread together. This used to
-    return a whole chat object as well, with its own (different) idea of
-    membership — one row's recipients plus the sender — and nothing ever read
-    it. Two definitions of `member_count` in one module is a bug waiting to be
-    exported, so there is now one, and it lives where the union is computed.
+    This is the rule the arrival ledger applies once, at first sight, and then
+    stores in `bridge_arrival.chat_id` — it is not applied again on every read.
+    Exchange fills a conversation id in late for a draft or an unindexed item,
+    and recomputing this per read handed the same mail to the consumer under
+    one chat and later under another, which the consumer records as two items:
+    one mail, two directives in the owner's morning list. `message()` therefore
+    reads the pinned column and never calls this; `arrival.page()` names it in
+    SQL for the one case a row predates migration 006.
 
     A mail with no conversation id is its own thread. Bucketing every such mail
     under one nameless chat would put unrelated correspondents in one
@@ -121,14 +123,18 @@ def message(row: dict, *, owner_key: str | None = None) -> dict:
     # the time was unknown.
     ts = row.get("date_ts")
     if ts is None:
-        # Fall back to when the store first saw it if send time is unknown.
-        first_seen = row.get("first_seen")
-        if first_seen is None:
-            raise ValueError(f"message {row['ews_id']!r} has no date_ts or first_seen")
-        if isinstance(first_seen, str):
-            sent = dt.datetime.fromisoformat(first_seen)
+        # Fall back to when the store first met this mail at all — deliberately
+        # `first_arrival`, which is written once, and never `first_seen`, which
+        # moves to now() on every amendment. Reading the column that moves made
+        # an undated draft look as though it had been sent a little later every
+        # time the owner flagged it in Outlook.
+        first_arrival = row.get("first_arrival")
+        if first_arrival is None:
+            raise ValueError(f"message {row['ews_id']!r} has no date_ts or first_arrival")
+        if isinstance(first_arrival, str):
+            sent = dt.datetime.fromisoformat(first_arrival)
         else:
-            sent = first_seen
+            sent = first_arrival
     else:
         sent = dt.datetime.fromtimestamp(int(ts), dt.timezone.utc)
 
@@ -145,7 +151,9 @@ def message(row: dict, *, owner_key: str | None = None) -> dict:
     raw = [{"type": "smtp", "value": sender_email}] if sender_email else []
     return {
         "native_id": row["ews_id"],
-        "chat": chat_native_id(row),
+        # The pinned id from the arrival ledger, not a fresh coalesce over
+        # this row: see chat_native_id's docstring for what recomputing costs.
+        "chat": row["chat_id"],
         "author": {
             "native_id": native_id,
             "key": author_key,
