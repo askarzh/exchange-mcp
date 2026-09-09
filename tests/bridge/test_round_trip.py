@@ -180,3 +180,50 @@ def test_a_mail_with_no_send_date_reaches_the_consumer_exactly_once(db):
     assert delivered == ["new-1", "undated"]
     again, _ = _poll(c, cursor, limit=2)
     assert again == []
+
+
+def test_a_mail_amended_mid_bootstrap_does_not_skip_the_ingestion_window(db):
+    """The owner marks a 45-day-old mail as read in Outlook while Mindet is
+    still walking history. Exchange moves its changekey, the next sweep gives
+    it a sequence at the live head — and if it kept its old arrival time, the
+    next bounded page would return it, come back short, and end bootstrap with
+    a live cursor at the head. Every message in the fourteen-day window would
+    then sit below that cursor, lost for good with nothing to say so.
+
+    Driven page by page rather than through `_bootstrap`, because the whole
+    point is what happens *between* two pages of one walk."""
+    now = dt.datetime.now(dt.timezone.utc)
+    window_start = now - dt.timedelta(days=WINDOW_DAYS)
+    old = ["old-1", "old-2", "old-3"]
+    fresh = ["new-1", "new-2", "new-3"]
+    with db.conn() as conn:
+        for i, ews_id in enumerate(old):
+            _msg(conn, ews_id, now - dt.timedelta(days=60 - i))
+        for i, ews_id in enumerate(fresh):
+            _msg(conn, ews_id, now - dt.timedelta(days=10 - i * 3))
+    c = _client(db)
+
+    params = {"until": window_start.isoformat(), "limit": "2"}
+    page = c.get("/bridge/v1/messages", params=params, headers=AUTH).json()
+    assert [m["native_id"] for m in page["messages"]] == ["old-1", "old-2"]
+    token = page["next"]
+
+    # …and now Outlook touches an old mail, mid-walk.
+    with db.conn() as conn:
+        conn.execute("UPDATE ews.messages SET changekey='ck2' WHERE ews_id='old-1'")
+
+    walked = []
+    while True:
+        params = {"until": window_start.isoformat(), "limit": "2", "since": token}
+        page = c.get("/bridge/v1/messages", params=params, headers=AUTH).json()
+        if not page["messages"]:
+            break
+        walked += [m["native_id"] for m in page["messages"]]
+        token = page["next"]
+    assert walked == ["old-3"], "the amended mail arrived now, so it is not history"
+
+    delivered, token = _poll(c, token, limit=2)
+    assert sorted(delivered) == sorted(fresh + ["old-1"])
+    assert len(delivered) == len(set(delivered))
+    again, _ = _poll(c, token, limit=2)
+    assert again == []

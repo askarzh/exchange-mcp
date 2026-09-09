@@ -108,10 +108,13 @@ def test_a_mail_with_no_send_time_arrives_now(db):
     assert row["first_seen"] >= before
 
 
-def test_an_amendment_takes_a_new_sequence_but_keeps_its_arrival_time(db):
-    """A re-arrival is a new place in the stream, not a new arrival time.
-    Rewriting first_seen would drag an amended old mail forward into a window
-    it does not belong to."""
+def test_an_amendment_takes_a_new_sequence_and_a_new_arrival_time(db):
+    """`seq` and `first_seen` are one fact seen two ways, and they move
+    together or not at all. `until` filters on first_seen while paging orders
+    by seq, so a row given a sequence at the live head while keeping an arrival
+    time inside the bound makes `until` stop being a prefix of the stream — and
+    a bootstrap that meets one finishes with its cursor above the whole
+    ingestion window."""
     with db.conn() as c:
         _msg(c, "m1", date_ts=int(dt.datetime(2026, 1, 15,
                                               tzinfo=dt.timezone.utc).timestamp()))
@@ -121,7 +124,7 @@ def test_an_amendment_takes_a_new_sequence_but_keeps_its_arrival_time(db):
         arrival.sweep(c)
         now_row = arrival.page(c, after_seq=None, until=None, limit=1)[0]
     assert now_row["seq"] > was["seq"]
-    assert now_row["first_seen"] == was["first_seen"]
+    assert now_row["first_seen"] > was["first_seen"]
 
 
 def test_a_mail_with_no_send_date_is_sequenced_at_the_head_not_before_history(db):

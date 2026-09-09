@@ -72,10 +72,21 @@ def sweep(conn) -> int:
         # behind the cursor for ever, undelivered, with no error anywhere.
         "  ORDER BY m.date_ts NULLS LAST, m.ews_id"
         " ON CONFLICT (ews_id) DO UPDATE"
-        # first_seen is deliberately absent: a re-arrival earns a new sequence
-        # number, not a new arrival time. Rewriting it would drag an amended
-        # old mail forward into a window it does not belong to.
-        "   SET seq = excluded.seq, changekey = excluded.changekey, updated_at = now()")
+        # first_seen moves to now() together with the new seq, and the two must
+        # always move together. `seq` and `first_seen` are one fact seen two
+        # ways — where this message sits in the arrival stream — because
+        # `until` filters on first_seen while paging orders by seq, so the
+        # moment they disagree `until` stops being a prefix of the stream.
+        # Concretely: leave first_seen at the old send time and a mail amended
+        # while a consumer is mid-bootstrap gets a sequence at the live head
+        # and an arrival time inside the bound. The next bounded page returns
+        # it, comes back short, and bootstrap finishes with a live cursor at
+        # the head — with the whole ingestion window sitting below it, lost.
+        # An amendment genuinely is a new arrival; that is why it earns a new
+        # sequence in the first place. Any path that moves one column without
+        # the other reopens this.
+        "   SET seq = excluded.seq, changekey = excluded.changekey,"
+        "       first_seen = now(), updated_at = now()")
     return cur.rowcount
 
 
