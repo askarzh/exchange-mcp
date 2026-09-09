@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hmac
+import logging
 import time
 
 from starlette.applications import Starlette
@@ -17,6 +18,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from . import arrival, mapping
+
+logger = logging.getLogger(__name__)
 
 CONTRACT = 1
 SOURCE = "ews"
@@ -39,14 +42,28 @@ class _Bad(Exception):
 def _parse_cursor(value: str | None, gen: int) -> int | None:
     if not value:
         return None
+    # Every log line here says the shape of what arrived, never the value: a
+    # cursor is not secret, but a habit of printing whatever a caller sent is
+    # how a token or an address ends up in a log file one refactor later.
     parts = value.split(":")
     if len(parts) != 3 or parts[0] != "v1":
+        logger.warning("bridge: rejected a cursor of %d part(s), prefix %r",
+                       len(parts), parts[0][:8])
         raise _Bad(400, "bad_cursor", "cursor is not of this contract")
     try:
         cursor_gen, seq = int(parts[1]), int(parts[2])
     except ValueError:
+        logger.warning("bridge: rejected a cursor whose generation or sequence "
+                       "is not a number")
         raise _Bad(400, "bad_cursor", "cursor is not of this contract") from None
     if cursor_gen != gen:
+        # Worth an INFO rather than a warning: this is the designed signal that
+        # the store was rebuilt, and the consumer's answer to it is to
+        # bootstrap again. Seeing it once is healthy; seeing it every poll is
+        # the thing to chase.
+        logger.info("bridge: refused a cursor from generation %d; this store is "
+                    "generation %d — the consumer should bootstrap again",
+                    cursor_gen, gen)
         raise _Bad(400, "cursor_generation", "the store was rebuilt; bootstrap again")
     return seq
 
@@ -95,6 +112,12 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         # U+007F, so `Authorization: Bearer café` would 500 out of the
         # credential check instead of being refused.
         if not hmac.compare_digest(given.encode("latin-1"), token.encode()):
+            # The token itself is never logged, not even truncated, and neither
+            # is the header — only whether one was offered in the right shape.
+            # That is enough to tell a misconfigured consumer from a probe.
+            logger.warning("bridge: refused %s on %s",
+                           "a bearer token that did not match" if given
+                           else "a request with no bearer token", request.url.path)
             raise _Bad(401, "unauthorized", "bad token")
 
     async def health(request: Request):
@@ -252,8 +275,23 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
                                 status_code=exc.status)
         raise exc
 
+    async def on_server_error(request: Request, exc: Exception):
+        # Anything that is not a _Bad is a fault in this bridge, and without a
+        # line here it reaches the owner as a bare 500 in a uvicorn access log
+        # with no traceback attached to the request that caused it. Registered
+        # against Exception rather than folded into on_error above, because
+        # Starlette only ever routes _Bad to that one.
+        #
+        # The path is logged; the query string is not, because `since` and
+        # `until` are the only things in it and neither is worth the habit. The
+        # response body stays generic — a traceback belongs in the log, never
+        # in an answer to a caller.
+        logger.exception("bridge: unhandled error serving %s", request.url.path)
+        return JSONResponse({"error": {"code": "internal", "message": "internal error"}},
+                            status_code=500)
+
     return Starlette(routes=[Route("/bridge/v1/health", health),
                              Route("/bridge/v1/messages", messages),
                              Route("/bridge/v1/chats", chats),
                              Route("/bridge/v1/contacts", contacts)],
-                     exception_handlers={_Bad: on_error})
+                     exception_handlers={_Bad: on_error, Exception: on_server_error})

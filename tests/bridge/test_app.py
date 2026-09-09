@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import logging
 import time
 
 import pytest
@@ -427,3 +428,51 @@ def test_every_conversation_the_message_stream_can_name_appears_in_chats(db):
         streamed |= {m["chat"] for m in page["messages"]}
     assert len(streamed) == 520
     assert streamed <= named
+
+
+def test_a_refused_request_is_logged_without_the_token(caplog):
+    """A bridge that logs nothing leaves a misconfigured consumer looking
+    exactly like a probe. A bridge that logs the credential it refused has
+    written the credential to disk. Log the shape, never the value."""
+    app = bridge_app.build_app(None, token="a-very-secret-token")
+    c = TestClient(app)
+    with caplog.at_level(logging.WARNING, logger="ewsmcp.bridge.app"):
+        assert c.get("/bridge/v1/health",
+                     headers={"Authorization": "Bearer wrong-token"}).status_code == 401
+        assert c.get("/bridge/v1/health").status_code == 401
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "did not match" in text and "no bearer token" in text
+    assert "a-very-secret-token" not in text and "wrong-token" not in text
+
+
+def test_a_refused_cursor_is_logged_by_shape_not_by_value(db, caplog):
+    c = _client(db)
+    with caplog.at_level(logging.INFO, logger="ewsmcp.bridge.app"):
+        c.get("/bridge/v1/messages", params={"since": "garbage-cursor-value"},
+              headers={"Authorization": "Bearer t"})
+        c.get("/bridge/v1/messages", params={"since": f"v1:{_gen(db) + 1}:7"},
+              headers={"Authorization": "Bearer t"})
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "rejected a cursor of 1 part(s)" in text
+    assert "bootstrap again" in text
+    assert "garbage-cursor-value" not in text
+
+
+def test_an_unhandled_fault_is_logged_and_answered_generically(caplog):
+    """Without a handler registered against Exception, a fault in this bridge
+    reaches the owner as a bare 500 in a uvicorn access line with no traceback
+    attached to the request that caused it — and Starlette never routes a
+    non-_Bad exception to the _Bad handler, so it has to be its own."""
+    class Exploding:
+        def conn(self):
+            raise RuntimeError("the connection string is postgres://secret@host")
+
+    c = TestClient(bridge_app.build_app(Exploding(), token="t"),
+                   raise_server_exceptions=False)
+    with caplog.at_level(logging.ERROR, logger="ewsmcp.bridge.app"):
+        r = c.get("/bridge/v1/health", headers={"Authorization": "Bearer t"})
+    assert r.status_code == 500
+    assert r.json() == {"error": {"code": "internal", "message": "internal error"}}
+    assert "secret@host" not in r.text
+    assert any("unhandled error serving /bridge/v1/health" in rec.getMessage()
+               for rec in caplog.records)
