@@ -27,7 +27,7 @@ def test_004_adds_phase3_columns_and_tables_and_requeues_short_replies(db):
         requeued = {r["ews_id"] for r in c.execute(
             "SELECT ews_id FROM ews.messages WHERE embedded_at IS NULL")}
     assert requeued == {"R1"}          # short AND in a conversation
-    assert db.schema_version() == 5
+    assert db.schema_version() == 6
 
 
 def test_004_widens_archive_runs_kind_check_to_allow_gc(db):
