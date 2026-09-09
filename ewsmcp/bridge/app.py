@@ -55,7 +55,25 @@ def _parse_time(value: str | None) -> dt.datetime | None:
     return parsed
 
 
+def _parse_limit(value: str | None) -> int:
+    if value is None:
+        return PAGE_LIMIT
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise _Bad(400, "bad_request", "limit must be a whole number") from None
+    if parsed < 1:
+        raise _Bad(400, "bad_request", "limit must be at least 1")
+    return min(parsed, PAGE_LIMIT)
+
+
 def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
+    # An empty token would make `compare_digest` true against a request that
+    # sends no header at all, so a missing environment variable would quietly
+    # publish the mailbox rather than fail to start.
+    if not token:
+        raise ValueError("EWS_BRIDGE_TOKEN must not be empty")
+
     # The owner's own address, keyed the same way mapping keys everyone else,
     # so a mail he sent himself reads as his and closes the promise it makes
     # rather than being filed as if a stranger had sent it back to him.
@@ -69,8 +87,11 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
 
     async def health(request: Request):
         guard(request)
+        # Deliberately reports the mail store, not the arrival ledger: this
+        # answer never reads bridge_arrival, so sweeping here would only take
+        # write locks on every poll for no effect on the response. Don't add
+        # it back.
         with pool.conn() as c:
-            arrival.sweep(c)
             row = c.execute("SELECT max(date_ts) FROM ews.messages"
                             " WHERE deleted_at IS NULL").fetchone()
         last = row["max"] if row else None
@@ -83,7 +104,7 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
 
     async def messages(request: Request):
         guard(request)
-        limit = min(int(request.query_params.get("limit", PAGE_LIMIT)), PAGE_LIMIT)
+        limit = _parse_limit(request.query_params.get("limit"))
         until = _parse_time(request.query_params.get("until"))
         with pool.conn() as c:
             arrival.sweep(c)

@@ -1,5 +1,6 @@
 import datetime as dt
 
+import pytest
 from starlette.testclient import TestClient
 
 from ewsmcp.bridge import app as bridge_app
@@ -50,6 +51,35 @@ def test_the_terminal_page_echoes_the_cursor_it_was_given(db):
     again = c.get("/bridge/v1/messages", params={"cursor": first["next"]},
                   headers={"Authorization": "Bearer t"}).json()
     assert again["messages"] == [] and again["next"] == first["next"]
+
+
+def test_a_terminal_page_echoes_even_when_the_head_has_moved_past_it(db):
+    """Fix round 1, item 4: with one message this test cannot fail, because a
+    terminal page's `after` always equals `head(c)` — a mutant that always
+    returns `head(c)` instead of echoing `after` would still pass. Force
+    `after != head(c)` on a genuinely terminal page: seed two messages, sweep
+    (so both get a seq and `head(c)` sits on the second), then soft-delete the
+    second. A page asked from a cursor at the first message's seq now sees no
+    live rows past it — terminal — while `head(c)` still reports the deleted
+    message's seq. Only echoing `after` gets this right; jumping to
+    `head(c)` would silently skip nothing (there is nothing left to skip),
+    but it would still be answering the wrong rule."""
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        _msg(conn, "m2")
+        bridge_app.arrival.sweep(conn)
+        m1_seq = conn.execute(
+            "SELECT seq FROM ews.bridge_arrival WHERE ews_id = 'm1'").fetchone()["seq"]
+        head_seq = bridge_app.arrival.head(conn)
+        conn.execute("UPDATE ews.messages SET deleted_at = now() WHERE ews_id = 'm2'")
+    assert m1_seq != head_seq
+    c = _client(db)
+    cursor = f"v1:1:{m1_seq}"
+    r = c.get("/bridge/v1/messages", params={"cursor": cursor},
+              headers={"Authorization": "Bearer t"}).json()
+    assert r["messages"] == []
+    assert r["next"] == cursor
+    assert r["next"] != f"v1:1:{head_seq}"
 
 
 def test_a_cursor_from_another_generation_is_refused(db):
@@ -142,6 +172,48 @@ def test_a_full_page_bounded_by_until_does_not_jump_past_the_bound(db):
               headers={"Authorization": "Bearer t"}).json()
     assert [m["native_id"] for m in r["messages"]] == ["m1"]
     assert r["next"] == f"v1:1:{m1_seq}"
+
+
+def test_an_empty_token_refuses_to_build_the_app(db):
+    """Fix round 1, item 1: `hmac.compare_digest("", "")` is True, so an
+    empty configured token would make a request with no Authorization header
+    at all pass the guard and serve the mailbox. Refuse loudly at
+    construction rather than quietly at request time."""
+    with pytest.raises(ValueError, match="EWS_BRIDGE_TOKEN"):
+        bridge_app.build_app(db, token="")
+
+
+def test_a_none_token_also_refuses_to_build_the_app(db):
+    with pytest.raises(ValueError, match="EWS_BRIDGE_TOKEN"):
+        bridge_app.build_app(db, token=None)
+
+
+def test_limit_abc_is_a_400_not_a_500(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "abc"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_limit_negative_is_a_400(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "-5"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_limit_zero_is_a_400(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "0"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_limit_above_the_page_limit_is_clamped_not_refused(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "99999"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 200
 
 
 def test_a_mail_from_the_owner_reads_as_the_owners_own(db):
