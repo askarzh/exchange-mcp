@@ -138,19 +138,21 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         # change constantly and this store is small enough to answer in
         # full every time, so a cursor here would be a promise the bridge
         # does not keep.
+        #
+        # A conversation's membership is the union of every sender and
+        # recipient it has ever had, not its latest message's recipient
+        # list (see mapping.chats_from_rows). Computing that union requires
+        # every row of every conversation, not one aggregated row per
+        # conversation, so this selects raw messages — bounded generously
+        # (5000 rows is ample for this store) — and folds them in Python.
         with pool.conn() as c:
             rows = c.execute(
                 "SELECT coalesce(conversation_id, ews_id) AS native_id,"
-                " max(subject) AS name, max(to_json) AS to_json"
+                " subject, sender_email, to_json, date_ts"
                 " FROM ews.messages WHERE deleted_at IS NULL"
-                " GROUP BY coalesce(conversation_id, ews_id)"
-                " ORDER BY max(date_ts) DESC LIMIT %s", (PAGE_LIMIT,)).fetchall()
-        return JSONResponse({"chats": [
-            {"native_id": r["native_id"],
-             "kind": "group" if len(mapping.recipients(dict(r))) > 1 else "direct",
-             "name": r["name"] or None,
-             "member_count": len(mapping.recipients(dict(r))) + 1}
-            for r in rows]})
+                " ORDER BY date_ts DESC LIMIT 5000").fetchall()
+        return JSONResponse({
+            "chats": mapping.chats_from_rows([dict(r) for r in rows], limit=PAGE_LIMIT)})
 
     async def contacts(request: Request):
         guard(request)

@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 
 import pytest
 from starlette.testclient import TestClient
@@ -230,16 +231,58 @@ def test_a_mail_from_the_owner_reads_as_the_owners_own(db):
     assert by_id["from-other"]["author"]["is_owner"] is False
 
 
-def test_chats_lists_each_conversation_once_with_its_latest_time(db):
+def test_chats_membership_is_the_union_across_the_thread_not_the_latest_message(db):
+    """A naive `max(to_json)` in SQL sorts byte-wise, not by recency or
+    membership. Here the early message's single-recipient list
+    ("zzz@example.test") sorts higher than the later reply-all's two-address
+    list ("aaa@...", "bbb@...") purely because 'z' > 'a' — so `max()` would
+    pick the single-recipient list and report this thread as `direct` with
+    `member_count == 2`, even though it was genuinely a four-person
+    conversation. The union must count all four and call it a group.
+    Also covers the pre-existing rule that one conversation appears once."""
     with db.conn() as conn:
-        _msg(conn, "m1", date_ts=1_700_000_000)
-        conn.execute("UPDATE ews.messages SET conversation_id='shared' WHERE ews_id='m1'")
-        _msg(conn, "m2", date_ts=1_700_009_000)
-        conn.execute("UPDATE ews.messages SET conversation_id='shared' WHERE ews_id='m2'")
+        _msg(conn, "early", date_ts=1_700_000_000, sender_email="boss@example.test")
+        conn.execute("UPDATE ews.messages SET conversation_id='shared',"
+                     " to_json=%s WHERE ews_id='early'",
+                     (json.dumps(["zzz@example.test"]),))
+        _msg(conn, "late", date_ts=1_700_009_000, sender_email="boss@example.test")
+        conn.execute("UPDATE ews.messages SET conversation_id='shared',"
+                     " to_json=%s WHERE ews_id='late'",
+                     (json.dumps(["aaa@example.test", "bbb@example.test"]),))
     r = _client(db).get("/bridge/v1/chats",
                         headers={"Authorization": "Bearer t"}).json()
-    ids = [c["native_id"] for c in r["chats"]]
-    assert ids.count("shared") == 1
+    matches = [c for c in r["chats"] if c["native_id"] == "shared"]
+    assert len(matches) == 1
+    chat = matches[0]
+    assert chat["member_count"] == 4
+    assert chat["kind"] == "group"
+
+
+def test_a_single_recipient_conversation_is_direct_with_two_members(db):
+    with db.conn() as conn:
+        _msg(conn, "m1", sender_email="a@example.test")
+        conn.execute("UPDATE ews.messages SET to_json=%s WHERE ews_id='m1'",
+                     (json.dumps(["single@example.test"]),))
+    r = _client(db).get("/bridge/v1/chats",
+                        headers={"Authorization": "Bearer t"}).json()
+    matches = [c for c in r["chats"] if c["native_id"] == "conv-m1"]
+    assert len(matches) == 1
+    assert matches[0]["kind"] == "direct"
+    assert matches[0]["member_count"] == 2
+
+
+def test_a_malformed_to_json_does_not_fail_the_whole_page(db):
+    """One malformed recipient header must not take down the endpoint, and
+    its conversation still has to show up — with whatever membership the
+    tolerant parser could recover (here, just the sender)."""
+    with db.conn() as conn:
+        _msg(conn, "bad", sender_email="a@example.test")
+        conn.execute("UPDATE ews.messages SET to_json='not json' WHERE ews_id='bad'")
+    r = _client(db).get("/bridge/v1/chats",
+                        headers={"Authorization": "Bearer t"})
+    assert r.status_code == 200
+    ids = [c["native_id"] for c in r.json()["chats"]]
+    assert "conv-bad" in ids
 
 
 def test_contacts_are_addresses_seen_as_senders_with_their_names(db):

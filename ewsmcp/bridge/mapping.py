@@ -50,6 +50,54 @@ def recipients(row: dict) -> list[dict]:
     return out
 
 
+def chats_from_rows(rows: list[dict], *, limit: int) -> list[dict]:
+    """Fold a page of `ews.messages` rows (most recent first) into the
+    conversations they belong to.
+
+    A chat's membership is the union of every sender and recipient ever seen
+    on it, not the latest message's recipient list. `to_json` is a text
+    column, so a naive `max(to_json)` in SQL sorts byte-wise — alphabetical,
+    not by recency or membership — and a ten-person thread can come back as
+    `direct` with `member_count: 2` purely by which address happens to sort
+    last. A thread that was ever between four people stays a group
+    conversation even when somebody later replies to the sender alone, and
+    the union never flips between polls, so Mindet's chat records don't
+    churn for no reason.
+
+    `rows` is ordered most-recent-first, so the first row we meet for a
+    conversation carries its most recent subject — that becomes `name`.
+    """
+    order: list[str] = []
+    convos: dict[str, dict] = {}
+    for row in rows:
+        native_id = row["native_id"]
+        convo = convos.get(native_id)
+        if convo is None:
+            convo = {"name": row.get("subject") or None, "members": set()}
+            convos[native_id] = convo
+            order.append(native_id)
+        sender = row.get("sender_email")
+        if sender and sender.strip():
+            convo["members"].add(sender.strip().lower())
+        for r in recipients({"to_json": row.get("to_json")}):
+            email = r.get("email")
+            if email:
+                convo["members"].add(email.strip().lower())
+    out = []
+    for native_id in order[:limit]:
+        convo = convos[native_id]
+        count = len(convo["members"])
+        out.append({
+            "native_id": native_id,
+            # Same threshold mapping.chat() uses for a single row, so the
+            # two never disagree on what counts as a group.
+            "kind": "group" if count > 2 else "direct",
+            "name": convo["name"],
+            "member_count": count,
+        })
+    return out
+
+
 def chat(row: dict) -> dict:
     # A mail with no conversation id is its own thread. Bucketing every such
     # mail under one nameless chat would put unrelated correspondents in one
