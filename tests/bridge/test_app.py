@@ -48,7 +48,7 @@ def test_the_terminal_page_echoes_the_cursor_it_was_given(db):
     c = _client(db)
     first = c.get("/bridge/v1/messages", headers={"Authorization": "Bearer t"}).json()
     assert [m["native_id"] for m in first["messages"]] == ["m1"]
-    again = c.get("/bridge/v1/messages", params={"cursor": first["next"]},
+    again = c.get("/bridge/v1/messages", params={"since": first["next"]},
                   headers={"Authorization": "Bearer t"}).json()
     assert again["messages"] == [] and again["next"] == first["next"]
 
@@ -75,7 +75,7 @@ def test_a_terminal_page_echoes_even_when_the_head_has_moved_past_it(db):
     assert m1_seq != head_seq
     c = _client(db)
     cursor = f"v1:1:{m1_seq}"
-    r = c.get("/bridge/v1/messages", params={"cursor": cursor},
+    r = c.get("/bridge/v1/messages", params={"since": cursor},
               headers={"Authorization": "Bearer t"}).json()
     assert r["messages"] == []
     assert r["next"] == cursor
@@ -87,7 +87,7 @@ def test_a_cursor_from_another_generation_is_refused(db):
     silently skip whatever now sits below that number; 400 makes Mindet
     bootstrap instead of going quietly blind."""
     c = _client(db)
-    r = c.get("/bridge/v1/messages", params={"cursor": "v1:99:0"},
+    r = c.get("/bridge/v1/messages", params={"since": "v1:99:0"},
               headers={"Authorization": "Bearer t"})
     assert r.status_code == 400
 
@@ -95,7 +95,7 @@ def test_a_cursor_from_another_generation_is_refused(db):
 def test_a_malformed_cursor_is_refused_rather_than_treated_as_the_beginning(db):
     c = _client(db)
     for bad in ("nonsense", "v1:1", "v2:1:0", "v1:x:1"):
-        assert c.get("/bridge/v1/messages", params={"cursor": bad},
+        assert c.get("/bridge/v1/messages", params={"since": bad},
                      headers={"Authorization": "Bearer t"}).status_code == 400
 
 
@@ -228,3 +228,37 @@ def test_a_mail_from_the_owner_reads_as_the_owners_own(db):
     by_id = {m["native_id"]: m for m in r["messages"]}
     assert by_id["from-owner"]["author"]["is_owner"] is True
     assert by_id["from-other"]["author"]["is_owner"] is False
+
+
+def test_chats_lists_each_conversation_once_with_its_latest_time(db):
+    with db.conn() as conn:
+        _msg(conn, "m1", date_ts=1_700_000_000)
+        conn.execute("UPDATE ews.messages SET conversation_id='shared' WHERE ews_id='m1'")
+        _msg(conn, "m2", date_ts=1_700_009_000)
+        conn.execute("UPDATE ews.messages SET conversation_id='shared' WHERE ews_id='m2'")
+    r = _client(db).get("/bridge/v1/chats",
+                        headers={"Authorization": "Bearer t"}).json()
+    ids = [c["native_id"] for c in r["chats"]]
+    assert ids.count("shared") == 1
+
+
+def test_contacts_are_addresses_seen_as_senders_with_their_names(db):
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        conn.execute("UPDATE ews.messages SET sender_email='Boss@Example.TEST',"
+                     " sender_name='the boss' WHERE ews_id='m1'")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    one = [c for c in r["contacts"] if c["key"] == "email:boss@example.test"]
+    assert len(one) == 1 and one[0]["name"] == "the boss"
+
+
+def test_a_sender_with_no_address_is_not_offered_as_a_contact(db):
+    """A contact with no key cannot be matched to anyone, and a roster
+    candidate nobody can identify is noise the owner has to dismiss."""
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        conn.execute("UPDATE ews.messages SET sender_email=NULL WHERE ews_id='m1'")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert r["contacts"] == []

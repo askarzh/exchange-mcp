@@ -62,7 +62,7 @@ def chat(row: dict) -> dict:
             # an error.
             "kind": "group" if len(recips) > 1 else "direct",
             "name": row.get("subject") or None,
-            "participants": len(recips) + 1}
+            "member_count": len(recips) + 1}
 
 
 def message(row: dict, *, owner_key: str | None = None) -> dict:
@@ -89,7 +89,7 @@ def message(row: dict, *, owner_key: str | None = None) -> dict:
     raw = [{"type": "smtp", "value": sender_email}] if sender_email else []
     return {
         "native_id": row["ews_id"],
-        "chat": {"native_id": chat(row)["native_id"]},
+        "chat": chat(row)["native_id"],
         "author": {
             "native_id": native_id,
             "key": author_key,
@@ -98,9 +98,9 @@ def message(row: dict, *, owner_key: str | None = None) -> dict:
             "is_owner": bool(owner_key) and author_key == owner_key,
         },
         "sent_at": sent.isoformat(),
-        # Mail says a great deal in the subject alone; an empty body would hide
+        # Mail says a great deal in the subject alone; an empty text would hide
         # the whole message from triage and from search.
-        "body": row.get("body_clean") or row.get("subject") or "",
-        "item_type": "mail",
-        "media": [],
+        "text": row.get("body_clean") or row.get("subject") or "",
+        "kind": "mail",
+        "files": [],
     }

@@ -117,9 +117,9 @@ def test_a_subject_with_no_body_still_carries_the_subject():
     """Mail routinely says everything in the subject line. An empty body would
     otherwise make the message invisible to triage and to search."""
     m = mapping.message(_row(body_clean="", subject="approve the invoice"))
-    assert m["body"] == "approve the invoice"
+    assert m["text"] == "approve the invoice"
     m = mapping.message(_row(body_clean="a body", subject="approve the invoice"))
-    assert m["body"] == "a body"
+    assert m["text"] == "a body"
 
 
 def test_author_raw_field_holds_smtp_address():

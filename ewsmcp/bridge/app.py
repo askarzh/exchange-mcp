@@ -20,7 +20,7 @@ from . import arrival, mapping
 CONTRACT = 1
 SOURCE = "ews"
 CAPABILITIES = ["messages", "chats", "contacts"]
-PAGE_LIMIT = 200
+PAGE_LIMIT = 500
 
 
 class _Bad(Exception):
@@ -109,7 +109,7 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         with pool.conn() as c:
             arrival.sweep(c)
             gen = arrival.generation(c)
-            after = _parse_cursor(request.query_params.get("cursor"), gen)
+            after = _parse_cursor(request.query_params.get("since"), gen)
             rows = arrival.page(c, after_seq=after, until=until, limit=limit)
             # Spec §3.2: an empty page still has to say where to resume, and
             # the terminal page echoes the cursor it was given rather than
@@ -130,8 +130,44 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
                 seq = after if after is not None else arrival.head(c)
             return JSONResponse({
                 "messages": [mapping.message(r, owner_key=owner_key) for r in rows],
-                "chats": [mapping.chat(r) for r in rows],
                 "next": f"v1:{gen}:{seq}"})
+
+    async def chats(request: Request):
+        guard(request)
+        # `since` is accepted and ignored (spec §3.4): mail conversations
+        # change constantly and this store is small enough to answer in
+        # full every time, so a cursor here would be a promise the bridge
+        # does not keep.
+        with pool.conn() as c:
+            rows = c.execute(
+                "SELECT coalesce(conversation_id, ews_id) AS native_id,"
+                " max(subject) AS name, max(to_json) AS to_json"
+                " FROM ews.messages WHERE deleted_at IS NULL"
+                " GROUP BY coalesce(conversation_id, ews_id)"
+                " ORDER BY max(date_ts) DESC LIMIT %s", (PAGE_LIMIT,)).fetchall()
+        return JSONResponse({"chats": [
+            {"native_id": r["native_id"],
+             "kind": "group" if len(mapping.recipients(dict(r))) > 1 else "direct",
+             "name": r["name"] or None,
+             "member_count": len(mapping.recipients(dict(r))) + 1}
+            for r in rows]})
+
+    async def contacts(request: Request):
+        guard(request)
+        # Spec §3.4: a directory of tens of thousands of senders is never
+        # dumped in full, so this list is capped at PAGE_LIMIT rather than
+        # answering with everyone mail has ever seen.
+        with pool.conn() as c:
+            rows = c.execute(
+                "SELECT lower(sender_email) AS email, max(sender_name) AS name"
+                " FROM ews.messages"
+                " WHERE deleted_at IS NULL AND sender_email IS NOT NULL"
+                "   AND sender_email <> ''"
+                " GROUP BY lower(sender_email) ORDER BY max(date_ts) DESC LIMIT %s",
+                (PAGE_LIMIT,)).fetchall()
+        return JSONResponse({"contacts": [
+            {"native_id": r["email"], "key": f"email:{r['email']}",
+             "name": r["name"] or r["email"], "aliases": []} for r in rows]})
 
     async def on_error(request: Request, exc: Exception):
         if isinstance(exc, _Bad):
@@ -140,5 +176,7 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
         raise exc
 
     return Starlette(routes=[Route("/bridge/v1/health", health),
-                             Route("/bridge/v1/messages", messages)],
+                             Route("/bridge/v1/messages", messages),
+                             Route("/bridge/v1/chats", chats),
+                             Route("/bridge/v1/contacts", contacts)],
                      exception_handlers={_Bad: on_error})
