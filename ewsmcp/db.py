@@ -103,18 +103,21 @@ class Database:
                 f"database schema is v{have}; this build needs v{expected}. "
                 "Start ewsd once to migrate.")
 
-    def reapply_last_migration_for_tests(self) -> None:
-        """Delete the newest schema_migrations row and re-run `migrate()`.
+    def reapply_migration_for_tests(self, version: int) -> None:
+        """Delete one migration's `schema_migrations` row and re-run `migrate()`.
 
         Test-only: lets a test exercise a migration's data-shaping statements
         (e.g. the Phase 3 re-queue UPDATE) against rows it has already
         inserted, on top of a DB that `migrate()` already brought fully
         current. Every migration must be idempotent (IF NOT EXISTS, etc.) for
         this re-application to be safe.
+
+        The version is named rather than taken as the newest, because a test
+        that means "migration 004" must keep meaning that after a later
+        migration lands — the alternative fails quietly, by exercising the
+        wrong statements and asserting nothing about the ones it meant.
         """
         with self.conn() as c:
-            c.execute(
-                f"DELETE FROM {SCHEMA}.schema_migrations WHERE version = "
-                f"(SELECT MAX(version) FROM {SCHEMA}.schema_migrations)"
-            )
+            c.execute(f"DELETE FROM {SCHEMA}.schema_migrations WHERE version = %s",
+                      (version,))
         self.migrate()

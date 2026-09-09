@@ -13,7 +13,8 @@ def _msg(conn, ews_id, *, changekey="ck1", date_ts=1_700_000_000, folder="inbox"
 
 def test_sweep_assigns_one_sequence_per_message_and_is_idempotent(db):
     with db.conn() as c:
-        _msg(c, "m1"); _msg(c, "m2")  # noqa: E702
+        _msg(c, "m1")
+        _msg(c, "m2")
         assert arrival.sweep(c) == 2
         assert arrival.sweep(c) == 0
         seqs = [r["seq"] for r in arrival.page(c, after_seq=None, until=None, limit=10)]
