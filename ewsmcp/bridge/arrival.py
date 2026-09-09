@@ -44,7 +44,7 @@ def sweep(conn) -> int:
 
 def page(conn, *, after_seq: int | None, until: dt.datetime | None,
          limit: int) -> list[dict]:
-    sql = ("SELECT " + _COLS + ", a.seq FROM ews.bridge_arrival a"
+    sql = ("SELECT " + _COLS + ", a.seq, a.first_seen FROM ews.bridge_arrival a"
            " JOIN ews.messages m ON m.ews_id = a.ews_id"
            " WHERE m.deleted_at IS NULL")
     args: list = []
