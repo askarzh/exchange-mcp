@@ -64,7 +64,13 @@ def sweep(conn) -> int:
         # strong hint rather than a guarantee — which is exactly why migration
         # 005 assigns the pre-existing store's sequence with an explicit
         # row_number() instead of relying on an ORDER BY here.
-        "  ORDER BY m.date_ts NULLS FIRST, m.ews_id"
+        #
+        # NULLS LAST, because a mail with no send date takes first_seen =
+        # now() above and so belongs at the head of the ledger, not before
+        # five months of history. Sequenced first, it would be excluded from
+        # every bounded bootstrap page while the cursor ended far above it —
+        # behind the cursor for ever, undelivered, with no error anywhere.
+        "  ORDER BY m.date_ts NULLS LAST, m.ews_id"
         " ON CONFLICT (ews_id) DO UPDATE"
         # first_seen is deliberately absent: a re-arrival earns a new sequence
         # number, not a new arrival time. Rewriting it would drag an amended

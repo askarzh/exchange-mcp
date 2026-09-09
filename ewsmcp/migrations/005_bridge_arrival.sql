@@ -26,11 +26,18 @@ CREATE SEQUENCE IF NOT EXISTS ews.bridge_arrival_seq;
 -- the consumer's bootstrap keeps the last sequence a bounded page returned,
 -- and anything in the window sitting below that number is lost for good.
 --
+-- NULLS LAST, not FIRST. A mail with no send date — Exchange writes those for
+-- drafts, calendar notices and headers it could not parse — takes first_seen =
+-- now(), so it arrives at the head of the ledger and its sequence has to sit
+-- there too. Sequenced at the front instead, it would be excluded from every
+-- bounded bootstrap page (its arrival is now, not before the window) while the
+-- bootstrap cursor ended far above it, leaving it behind the cursor for ever.
+--
 -- Guarded on an empty ledger so this is a first-migration backfill and nothing
 -- else; once rows exist, sweep() owns every later arrival.
 INSERT INTO ews.bridge_arrival (ews_id, seq, changekey, first_seen)
 SELECT m.ews_id,
-       row_number() OVER (ORDER BY m.date_ts NULLS FIRST, m.ews_id),
+       row_number() OVER (ORDER BY m.date_ts NULLS LAST, m.ews_id),
        m.changekey,
        coalesce(to_timestamp(m.date_ts), now())
   FROM ews.messages m

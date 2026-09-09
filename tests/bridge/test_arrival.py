@@ -124,6 +124,26 @@ def test_an_amendment_takes_a_new_sequence_but_keeps_its_arrival_time(db):
     assert now_row["first_seen"] == was["first_seen"]
 
 
+def test_a_mail_with_no_send_date_is_sequenced_at_the_head_not_before_history(db):
+    """Exchange writes a null date_ts for drafts, calendar notices and headers
+    it could not parse. Such a mail arrives now, so it must be sequenced now.
+    Ordered NULLS FIRST it took seq 1 while carrying first_seen = now(): every
+    bounded bootstrap page excluded it (its arrival is after the window edge)
+    and the bootstrap cursor ended far above it, so it sat behind the cursor
+    for ever, undelivered, with no error anywhere."""
+    with db.conn() as c:
+        for i, month in enumerate((1, 3, 6)):
+            _msg(c, f"dated-{i}", date_ts=int(
+                dt.datetime(2026, month, 15, tzinfo=dt.timezone.utc).timestamp()))
+        c.execute(
+            "INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id,"
+            " sender_email, subject, date_ts, body_clean)"
+            " VALUES ('undated','ck','inbox','conv-undated','a@example.test','s',NULL,'b')")
+        arrival.sweep(c)
+        rows = arrival.page(c, after_seq=None, until=None, limit=10)
+    assert [r["ews_id"] for r in rows] == ["dated-0", "dated-1", "dated-2", "undated"]
+
+
 def test_the_first_migration_backfills_arrival_from_send_time_in_send_order(db):
     """The other half of the same rule, for the store that already exists when
     migration 005 lands. The sequence is assigned there with an explicit

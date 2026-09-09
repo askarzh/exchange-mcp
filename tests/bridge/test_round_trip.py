@@ -151,3 +151,32 @@ def test_a_store_with_no_mail_older_than_the_window_still_delivers_all_of_it(db)
     assert delivered == ["new-1", "new-2", "new-3"]
     again, _ = _poll(c, cursor, limit=2)
     assert again == []
+
+
+def test_a_mail_with_no_send_date_reaches_the_consumer_exactly_once(db):
+    """Exchange writes a null `date_ts` for drafts, calendar notices and
+    headers it could not parse. Such a mail arrives now, so bootstrap must
+    leave it alone and the live poll must deliver it. Sequenced before all of
+    history instead — which is what `NULLS FIRST` did — it carried an arrival
+    time of now(), so every bounded page excluded it while the bootstrap cursor
+    ended far above its sequence: behind the cursor for ever, with no error."""
+    now = dt.datetime.now(dt.timezone.utc)
+    window_start = now - dt.timedelta(days=WINDOW_DAYS)
+    with db.conn() as conn:
+        _msg(conn, "old-1", now - dt.timedelta(days=200))
+        _msg(conn, "old-2", now - dt.timedelta(days=100))
+        _msg(conn, "new-1", now - dt.timedelta(days=5))
+        conn.execute(
+            "INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id,"
+            " sender_email, subject, date_ts, body_clean)"
+            " VALUES ('undated','ck1','inbox','conv-undated','a@example.test','s',"
+            " NULL,'b')")
+    c = _client(db)
+
+    cursor, walked = _bootstrap(c, window_start, limit=2)
+    assert walked == ["old-1", "old-2"]
+
+    delivered, cursor = _poll(c, cursor, limit=2)
+    assert delivered == ["new-1", "undated"]
+    again, _ = _poll(c, cursor, limit=2)
+    assert again == []
