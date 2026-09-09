@@ -45,8 +45,20 @@ SELECT setval('ews.bridge_arrival_seq',
 -- must invalidate every cursor Mindet holds rather than let it resume in the
 -- middle of a renumbered stream, so the generation is bumped and old cursors
 -- are refused with 400.
+--
+-- It is drawn at random when this table is first created rather than fixed at
+-- 1, which is the whole point: a rebuilt volume comes back with seq restarting
+-- at 1, and a constant generation would make Mindet's stored cursor
+-- `v1:1:2417` *valid* against a ledger that has 40 rows in it. Every poll
+-- would return an empty page, the 400-and-re-bootstrap path would never fire,
+-- and mail would stop for ever with no error anywhere. A random generation is
+-- stable across restarts of this store (the row survives) and differs for a
+-- store that was rebuilt.
 CREATE TABLE IF NOT EXISTS ews.bridge_meta (
-  id         int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-  generation bigint NOT NULL DEFAULT 1
+  id         int PRIMARY KEY CHECK (id = 1),
+  generation bigint NOT NULL
 );
-INSERT INTO ews.bridge_meta (id, generation) VALUES (1, 1) ON CONFLICT DO NOTHING;
+INSERT INTO ews.bridge_meta (id, generation)
+VALUES (1, ('x' || substr(md5(random()::text || clock_timestamp()::text),
+                          1, 15))::bit(60)::bigint)
+ON CONFLICT DO NOTHING;

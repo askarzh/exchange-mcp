@@ -11,6 +11,15 @@ def _client(db, **kw):
     return TestClient(bridge_app.build_app(db, token="t", **kw))
 
 
+def _gen(db):
+    """This store's cursor generation. It is drawn at random when the ledger is
+    created, so a test that wants a valid cursor has to ask for it rather than
+    assume 1 — which is the point: a constant would make a cursor from a
+    long-gone store look valid against a rebuilt one."""
+    with db.conn() as c:
+        return bridge_app.arrival.generation(c)
+
+
 def _msg(conn, ews_id, *, date_ts=1_700_000_000, sender_email="a@example.test"):
     conn.execute(
         "INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id,"
@@ -75,12 +84,12 @@ def test_a_terminal_page_echoes_even_when_the_head_has_moved_past_it(db):
         conn.execute("UPDATE ews.messages SET deleted_at = now() WHERE ews_id = 'm2'")
     assert m1_seq != head_seq
     c = _client(db)
-    cursor = f"v1:1:{m1_seq}"
+    cursor = f"v1:{_gen(db)}:{m1_seq}"
     r = c.get("/bridge/v1/messages", params={"since": cursor},
               headers={"Authorization": "Bearer t"}).json()
     assert r["messages"] == []
     assert r["next"] == cursor
-    assert r["next"] != f"v1:1:{head_seq}"
+    assert r["next"] != f"v1:{_gen(db)}:{head_seq}"
 
 
 def test_a_cursor_from_another_generation_is_refused(db):
@@ -88,7 +97,7 @@ def test_a_cursor_from_another_generation_is_refused(db):
     silently skip whatever now sits below that number; 400 makes Mindet
     bootstrap instead of going quietly blind."""
     c = _client(db)
-    r = c.get("/bridge/v1/messages", params={"since": "v1:99:0"},
+    r = c.get("/bridge/v1/messages", params={"since": f"v1:{_gen(db) + 1}:0"},
               headers={"Authorization": "Bearer t"})
     assert r.status_code == 400
 
@@ -146,7 +155,7 @@ def test_a_full_page_bounded_by_until_does_not_jump_past_the_bound(db):
               params={"until": "2026-06-01T00:00:00+00:00", "limit": "1"},
               headers={"Authorization": "Bearer t"}).json()
     assert [m["native_id"] for m in r["messages"]] == ["m1"]
-    assert r["next"] == f"v1:1:{m1_seq}"
+    assert r["next"] == f"v1:{_gen(db)}:{m1_seq}"
 
 
 def test_an_empty_token_refuses_to_build_the_app(db):

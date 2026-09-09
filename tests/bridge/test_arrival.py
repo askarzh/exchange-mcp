@@ -147,3 +147,21 @@ def test_the_first_migration_backfills_arrival_from_send_time_in_send_order(db):
         arrival.sweep(c)
         after = arrival.page(c, after_seq=rows[-1]["seq"], until=None, limit=10)
         assert [r["ews_id"] for r in after] == ["m3"]
+
+
+def test_the_cursor_generation_is_this_stores_own_and_survives_a_restart(db):
+    """A rebuilt volume comes back with seq restarting at 1. With the
+    generation fixed at 1, Mindet's stored `v1:1:2417` would be *accepted*
+    against a ledger holding forty rows: every poll empty, the
+    400-and-re-bootstrap path never firing, mail stopped for good with no
+    error anywhere."""
+    with db.conn() as c:
+        first = arrival.generation(c)
+    assert first != 1
+    db.migrate()                                            # a restart re-migrates
+    with db.conn() as c:
+        assert arrival.generation(c) == first
+        c.execute("DROP TABLE ews.bridge_meta")             # the volume was rebuilt
+    db.reapply_migration_for_tests(5)
+    with db.conn() as c:
+        assert arrival.generation(c) != first
