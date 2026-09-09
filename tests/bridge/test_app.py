@@ -1,0 +1,478 @@
+import datetime as dt
+import json
+import logging
+import time
+
+import pytest
+from starlette.testclient import TestClient
+
+from ewsmcp.bridge import app as bridge_app
+
+
+def _client(db, **kw):
+    return TestClient(bridge_app.build_app(db, token="t", **kw))
+
+
+def _gen(db):
+    """This store's cursor generation. It is drawn at random when the ledger is
+    created, so a test that wants a valid cursor has to ask for it rather than
+    assume 1 — which is the point: a constant would make a cursor from a
+    long-gone store look valid against a rebuilt one."""
+    with db.conn() as c:
+        return bridge_app.arrival.generation(c)
+
+
+def _msg(conn, ews_id, *, date_ts=1_700_000_000, sender_email="a@example.test"):
+    conn.execute(
+        "INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id,"
+        " sender_email, subject, date_ts, body_clean)"
+        " VALUES (%s,'ck','inbox',%s,%s,'s',%s,'b')",
+        (ews_id, "conv-" + ews_id, sender_email, date_ts))
+
+
+def test_health_declares_version_one_and_no_send(db):
+    r = _client(db).get("/bridge/v1/health", headers={"Authorization": "Bearer t"})
+    assert r.status_code == 200
+    h = r.json()
+    assert h["contract"] == 1 and h["source"] == "ews"
+    assert "send" not in h["capabilities"] and "login" not in h["capabilities"]
+    assert h["auth"] == "ok"
+
+
+def test_a_wrong_token_is_refused_everywhere(db):
+    c = _client(db)
+    for path in ("/bridge/v1/health", "/bridge/v1/messages"):
+        assert c.get(path, headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert c.get(path).status_code == 401
+
+
+def test_an_empty_page_still_carries_a_cursor_to_come_back_with(db):
+    """Spec §3.2. A page with no messages must still say where to resume, or a
+    quiet mailbox makes Mindet start from the beginning on every poll."""
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", headers={"Authorization": "Bearer t"}).json()
+    assert r["messages"] == [] and r["next"]
+
+
+def test_the_terminal_page_echoes_the_cursor_it_was_given(db):
+    with db.conn() as conn:
+        _msg(conn, "m1")
+    c = _client(db)
+    first = c.get("/bridge/v1/messages", headers={"Authorization": "Bearer t"}).json()
+    assert [m["native_id"] for m in first["messages"]] == ["m1"]
+    again = c.get("/bridge/v1/messages", params={"since": first["next"]},
+                  headers={"Authorization": "Bearer t"}).json()
+    assert again["messages"] == [] and again["next"] == first["next"]
+
+
+def test_a_terminal_page_echoes_even_when_the_head_has_moved_past_it(db):
+    """Fix round 1, item 4: with one message this test cannot fail, because a
+    terminal page's `after` always equals `head(c)` — a mutant that always
+    returns `head(c)` instead of echoing `after` would still pass. Force
+    `after != head(c)` on a genuinely terminal page: seed two messages, sweep
+    (so both get a seq and `head(c)` sits on the second), then soft-delete the
+    second. A page asked from a cursor at the first message's seq now sees no
+    live rows past it — terminal — while `head(c)` still reports the deleted
+    message's seq. Only echoing `after` gets this right; jumping to
+    `head(c)` would silently skip nothing (there is nothing left to skip),
+    but it would still be answering the wrong rule."""
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        _msg(conn, "m2")
+        bridge_app.arrival.sweep(conn)
+        m1_seq = conn.execute(
+            "SELECT seq FROM ews.bridge_arrival WHERE ews_id = 'm1'").fetchone()["seq"]
+        head_seq = bridge_app.arrival.head(conn)
+        conn.execute("UPDATE ews.messages SET deleted_at = now() WHERE ews_id = 'm2'")
+    assert m1_seq != head_seq
+    c = _client(db)
+    cursor = f"v1:{_gen(db)}:{m1_seq}"
+    r = c.get("/bridge/v1/messages", params={"since": cursor},
+              headers={"Authorization": "Bearer t"}).json()
+    assert r["messages"] == []
+    assert r["next"] == cursor
+    assert r["next"] != f"v1:{_gen(db)}:{head_seq}"
+
+
+def test_a_cursor_from_another_generation_is_refused(db):
+    """Rebuilding the ledger renumbers everything. Accepting an old cursor would
+    silently skip whatever now sits below that number; 400 makes Mindet
+    bootstrap instead of going quietly blind."""
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"since": f"v1:{_gen(db) + 1}:0"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_a_malformed_cursor_is_refused_rather_than_treated_as_the_beginning(db):
+    c = _client(db)
+    for bad in ("nonsense", "v1:1", "v2:1:0", "v1:x:1"):
+        assert c.get("/bridge/v1/messages", params={"since": bad},
+                     headers={"Authorization": "Bearer t"}).status_code == 400
+
+
+def test_until_is_accepted_without_since(db):
+    """`until` bounds by arrival time (spec §3.2, task-1's arrival.page), not
+    by send time. `first_seen` defaults to now() on insert, so bounding it
+    requires setting first_seen explicitly after sweep — the brief's own test
+    used send-time reasoning and would not exercise the real rule."""
+    with db.conn() as conn:
+        _msg(conn, "early", date_ts=1_700_000_000)
+        bridge_app.arrival.sweep(conn)
+        _msg(conn, "late", date_ts=1_700_009_000)
+        bridge_app.arrival.sweep(conn)
+        conn.execute("UPDATE ews.bridge_arrival SET first_seen = %s WHERE ews_id = %s",
+                    (dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), "early"))
+        conn.execute("UPDATE ews.bridge_arrival SET first_seen = %s WHERE ews_id = %s",
+                    (dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc), "late"))
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"until": "2026-03-01T00:00:00+00:00"},
+              headers={"Authorization": "Bearer t"}).json()
+    assert [m["native_id"] for m in r["messages"]] == ["early"]
+
+
+def test_until_without_a_timezone_is_refused(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"until": "2026-03-01T00:00:00"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_a_full_page_bounded_by_until_does_not_jump_past_the_bound(db):
+    """The opposite side of the same rule: when `until` did not cut the page
+    short (a full page came back), there is more inside the bound still to
+    fetch, so `next` stays the last returned row's seq rather than jumping
+    to the live head."""
+    with db.conn() as conn:
+        _msg(conn, "m1", date_ts=1_700_000_000)
+        _msg(conn, "m2", date_ts=1_700_000_100)
+        bridge_app.arrival.sweep(conn)
+        conn.execute(
+            "UPDATE ews.bridge_arrival SET first_seen = %s",
+            (dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),))
+        m1_seq = conn.execute(
+            "SELECT seq FROM ews.bridge_arrival WHERE ews_id = 'm1'").fetchone()["seq"]
+    c = _client(db)
+    r = c.get("/bridge/v1/messages",
+              params={"until": "2026-06-01T00:00:00+00:00", "limit": "1"},
+              headers={"Authorization": "Bearer t"}).json()
+    assert [m["native_id"] for m in r["messages"]] == ["m1"]
+    assert r["next"] == f"v1:{_gen(db)}:{m1_seq}"
+
+
+def test_an_empty_token_refuses_to_build_the_app(db):
+    """Fix round 1, item 1: `hmac.compare_digest("", "")` is True, so an
+    empty configured token would make a request with no Authorization header
+    at all pass the guard and serve the mailbox. Refuse loudly at
+    construction rather than quietly at request time."""
+    with pytest.raises(ValueError, match="EWS_BRIDGE_TOKEN"):
+        bridge_app.build_app(db, token="")
+
+
+def test_a_none_token_also_refuses_to_build_the_app(db):
+    with pytest.raises(ValueError, match="EWS_BRIDGE_TOKEN"):
+        bridge_app.build_app(db, token=None)
+
+
+def test_limit_abc_is_a_400_not_a_500(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "abc"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_limit_negative_is_a_400(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "-5"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_limit_zero_is_a_400(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "0"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 400
+
+
+def test_limit_above_the_page_limit_is_clamped_not_refused(db):
+    c = _client(db)
+    r = c.get("/bridge/v1/messages", params={"limit": "99999"},
+              headers={"Authorization": "Bearer t"})
+    assert r.status_code == 200
+
+
+def test_a_mail_from_the_owner_reads_as_the_owners_own(db):
+    """Correction 2: mapping.message now takes an owner key. Without it, a
+    mail the owner sent himself would read as someone else's, and Mindet
+    would never close the promise it makes."""
+    with db.conn() as conn:
+        _msg(conn, "from-owner", sender_email="owner@example.test")
+        _msg(conn, "from-other", sender_email="other@example.test")
+    c = _client(db, owner_email="owner@example.test")
+    r = c.get("/bridge/v1/messages", headers={"Authorization": "Bearer t"}).json()
+    by_id = {m["native_id"]: m for m in r["messages"]}
+    assert by_id["from-owner"]["author"]["is_owner"] is True
+    assert by_id["from-other"]["author"]["is_owner"] is False
+
+
+def test_chats_membership_is_the_union_across_the_thread_not_the_latest_message(db):
+    """A naive `max(to_json)` in SQL sorts byte-wise, not by recency or
+    membership. Here the early message's single-recipient list
+    ("zzz@example.test") sorts higher than the later reply-all's two-address
+    list ("aaa@...", "bbb@...") purely because 'z' > 'a' — so `max()` would
+    pick the single-recipient list and report this thread as `direct` with
+    `member_count == 2`, even though it was genuinely a four-person
+    conversation. The union must count all four and call it a group.
+    Also covers the pre-existing rule that one conversation appears once."""
+    with db.conn() as conn:
+        _msg(conn, "early", date_ts=1_700_000_000, sender_email="boss@example.test")
+        conn.execute("UPDATE ews.messages SET conversation_id='shared',"
+                     " to_json=%s WHERE ews_id='early'",
+                     (json.dumps(["zzz@example.test"]),))
+        _msg(conn, "late", date_ts=1_700_009_000, sender_email="boss@example.test")
+        conn.execute("UPDATE ews.messages SET conversation_id='shared',"
+                     " to_json=%s WHERE ews_id='late'",
+                     (json.dumps(["aaa@example.test", "bbb@example.test"]),))
+    r = _client(db).get("/bridge/v1/chats",
+                        headers={"Authorization": "Bearer t"}).json()
+    matches = [c for c in r["chats"] if c["native_id"] == "shared"]
+    assert len(matches) == 1
+    chat = matches[0]
+    assert chat["member_count"] == 4
+    assert chat["kind"] == "group"
+
+
+def test_a_single_recipient_conversation_is_direct_with_two_members(db):
+    with db.conn() as conn:
+        _msg(conn, "m1", sender_email="a@example.test")
+        conn.execute("UPDATE ews.messages SET to_json=%s WHERE ews_id='m1'",
+                     (json.dumps(["single@example.test"]),))
+    r = _client(db).get("/bridge/v1/chats",
+                        headers={"Authorization": "Bearer t"}).json()
+    matches = [c for c in r["chats"] if c["native_id"] == "conv-m1"]
+    assert len(matches) == 1
+    assert matches[0]["kind"] == "direct"
+    assert matches[0]["member_count"] == 2
+
+
+def test_a_malformed_to_json_does_not_fail_the_whole_page(db):
+    """One malformed recipient header must not take down the endpoint, and
+    its conversation still has to show up — with whatever membership the
+    tolerant parser could recover (here, just the sender)."""
+    with db.conn() as conn:
+        _msg(conn, "bad", sender_email="a@example.test")
+        conn.execute("UPDATE ews.messages SET to_json='not json' WHERE ews_id='bad'")
+    r = _client(db).get("/bridge/v1/chats",
+                        headers={"Authorization": "Bearer t"})
+    assert r.status_code == 200
+    ids = [c["native_id"] for c in r.json()["chats"]]
+    assert "conv-bad" in ids
+
+
+def test_a_same_second_tie_on_name_breaks_by_ews_id_and_stays_stable(db):
+    """Two messages in one conversation sharing a `date_ts` (rapid replies
+    are ordinary) with no tiebreaker would let Postgres pick either subject
+    for `name`, and it could differ between polls. `ews_id DESC` makes the
+    choice deterministic — always the higher native id — and repeated calls
+    must agree."""
+    with db.conn() as conn:
+        _msg(conn, "aaa", date_ts=1_700_000_000)
+        conn.execute("UPDATE ews.messages SET conversation_id='tie',"
+                     " subject='from aaa' WHERE ews_id='aaa'")
+        _msg(conn, "zzz", date_ts=1_700_000_000)
+        conn.execute("UPDATE ews.messages SET conversation_id='tie',"
+                     " subject='from zzz' WHERE ews_id='zzz'")
+    c = _client(db)
+    names = set()
+    for _ in range(3):
+        r = c.get("/bridge/v1/chats", headers={"Authorization": "Bearer t"}).json()
+        names.add(next(x["name"] for x in r["chats"] if x["native_id"] == "tie"))
+    assert names == {"from zzz"}
+
+
+def test_contacts_are_addresses_seen_as_senders_with_their_names(db):
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        conn.execute("UPDATE ews.messages SET sender_email='Boss@Example.TEST',"
+                     " sender_name='the boss' WHERE ews_id='m1'")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    one = [c for c in r["contacts"] if c["key"] == "email:boss@example.test"]
+    assert len(one) == 1 and one[0]["name"] == "the boss"
+
+
+def test_a_sender_with_no_address_is_not_offered_as_a_contact(db):
+    """A contact with no key cannot be matched to anyone, and a roster
+    candidate nobody can identify is noise the owner has to dismiss."""
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        conn.execute("UPDATE ews.messages SET sender_email=NULL WHERE ews_id='m1'")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert r["contacts"] == []
+
+
+def test_a_non_ascii_token_is_refused_and_not_a_500(db):
+    """Starlette decodes headers as latin-1 and `hmac.compare_digest` raises
+    TypeError on a str with a character above U+007F, so a header of
+    `Bearer café` used to come back as a 500 from inside the credential
+    check. A bad token is a 401, whatever bytes it is made of."""
+    c = _client(db)
+    # Sent as bytes because httpx will not encode a non-ASCII header itself;
+    # latin-1 is what a real client's bytes look like on the wire and what
+    # Starlette decodes them back with.
+    r = c.get("/bridge/v1/health",
+              headers={"Authorization": "Bearer café".encode("latin-1")})
+    assert r.status_code == 401
+
+
+def test_health_is_connected_when_the_store_synced_recently(db):
+    with db.conn() as conn:
+        conn.execute("INSERT INTO ews.sync_state (key, token, as_of)"
+                     " VALUES ('item:inbox', 'tok', %s)", (int(time.time()) - 30,))
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["connected"] is True and h["detail"] is None and h["since"]
+
+
+def test_health_is_disconnected_when_the_store_has_gone_stale(db):
+    """Postgres answering says the bridge can read a store, not that the store
+    is alive. If `ewsd` died a week ago the mailbox is frozen — and Mindet
+    gates its whole tick on `connected`, so claiming true here would let the
+    mail source read as healthy while nothing arrived."""
+    with db.conn() as conn:
+        conn.execute("INSERT INTO ews.sync_state (key, token, as_of)"
+                     " VALUES ('item:inbox', 'tok', %s)",
+                     (int(time.time()) - 7 * 24 * 3600,))
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["connected"] is False and "synced" in h["detail"]
+
+
+def test_health_on_a_store_that_never_synced_is_not_connected(db):
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["connected"] is False and h["detail"] == "the mail store has never synced"
+
+
+def test_health_reports_a_send_time_of_zero_rather_than_null(db):
+    """`max(date_ts)` came back under the key `max` and was tested for truth,
+    so an epoch-zero send time — which the store really does hold for a mail
+    whose header would not parse — reported no last message at all."""
+    with db.conn() as conn:
+        _msg(conn, "m1", date_ts=0)
+    h = _client(db).get("/bridge/v1/health",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert h["last_message_at"] == "1970-01-01T00:00:00+00:00"
+
+
+def test_a_legacy_distinguished_name_is_not_offered_as_a_contact(db):
+    """Exchange puts an `/o=…/cn=…` legacy DN in sender_email for a sender it
+    could not resolve. Minting `email:/o=…` from it would put a person on the
+    roster that no other source can ever match — spec §4: a bridge never
+    fabricates a key. mapping.identity refuses those, and this route must
+    refuse them the same way rather than build the string itself."""
+    with db.conn() as conn:
+        _msg(conn, "m1")
+        conn.execute("UPDATE ews.messages SET sender_email=%s WHERE ews_id='m1'",
+                     ("/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=x",))
+        _msg(conn, "m2", sender_email="real@example.test")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert [c["key"] for c in r["contacts"]] == ["email:real@example.test"]
+
+
+def test_a_contacts_name_comes_from_the_most_recent_message_not_the_alphabet(db):
+    """`max(sender_name)` is a byte-wise text max, so an address that once
+    signed itself 'zzz' would keep that name for ever."""
+    with db.conn() as conn:
+        _msg(conn, "old", date_ts=1_700_000_000, sender_email="p@example.test")
+        conn.execute("UPDATE ews.messages SET sender_name='zzz old name'"
+                     " WHERE ews_id='old'")
+        _msg(conn, "new", date_ts=1_700_009_000, sender_email="p@example.test")
+        conn.execute("UPDATE ews.messages SET sender_name='aaa new name'"
+                     " WHERE ews_id='new'")
+    r = _client(db).get("/bridge/v1/contacts",
+                        headers={"Authorization": "Bearer t"}).json()
+    assert [c["name"] for c in r["contacts"]] == ["aaa new name"]
+
+
+def test_every_conversation_the_message_stream_can_name_appears_in_chats(db):
+    """The consumer classifies a message by its chat and skips one whose chat
+    the bridge did not name — advancing its cursor past it, so the message is
+    gone for good. A `chats` capped at the 500 most recent conversations lost
+    exactly the case the arrival ledger exists for: a folder sync discovering
+    months-old mail, landing a message in a conversation whose last activity
+    is far outside the top 500."""
+    with db.conn() as conn:
+        conn.execute(
+            "INSERT INTO ews.messages (ews_id, changekey, folder_id,"
+            " conversation_id, sender_email, subject, date_ts, body_clean)"
+            " SELECT 'm' || i, 'ck', 'inbox', 'conv-' || i, 'a@example.test',"
+            "        's', 1700000000 + i, 'b' FROM generate_series(1, 520) i")
+    c = _client(db)
+    named = {x["native_id"] for x in
+             c.get("/bridge/v1/chats", headers={"Authorization": "Bearer t"}).json()["chats"]}
+    streamed = set()
+    cursor = None
+    while True:
+        params = {"limit": "500"}
+        if cursor:
+            params["since"] = cursor
+        page = c.get("/bridge/v1/messages", params=params,
+                     headers={"Authorization": "Bearer t"}).json()
+        cursor = page["next"]
+        if not page["messages"]:
+            break
+        streamed |= {m["chat"] for m in page["messages"]}
+    assert len(streamed) == 520
+    assert streamed <= named
+
+
+def test_a_refused_request_is_logged_without_the_token(caplog):
+    """A bridge that logs nothing leaves a misconfigured consumer looking
+    exactly like a probe. A bridge that logs the credential it refused has
+    written the credential to disk. Log the shape, never the value."""
+    app = bridge_app.build_app(None, token="a-very-secret-token")
+    c = TestClient(app)
+    with caplog.at_level(logging.WARNING, logger="ewsmcp.bridge.app"):
+        assert c.get("/bridge/v1/health",
+                     headers={"Authorization": "Bearer wrong-token"}).status_code == 401
+        assert c.get("/bridge/v1/health").status_code == 401
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "did not match" in text and "no bearer token" in text
+    assert "a-very-secret-token" not in text and "wrong-token" not in text
+
+
+def test_a_refused_cursor_is_logged_by_shape_not_by_value(db, caplog):
+    c = _client(db)
+    with caplog.at_level(logging.INFO, logger="ewsmcp.bridge.app"):
+        c.get("/bridge/v1/messages", params={"since": "garbage-cursor-value"},
+              headers={"Authorization": "Bearer t"})
+        c.get("/bridge/v1/messages", params={"since": f"v1:{_gen(db) + 1}:7"},
+              headers={"Authorization": "Bearer t"})
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "rejected a cursor of 1 part(s)" in text
+    assert "bootstrap again" in text
+    assert "garbage-cursor-value" not in text
+
+
+def test_an_unhandled_fault_is_logged_and_answered_generically(caplog):
+    """Without a handler registered against Exception, a fault in this bridge
+    reaches the owner as a bare 500 in a uvicorn access line with no traceback
+    attached to the request that caused it — and Starlette never routes a
+    non-_Bad exception to the _Bad handler, so it has to be its own."""
+    class Exploding:
+        def conn(self):
+            raise RuntimeError("the connection string is postgres://secret@host")
+
+    c = TestClient(bridge_app.build_app(Exploding(), token="t"),
+                   raise_server_exceptions=False)
+    with caplog.at_level(logging.ERROR, logger="ewsmcp.bridge.app"):
+        r = c.get("/bridge/v1/health", headers={"Authorization": "Bearer t"})
+    assert r.status_code == 500
+    assert r.json() == {"error": {"code": "internal", "message": "internal error"}}
+    assert "secret@host" not in r.text
+    assert any("unhandled error serving /bridge/v1/health" in rec.getMessage()
+               for rec in caplog.records)

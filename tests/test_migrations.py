@@ -15,7 +15,7 @@ def test_004_adds_phase3_columns_and_tables_and_requeues_short_replies(db):
         make_row("S1", conv=None, body="short", date_ts=3000),
     ])
     store.mark_embedded(["P1", "R1", "S1"])
-    db.reapply_last_migration_for_tests()
+    db.reapply_migration_for_tests(4)
     with db.conn() as c:
         cols = {r["column_name"] for r in c.execute(
             "SELECT column_name FROM information_schema.columns "
@@ -27,7 +27,7 @@ def test_004_adds_phase3_columns_and_tables_and_requeues_short_replies(db):
         requeued = {r["ews_id"] for r in c.execute(
             "SELECT ews_id FROM ews.messages WHERE embedded_at IS NULL")}
     assert requeued == {"R1"}          # short AND in a conversation
-    assert db.schema_version() == 4
+    assert db.schema_version() == 6
 
 
 def test_004_widens_archive_runs_kind_check_to_allow_gc(db):
