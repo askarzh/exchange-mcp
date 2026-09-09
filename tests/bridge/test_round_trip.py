@@ -126,3 +126,28 @@ def test_an_amended_mail_reaches_a_consumer_holding_a_live_cursor_once(db):
     assert delivered == ["new-1"]
     again, _ = _poll(c, cursor, limit=500)
     assert again == []
+
+
+def test_a_store_with_no_mail_older_than_the_window_still_delivers_all_of_it(db):
+    """A fresh mailbox, a store pruned to the window, or a re-bootstrap after a
+    `400 cursor_generation` against a rebuilt store holding only recent mail.
+    Bootstrap's very first bounded page is empty — there is no history to walk —
+    and if an empty page hands back the live head rather than the cursor it was
+    given, the live cursor lands past everything and not one in-window message
+    is ever delivered. Every other test here seeds old mail, so every other test
+    is blind to it."""
+    now = dt.datetime.now(dt.timezone.utc)
+    window_start = now - dt.timedelta(days=WINDOW_DAYS)
+    with db.conn() as conn:
+        _msg(conn, "new-1", now - dt.timedelta(days=9))
+        _msg(conn, "new-2", now - dt.timedelta(days=4))
+        _msg(conn, "new-3", now - dt.timedelta(minutes=20))
+    c = _client(db)
+
+    cursor, walked = _bootstrap(c, window_start, limit=2)
+    assert walked == []                       # there is no history to walk
+
+    delivered, cursor = _poll(c, cursor, limit=2)
+    assert delivered == ["new-1", "new-2", "new-3"]
+    again, _ = _poll(c, cursor, limit=2)
+    assert again == []

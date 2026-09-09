@@ -155,10 +155,20 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
             # head on the last bounded page would carry the consumer straight
             # past every message inside the window, for ever, with no error
             # anywhere. So: the last row returned, or the cursor we were given.
+            #
+            # And when there was no cursor, that is zero — never the head. A
+            # page that returned nothing has not carried the consumer
+            # anywhere, so the cursor must stay where it was, and for a
+            # consumer that has never asked before "where it was" is the
+            # beginning. Handing back the head instead loses a store with no
+            # mail older than the window — a fresh mailbox, a store pruned to
+            # the window, a re-bootstrap against a rebuilt one — because its
+            # first bounded page is empty and every in-window message then
+            # sits below the cursor for good.
             if rows:
                 seq = rows[-1]["seq"]
             else:
-                seq = after if after is not None else arrival.head(c)
+                seq = after if after is not None else 0
             return JSONResponse({
                 "messages": [mapping.message(r, owner_key=owner_key) for r in rows],
                 "next": f"v1:{gen}:{seq}"})
