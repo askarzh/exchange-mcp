@@ -116,6 +116,45 @@ def chat_native_id(row: dict) -> str:
     return row.get("conversation_id") or row["ews_id"]
 
 
+# Exchange says what an item is in its class. These are the schedule classes as
+# the owner's own mailbox holds them; the list is not exhaustive and cannot be,
+# so anything else under IPM.Schedule.Meeting is still reported as a meeting —
+# reading an unknown cancellation as ordinary mail is how one goes unnoticed.
+_MEETING_CLASSES = {
+    "IPM.Schedule.Meeting.Request": {"kind": "invitation"},
+    "IPM.Schedule.Meeting.Resp.Pos": {"kind": "reply", "response": "accepted"},
+    "IPM.Schedule.Meeting.Resp.Neg": {"kind": "reply", "response": "declined"},
+    "IPM.Schedule.Meeting.Resp.Tent": {"kind": "reply", "response": "tentative"},
+    "IPM.Schedule.Meeting.Canceled": {"kind": "cancellation"},
+    "IPM.Schedule.Meeting.Notification.Forward": {"kind": "forwarded"},
+}
+_MEETING_PREFIX = "IPM.Schedule.Meeting"
+
+
+def _meeting(item_class: str | None) -> dict | None:
+    """What kind of calendar item this is, in plain words, or None for mail."""
+    if not isinstance(item_class, str) or not item_class.startswith(_MEETING_PREFIX):
+        return None
+    known = _MEETING_CLASSES.get(item_class)
+    return dict(known) if known else {"kind": "other", "class": item_class}
+
+
+def _text(row: dict, meeting: dict | None) -> str:
+    """What the item says. An invitation's body is usually empty and its subject
+    is the whole message, so for a meeting the subject leads and the body
+    follows — unless the body already opens with it, which Exchange's own
+    cancellation notices do."""
+    body = (row.get("body_clean") or "").strip()
+    subject = (row.get("subject") or "").strip()
+    if not meeting:
+        return row.get("body_clean") or row.get("subject") or ""
+    if not body:
+        return subject
+    if not subject or body.startswith(subject):
+        return body
+    return f"{subject}\n\n{body}"
+
+
 def message(row: dict, *, owner_key: str | None = None) -> dict:
     # Prefer date_ts; fall back to first_seen when a mail's send time couldn't
     # be parsed. A message with no timestamp at all is not something a ledger
@@ -138,6 +177,7 @@ def message(row: dict, *, owner_key: str | None = None) -> dict:
     else:
         sent = dt.datetime.fromtimestamp(int(ts), dt.timezone.utc)
 
+    meeting = _meeting(row.get("item_class"))
     author_key = identity(row.get("sender_email"))
     sender_email = row.get("sender_email")
     if sender_email:
@@ -164,7 +204,12 @@ def message(row: dict, *, owner_key: str | None = None) -> dict:
         "sent_at": sent.isoformat(),
         # Mail says a great deal in the subject alone; an empty text would hide
         # the whole message from triage and from search.
-        "text": row.get("body_clean") or row.get("subject") or "",
+        "text": _text(row, meeting),
         "kind": "mail",
         "files": [],
+        # What this item is, when it is not simply mail. The owner's calendar
+        # arrives in his mailbox — invitations, every reply to them, and
+        # cancellations — and handed over unmarked they read as ordinary
+        # messages, with a meeting's own subject usually the only thing said.
+        "meta": {"meeting": meeting} if meeting else {},
     }
