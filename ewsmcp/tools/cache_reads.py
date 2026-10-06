@@ -406,6 +406,8 @@ async def overview(ctx: Context, horizon_days: int) -> dict[str, Any] | None:
             "subject": r["subject"],
             "start": r["start_iso"],
             "end": r["end_iso"],
+            # an all-day boundary is stored as a bare date (row_from_event)
+            **({"all_day": True} if r["start_iso"] and "T" not in r["start_iso"] else {}),
             **({"location": r["location"]} if r["location"] else {}),
             **({"recurring": True} if r["is_recurring"] else {}),
         } for r in event_rows]

@@ -39,7 +39,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -107,6 +107,16 @@ def _ts(dt: Any) -> int | None:
         return int(dt.timestamp())
     except (AttributeError, OSError, OverflowError, ValueError, TypeError):
         return None
+
+
+def _event_ts(value: Any, tz: str) -> int | None:
+    """An all-day boundary is a bare date (EWSDate): no clock, no timestamp().
+    Anchor it at midnight in EWS_TZ so the row keeps epoch bounds — without
+    them events_window's range test drops every all-day event."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return int(datetime(value.year, value.month, value.day,
+                            tzinfo=ZoneInfo(tz)).timestamp())
+    return _ts(value)
 
 
 BODY_FETCH_CHUNK = 100
@@ -229,9 +239,9 @@ def row_from_event(item: Any, tz: str) -> dict[str, Any]:
         "ews_id": str(getattr(item, "id", "") or ""),
         "changekey": getattr(item, "changekey", None),
         "subject": getattr(item, "subject", "") or "",
-        "start_ts": _ts(getattr(item, "start", None)),
+        "start_ts": _event_ts(getattr(item, "start", None), tz),
         "start_iso": fmt_dt(getattr(item, "start", None), tz),
-        "end_ts": _ts(getattr(item, "end", None)),
+        "end_ts": _event_ts(getattr(item, "end", None), tz),
         "end_iso": fmt_dt(getattr(item, "end", None), tz),
         "location": str(getattr(item, "location", None) or "") or None,
         "organizer": getattr(organizer, "email_address", None),

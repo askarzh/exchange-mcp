@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -10,7 +10,7 @@ from conftest import FakeGateway, make_settings
 from exchangelib import FileAttachment
 
 from ewsmcp.cache.store import CacheStore
-from ewsmcp.cache.sync import SyncEngine, row_from_message
+from ewsmcp.cache.sync import SyncEngine, row_from_event, row_from_message
 
 TZ = ZoneInfo("Asia/Riyadh")
 NOW = datetime(2026, 7, 10, 9, 0, tzinfo=TZ)
@@ -611,3 +611,22 @@ def test_status_reports_what_the_deletes_did(db):
     asyncio.run(engine._cycle())
     st = engine.status()
     assert st["dropped"] == 1 and st["tombstoned"] == 1
+
+
+def test_row_from_event_keeps_an_all_day_event_in_the_window():
+    """All-day boundaries are EWSDate (no clock, no timestamp()). The row must
+    still carry epoch bounds — midnight in EWS_TZ — or events_window's
+    start_ts/end_ts comparison silently drops every all-day event from the
+    mirror-served overview (upstream PR #140, mirror half)."""
+    tz = "Asia/Almaty"
+    item = SimpleNamespace(
+        id="RAW-AD", changekey="CK", subject="Vacation",
+        start=date(2026, 8, 5), end=date(2026, 8, 8), is_all_day=True,
+        location=None, organizer=None, is_recurring=False, recurrence=None,
+        my_response_type=None)
+    row = row_from_event(item, tz)
+    midnight = lambda d: int(datetime(d.year, d.month, d.day,
+                                      tzinfo=ZoneInfo(tz)).timestamp())
+    assert row["start_ts"] == midnight(date(2026, 8, 5))
+    assert row["end_ts"] == midnight(date(2026, 8, 8))
+    assert row["start_iso"] == "2026-08-05" and row["end_iso"] == "2026-08-08"

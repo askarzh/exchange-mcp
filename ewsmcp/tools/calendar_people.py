@@ -100,6 +100,16 @@ def merge_busy_and_find_slots(
     return slots
 
 
+def _as_tz(value: Optional[datetime], tz: Any) -> Optional[datetime]:
+    """Free/busy CalendarEvents arrive NAIVE, rendered in the timezone the
+    request carried. Re-attach it (never shift it): left naive, fmt_dt reads
+    them as the host's zone (UTC in the container) and slot finding cannot
+    compare them with the aware window."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=tz)
+
+
 # -------------------------------------------------------------- handlers
 
 
@@ -187,6 +197,8 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
     if int(duration_minutes) <= 0:
         raise ToolError("validation", "'duration_minutes' must be positive.")
     start_dt, end_dt = _window(start, end, tz)
+    ews_tz = ctx.gateway.ews_tz(tz)  # get_free_busy_info reads tzinfo.ms_id
+    start_dt, end_dt = start_dt.astimezone(ews_tz), end_dt.astimezone(ews_tz)
     requests = [(email, "Required", False) for email in emails]
 
     def work(account: Any) -> List[Any]:
@@ -208,8 +220,8 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
         entries: List[Dict[str, Any]] = []
         blocks: List[Tuple[datetime, datetime]] = []
         for ev in getattr(view, "calendar_events", None) or []:
-            ev_start = getattr(ev, "start", None)
-            ev_end = getattr(ev, "end", None)
+            ev_start = _as_tz(getattr(ev, "start", None), ews_tz)
+            ev_end = _as_tz(getattr(ev, "end", None), ews_tz)
             if ev_start is None or ev_end is None:
                 continue
             status = str(getattr(ev, "busy_type", None) or "Busy")

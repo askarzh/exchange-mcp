@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from _pg import ThrowawayPostgres
 
 from ewsmcp.confirm import reset_consumed_tokens
+from ewsmcp.gateway.client import EWSGateway
 from ewsmcp.tools.base import reset_send_rate_window
 from ewsmcp.tools.writes import reset_idempotency_store
 
@@ -92,6 +93,10 @@ class FakeGateway:
             raise AssertionError("EWS was contacted — the mirror path failed")
         self.calls += 1
         return fn(self.account)
+
+    @staticmethod
+    def ews_tz(name):
+        return EWSGateway.ews_tz(name)  # the real conversion — it is pure
 
     def resolve_folder(self, account, ref, aliaser):
         if self.raise_on_call:

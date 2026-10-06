@@ -116,6 +116,25 @@ def test_overview_pure_mirror(tmp_path, db):
     assert res["today_events"][0]["subject"] == "Standup"
 
 
+def test_overview_marks_an_all_day_mirror_event(tmp_path, db):
+    """The mirror stores an all-day boundary as a bare date; the overview card
+    must say the event is all-day, matching the live event_card (PR #140)."""
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    now = int(time.time())
+    ctx.cache.replace_events([{  # after _ctx: seeded_store writes its own events
+        "ews_id": "EV-AD", "changekey": None, "subject": "Public holiday",
+        "start_ts": now - 3600, "start_iso": "2026-07-10",
+        "end_ts": now + 3600, "end_iso": "2026-07-11",
+        "location": None, "organizer": None, "is_recurring": 0,
+        "my_response": None,
+    }])
+    res = _run(ctx, "get_mailbox_overview")
+    assert res["source"] == "cache"
+    holiday = res["today_events"][0]
+    assert holiday["subject"] == "Public holiday"
+    assert holiday["start"] == "2026-07-10" and holiday["all_day"] is True
+
+
 def test_list_folders_from_mirror(tmp_path, db):
     ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "list_folders")
