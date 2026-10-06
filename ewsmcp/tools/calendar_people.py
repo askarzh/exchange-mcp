@@ -100,6 +100,16 @@ def merge_busy_and_find_slots(
     return slots
 
 
+def _as_tz(value: Optional[datetime], tz: Any) -> Optional[datetime]:
+    """Free/busy CalendarEvents arrive NAIVE, rendered in the timezone the
+    request carried. Re-attach it (never shift it): left naive, fmt_dt reads
+    them as the host's zone (UTC in the container) and slot finding cannot
+    compare them with the aware window."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=tz)
+
+
 # -------------------------------------------------------------- handlers
 
 
@@ -187,11 +197,20 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
     if int(duration_minutes) <= 0:
         raise ToolError("validation", "'duration_minutes' must be positive.")
     start_dt, end_dt = _window(start, end, tz)
+    # Ask Exchange in UTC. get_free_busy_info sends the window's zone by its
+    # Windows id (tzinfo.ms_id, so it must be an EWSTimeZone) and the SERVER
+    # resolves that id with its own definition. A stale one is real: Almaty
+    # moved to UTC+5 in 2024, and Exchange still defines Central Asia Standard
+    # Time as UTC+6, which pushed every busy block an hour late. UTC cannot
+    # drift. The window itself stays in EWS_TZ (IANA data), where working
+    # hours and slots are computed.
+    utc = ctx.gateway.ews_tz("UTC")
     requests = [(email, "Required", False) for email in emails]
 
     def work(account: Any) -> List[Any]:
         return list(account.protocol.get_free_busy_info(
-            accounts=requests, start=start_dt, end=end_dt))
+            accounts=requests, start=start_dt.astimezone(utc),
+            end=end_dt.astimezone(utc)))
 
     views = await ctx.gateway.call(work)
     per_attendee: Dict[str, Any] = {}
@@ -208,8 +227,8 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
         entries: List[Dict[str, Any]] = []
         blocks: List[Tuple[datetime, datetime]] = []
         for ev in getattr(view, "calendar_events", None) or []:
-            ev_start = getattr(ev, "start", None)
-            ev_end = getattr(ev, "end", None)
+            ev_start = _as_tz(getattr(ev, "start", None), utc)
+            ev_end = _as_tz(getattr(ev, "end", None), utc)
             if ev_start is None or ev_end is None:
                 continue
             status = str(getattr(ev, "busy_type", None) or "Busy")

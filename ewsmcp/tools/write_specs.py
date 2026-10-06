@@ -146,15 +146,18 @@ SPECS: List[ToolSpec] = [
     ToolSpec(
         name="update_messages",
         description=(
-            "Bulk-update up to 50 messages: set_read and/or categories_add/"
-            "categories_remove. Per-item failures are isolated and reported. "
-            "There is no follow-up-flag support in this backend — use "
-            "categories_add (e.g. ['Follow up']) as the visible marker."
+            "Bulk-update up to 50 messages: set_read, categories_add/"
+            "categories_remove and/or flag_complete. Per-item failures are "
+            "isolated and reported. flag_complete=true marks a follow-up flag "
+            "complete; false reopens a completed one. Neither raises a flag on "
+            "mail that has none — find flagged mail with "
+            "search_messages(flag='flagged')."
         ),
         side_effect_class="write",
         input_schema=_obj({
             "ids": _IDS, "set_read": _BOOL,
             "categories_add": _EMAILS, "categories_remove": _EMAILS,
+            "flag_complete": _BOOL,
         }, required=["ids"]),
         handler=_unbound,
         confirm=False,

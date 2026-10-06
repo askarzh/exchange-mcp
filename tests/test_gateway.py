@@ -61,3 +61,16 @@ def test_reset_survives_close_and_clear_failures(monkeypatch):
     account.protocol.close.side_effect = OSError("socket gone")
     gw.reset()  # must not raise
     assert gw._account is None
+
+
+def test_the_gateway_registers_the_follow_up_flag_property():
+    """PidTagFlagStatus (0x1090) is not a first-class exchangelib 5.0.3
+    field; the daemon registers it as an extended property so sync, fetch
+    and save can use ``flag_status`` (upstream PR #146). Registration lives
+    in the gateway because the thin MCP must not import exchangelib."""
+    from exchangelib import Message
+
+    import ewsmcp.gateway.client  # noqa: F401 - registration is an import side effect
+    field = Message.get_field_by_fieldname("flag_status")
+    prop = field.value_cls
+    assert prop.property_tag == 0x1090 and prop.property_type == "Integer"

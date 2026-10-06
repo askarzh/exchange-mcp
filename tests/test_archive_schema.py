@@ -19,9 +19,18 @@ def _indexes(db, table):
     return {r["indexname"]: r["indexdef"] for r in rows}
 
 
-def test_schema_version_is_six(db):
-    assert SCHEMA_VERSION == 6
-    assert db.schema_version() == 6
+def test_schema_version_is_seven(db):
+    assert SCHEMA_VERSION == 7
+    assert db.schema_version() == 7
+
+
+def test_007_mirrors_the_follow_up_flag(db):
+    with db.conn() as c:
+        col = c.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = 'ews' AND table_name = 'messages' "
+            "AND column_name = 'flag_status'").fetchone()
+    assert col is not None and col["data_type"] == "smallint"
 
 
 def test_vector_extension_is_installed(db):

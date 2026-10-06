@@ -116,6 +116,46 @@ def test_overview_pure_mirror(tmp_path, db):
     assert res["today_events"][0]["subject"] == "Standup"
 
 
+def test_overview_marks_an_all_day_mirror_event(tmp_path, db):
+    """The mirror stores an all-day boundary as a bare date; the overview card
+    must say the event is all-day, matching the live event_card (PR #140)."""
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    now = int(time.time())
+    ctx.cache.replace_events([{  # after _ctx: seeded_store writes its own events
+        "ews_id": "EV-AD", "changekey": None, "subject": "Public holiday",
+        "start_ts": now - 3600, "start_iso": "2026-07-10",
+        "end_ts": now + 3600, "end_iso": "2026-07-11",
+        "location": None, "organizer": None, "is_recurring": 0,
+        "my_response": None,
+    }])
+    res = _run(ctx, "get_mailbox_overview")
+    assert res["source"] == "cache"
+    holiday = res["today_events"][0]
+    assert holiday["subject"] == "Public holiday"
+    assert holiday["start"] == "2026-07-10" and holiday["all_day"] is True
+
+
+def test_search_filters_on_the_mirrored_follow_up_flag(tmp_path, db):
+    """search_messages is mirror-only, so the flag filter runs in Postgres:
+    'flagged' = still open, 'complete' = marked done (upstream PR #146,
+    adapted — 'not complete' alone could not find what is still open)."""
+    ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
+    from conftest import make_row
+    ctx.cache.upsert_messages([
+        make_row("RAW-OPEN", subject="Contract follow-up", flag_status=2),
+        make_row("RAW-DONE", subject="Invoice follow-up", flag_status=1),
+    ])
+    flagged = _run(ctx, "search_messages", flag="flagged")
+    complete = _run(ctx, "search_messages", flag="complete")
+    assert [m["subject"] for m in flagged["items"]] == ["Contract follow-up"]
+    assert flagged["items"][0]["flag"] == "flagged"
+    assert [m["subject"] for m in complete["items"]] == ["Invoice follow-up"]
+    assert complete["items"][0]["flag"] == "complete"
+    assert flagged["total_available"] == 1
+    plain = _run(ctx, "search_messages", query="budget")["items"]
+    assert all("flag" not in m for m in plain)  # unflagged cards stay lean
+
+
 def test_list_folders_from_mirror(tmp_path, db):
     ctx = _ctx(tmp_path, db, FakeGateway(raise_on_call=True))
     res = _run(ctx, "list_folders")

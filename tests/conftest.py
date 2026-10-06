@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from _pg import ThrowawayPostgres
 
 from ewsmcp.confirm import reset_consumed_tokens
+from ewsmcp.gateway.client import EWSGateway
 from ewsmcp.tools.base import reset_send_rate_window
 from ewsmcp.tools.writes import reset_idempotency_store
 
@@ -93,6 +94,10 @@ class FakeGateway:
         self.calls += 1
         return fn(self.account)
 
+    @staticmethod
+    def ews_tz(name):
+        return EWSGateway.ews_tz(name)  # the real conversion — it is pure
+
     def resolve_folder(self, account, ref, aliaser):
         if self.raise_on_call:
             raise AssertionError("EWS folder resolution — the mirror path failed")
@@ -130,7 +135,7 @@ def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
              sender_email="a@corp.example", sender_name="Ahmed",
              body="please review the numbers", date_ts=None, is_read=1,
              has_attachments=0, conv="CONV-1", imid=None, to=None,
-             categories=None):
+             categories=None, flag_status=None):
     """One `CacheStore.upsert_messages` row."""
     return {
         "ews_id": ews_id,
@@ -149,6 +154,7 @@ def make_row(ews_id, *, folder_id=INBOX_ID, subject="Budget review",
         "categories_json": json.dumps(categories or []),
         "body_clean": body,
         "internet_message_id": imid or f"<{ews_id}@corp.example>",
+        "flag_status": flag_status,
     }
 
 

@@ -39,7 +39,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 ITEM_FIELDS = [
     "id", "changekey", "subject", "sender", "datetime_received", "is_read",
     "has_attachments", "importance", "categories", "conversation_id",
-    "message_id", "to_recipients", "text_body",
+    "message_id", "to_recipients", "text_body", "flag_status",
 ]
 TASK_FIELDS = ["id", "changekey", "subject", "due_date", "is_complete", "status"]
 BODY_CLEAN_MAX = 20_000
@@ -109,7 +109,18 @@ def _ts(dt: Any) -> int | None:
         return None
 
 
+def _event_ts(value: Any, tz: str) -> int | None:
+    """An all-day boundary is a bare date (EWSDate): no clock, no timestamp().
+    Anchor it at midnight in EWS_TZ so the row keeps epoch bounds — without
+    them events_window's range test drops every all-day event."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return int(datetime(value.year, value.month, value.day,
+                            tzinfo=ZoneInfo(tz)).timestamp())
+    return _ts(value)
+
+
 BODY_FETCH_CHUNK = 100
+FLAG_BACKFILL_KEY = "flags_backfill"
 # What SyncFolderItems leaves empty and GetItem must supply.
 HYDRATE_FIELDS = ["text_body", "to_recipients", "item_class", "attachments"]
 
@@ -220,7 +231,15 @@ def row_from_message(item: Any, folder_id: str, tz: str) -> dict[str, Any]:
         "internet_message_id": imid if isinstance(imid, str) else None,
         "item_class": getattr(item, "item_class", None) or None,
         "attachments_json": attachments_json(item),
+        "flag_status": flag_status_of(item),
     }
+
+
+def flag_status_of(item: Any) -> int | None:
+    """2 (open) or 1 (complete); a cleared flag (0), no flag, or an item class
+    that carries no flag at all (meeting items) is None."""
+    value = getattr(item, "flag_status", None)
+    return value if value in (1, 2) else None
 
 
 def row_from_event(item: Any, tz: str) -> dict[str, Any]:
@@ -229,9 +248,9 @@ def row_from_event(item: Any, tz: str) -> dict[str, Any]:
         "ews_id": str(getattr(item, "id", "") or ""),
         "changekey": getattr(item, "changekey", None),
         "subject": getattr(item, "subject", "") or "",
-        "start_ts": _ts(getattr(item, "start", None)),
+        "start_ts": _event_ts(getattr(item, "start", None), tz),
         "start_iso": fmt_dt(getattr(item, "start", None), tz),
-        "end_ts": _ts(getattr(item, "end", None)),
+        "end_ts": _event_ts(getattr(item, "end", None), tz),
         "end_iso": fmt_dt(getattr(item, "end", None), tz),
         "location": str(getattr(item, "location", None) or "") or None,
         "organizer": getattr(organizer, "email_address", None),
@@ -336,6 +355,7 @@ class SyncEngine:
             await self.gateway.call(self._sync_hierarchy)
             self._last_hierarchy_ts = time.time()
         slow_every = max(60, int(self.settings.ews_cache_hierarchy_seconds))
+        await self.gateway.call(self._backfill_flags)
         await self.gateway.call(self._sync_mail_folders)
         if time.time() - self._last_slow_ts >= slow_every:
             await self.gateway.call(self._sync_slow_lane)
@@ -417,6 +437,25 @@ class SyncEngine:
             self.store.drop_sync_state(f"item:{gone}")
             logger.info("folder %s disappeared — dropped token, %s live rows",
                         gone, removed)
+
+    def _backfill_flags(self, account: Any) -> None:
+        """One pass, ever: rows mirrored before flag_status existed never get
+        it from the delta (nothing changed upstream), so fetch it for every
+        live row, then record that it ran. Before mail sync in the cycle, so
+        on a fresh store it sees no rows and is done before any arrive (they
+        carry the flag from the delta)."""
+        if self.store.get_sync_state(FLAG_BACKFILL_KEY) is not None:
+            return
+        ids = self.store.live_message_ids()
+        for i in range(0, len(ids), BODY_FETCH_CHUNK):
+            batch = ids[i:i + BODY_FETCH_CHUNK]
+            fetched = account.fetch([(ews_id, None) for ews_id in batch],
+                                    only_fields=["flag_status"])
+            self.store.set_flag_status([
+                (ews_id, flag_status_of(item)) for ews_id, item in zip(batch, fetched)
+                if not isinstance(item, Exception)])
+        self.store.set_sync_state(FLAG_BACKFILL_KEY, "done", time.time())
+        logger.info("flag backfill: %s live rows", len(ids))
 
     def _sync_mail_folders(self, account: Any) -> None:
         """Apply item deltas for every mirrored folder (runs on the EWS pool).

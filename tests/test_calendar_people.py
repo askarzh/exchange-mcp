@@ -7,13 +7,14 @@ account synchronously. All datetimes are tz-aware Asia/Riyadh.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 from conftest import FakeGateway, make_context
+from exchangelib import EWSTimeZone
 
 from ewsmcp import __version__
 from ewsmcp.tools import calendar_people
@@ -37,13 +38,36 @@ def _dt(hour, minute=0, day=15):
     return datetime(2026, 6, day, hour, minute, tzinfo=TZ)
 
 
-def _event(raw_id="RAW-EV-1", subject="Standup", start=None, end=None):
+def _event(raw_id="RAW-EV-1", subject="Standup", start=None, end=None,
+           is_all_day=False):
     return SimpleNamespace(
         id=raw_id, subject=subject,
         start=start or _dt(9), end=end or _dt(9, 30),
         location=None, organizer=None, my_response_type=None,
-        is_recurring=False, recurrence=None,
+        is_recurring=False, recurrence=None, is_all_day=is_all_day,
     )
+
+
+# --- all-day events (upstream PR #140) ----------------------------------------
+
+
+def test_list_events_keeps_the_date_of_an_all_day_event(tmp_path, db):
+    """exchangelib hands all-day boundaries back as EWSDate — a plain date
+    with no clock and no astimezone(). The card must keep the date and say
+    the event is all-day, or a vacation block reads as a broken record."""
+    account = MagicMock()
+    account.calendar.view.return_value = [
+        _event("RAW-AD", "Vacation", start=date(2026, 8, 5), end=date(2026, 8, 8),
+               is_all_day=True),
+        _event("RAW-T", "Standup"),
+    ]
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "list_events", {"start": "2026-08-01", "end": "2026-08-10"})
+    assert res["ok"] is True
+    all_day, timed = res["items"]
+    assert all_day["start"] == "2026-08-05" and all_day["end"] == "2026-08-08"
+    assert all_day["all_day"] is True
+    assert "all_day" not in timed
 
 
 # --- pack contract ----------------------------------------------------------
@@ -255,6 +279,55 @@ def test_check_availability_end_to_end(tmp_path, db):
     assert [e["status"] for e in per["a@corp.example"]] == ["Busy", "Free"]
     assert per["a@corp.example"][0]["start"] == "2026-06-15T09:00+03:00"
     assert per["b@corp.example"] == []
+
+
+def test_check_availability_asks_exchange_in_utc(tmp_path, db):
+    """get_free_busy_info serialises the window's timezone through
+    tzinfo.ms_id, which only exchangelib's EWSTimeZone carries; a stdlib
+    ZoneInfo made every live call fail (upstream PR #141). And the zone must
+    be UTC: the server resolves a named zone with ITS OWN Windows definition,
+    and a stale one (Exchange still calls Central Asia Standard Time UTC+6,
+    while Almaty moved to UTC+5 in 2024) shifted every busy block an hour."""
+    account = MagicMock()
+    account.protocol.get_free_busy_info.return_value = iter(
+        [SimpleNamespace(calendar_events=[])])
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "check_availability", {
+        "attendees": ["a@corp.example"],
+        "start": "2026-06-15T09:00", "end": "2026-06-15T11:00",
+    })
+    assert res["ok"] is True
+    kwargs = account.protocol.get_free_busy_info.call_args.kwargs
+    for bound in (kwargs["start"], kwargs["end"]):
+        assert isinstance(bound.tzinfo, EWSTimeZone)
+        assert bound.tzinfo.ms_id == "UTC"  # what exchangelib actually reads
+    assert kwargs["start"] == _dt(9) and kwargs["end"] == _dt(11)  # same instants
+
+
+def test_check_availability_reads_naive_busy_blocks_in_the_request_zone(tmp_path, db):
+    """Free/busy CalendarEvents come back NAIVE, rendered in the request's
+    timezone — UTC. 06:00-07:00 UTC is 09:00-10:00 in the server's EWS_TZ
+    (+03:00 here). Read as anything else, or left naive, they shift or crash
+    slot finding (upstream PR #141)."""
+    busy_view = SimpleNamespace(calendar_events=[
+        SimpleNamespace(start=datetime(2026, 6, 15, 6), end=datetime(2026, 6, 15, 7),
+                        busy_type="Busy"),
+    ])
+    account = MagicMock()
+    account.protocol.get_free_busy_info.return_value = iter([busy_view])
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "check_availability", {
+        "attendees": ["a@corp.example"],
+        "start": "2026-06-15T09:00", "end": "2026-06-15T11:00",
+    })
+    assert res["ok"] is True, res
+    block = res["per_attendee"]["a@corp.example"][0]
+    assert block["start"] == "2026-06-15T09:00+03:00"
+    assert block["end"] == "2026-06-15T10:00+03:00"
+    assert res["slots"] == [
+        {"start": "2026-06-15T10:00+03:00", "end": "2026-06-15T10:30+03:00"},
+        {"start": "2026-06-15T10:30+03:00", "end": "2026-06-15T11:00+03:00"},
+    ]
 
 
 def test_check_availability_degrades_per_attendee(tmp_path, db):

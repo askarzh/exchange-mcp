@@ -87,11 +87,11 @@ _UPSERT_MESSAGE = """
 INSERT INTO ews.messages (ews_id, changekey, folder_id, conversation_id, sender_name,
     sender_email, to_json, subject, date_ts, date_iso, is_read, has_attachments,
     importance, categories_json, body_clean, internet_message_id, item_class,
-    attachments_json)
+    attachments_json, flag_status)
 VALUES (%(ews_id)s, %(changekey)s, %(folder_id)s, %(conversation_id)s, %(sender_name)s,
     %(sender_email)s, %(to_json)s, %(subject)s, %(date_ts)s, %(date_iso)s, %(is_read)s,
     %(has_attachments)s, %(importance)s, %(categories_json)s, %(body_clean)s,
-    %(internet_message_id)s, %(item_class)s, %(attachments_json)s)
+    %(internet_message_id)s, %(item_class)s, %(attachments_json)s, %(flag_status)s)
 ON CONFLICT (ews_id) DO UPDATE SET
     changekey = EXCLUDED.changekey, folder_id = EXCLUDED.folder_id,
     conversation_id = EXCLUDED.conversation_id, sender_name = EXCLUDED.sender_name,
@@ -100,8 +100,12 @@ ON CONFLICT (ews_id) DO UPDATE SET
     is_read = EXCLUDED.is_read, has_attachments = EXCLUDED.has_attachments,
     importance = EXCLUDED.importance, categories_json = EXCLUDED.categories_json,
     body_clean = EXCLUDED.body_clean, internet_message_id = EXCLUDED.internet_message_id,
-    item_class = EXCLUDED.item_class, attachments_json = EXCLUDED.attachments_json
+    item_class = EXCLUDED.item_class, attachments_json = EXCLUDED.attachments_json,
+    flag_status = EXCLUDED.flag_status
 """
+
+
+_FLAG_STATUS = {"flagged": 2, "complete": 1}  # MAPI PidTagFlagStatus
 
 
 class CacheStore:
@@ -118,6 +122,7 @@ class CacheStore:
         for row in rows:
             row.setdefault("item_class", None)
             row.setdefault("attachments_json", None)
+            row.setdefault("flag_status", None)
         with self.db.conn() as c:
             c.cursor().executemany(_UPSERT_MESSAGE, rows)
         return len(rows)
@@ -140,6 +145,20 @@ class CacheStore:
         with self.db.conn() as c:
             c.execute("UPDATE ews.messages SET is_read = %s WHERE ews_id = ANY(%s)",
                       (1 if is_read else 0, list(ews_ids)))
+
+    def set_flag_status(self, pairs: list[tuple[str, int | None]]) -> None:
+        if not pairs:
+            return
+        with self.db.conn() as c:
+            c.cursor().executemany(
+                "UPDATE ews.messages SET flag_status = %s WHERE ews_id = %s",
+                [(status, ews_id) for ews_id, status in pairs])
+
+    def live_message_ids(self) -> list[str]:
+        with self.db.conn() as c:
+            return [r["ews_id"] for r in c.execute(
+                "SELECT ews_id FROM ews.messages WHERE archive_state = 'live' "
+                "ORDER BY ews_id").fetchall()]
 
     def apply_categories(self, ews_id: str, categories: list[str] | None) -> None:
         with self.db.conn() as c:
@@ -269,6 +288,7 @@ class CacheStore:
         sender: str | None = None, subject: str | None = None,
         since_ts: int | None = None, until_ts: int | None = None,
         is_unread: bool | None = None, has_attachments: bool | None = None,
+        flag: str | None = None,
         archived: str = "any", offset: int = 0, limit: int = 20,
         include_calendar_items: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -305,6 +325,9 @@ class CacheStore:
         if has_attachments is not None:
             where.append("m.has_attachments = %s")
             params.append(1 if has_attachments else 0)
+        if flag is not None:
+            where.append("m.flag_status = %s")
+            params.append(_FLAG_STATUS[flag])
         base = "FROM ews.messages m WHERE " + " AND ".join(where)
         order, order_params = "m.date_ts DESC", []
         if tokens:

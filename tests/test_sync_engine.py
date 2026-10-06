@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -10,7 +10,7 @@ from conftest import FakeGateway, make_settings
 from exchangelib import FileAttachment
 
 from ewsmcp.cache.store import CacheStore
-from ewsmcp.cache.sync import SyncEngine, row_from_message
+from ewsmcp.cache.sync import SyncEngine, row_from_event, row_from_message
 
 TZ = ZoneInfo("Asia/Riyadh")
 NOW = datetime(2026, 7, 10, 9, 0, tzinfo=TZ)
@@ -611,3 +611,67 @@ def test_status_reports_what_the_deletes_did(db):
     asyncio.run(engine._cycle())
     st = engine.status()
     assert st["dropped"] == 1 and st["tombstoned"] == 1
+
+
+def test_row_from_event_keeps_an_all_day_event_in_the_window():
+    """All-day boundaries are EWSDate (no clock, no timestamp()). The row must
+    still carry epoch bounds — midnight in EWS_TZ — or events_window's
+    start_ts/end_ts comparison silently drops every all-day event from the
+    mirror-served overview (upstream PR #140, mirror half)."""
+    tz = "Asia/Almaty"
+    item = SimpleNamespace(
+        id="RAW-AD", changekey="CK", subject="Vacation",
+        start=date(2026, 8, 5), end=date(2026, 8, 8), is_all_day=True,
+        location=None, organizer=None, is_recurring=False, recurrence=None,
+        my_response_type=None)
+    row = row_from_event(item, tz)
+    midnight = lambda d: int(datetime(d.year, d.month, d.day,
+                                      tzinfo=ZoneInfo(tz)).timestamp())
+    assert row["start_ts"] == midnight(date(2026, 8, 5))
+    assert row["end_ts"] == midnight(date(2026, 8, 8))
+    assert row["start_iso"] == "2026-08-05" and row["end_iso"] == "2026-08-08"
+
+
+def test_sync_asks_for_the_follow_up_flag():
+    from ewsmcp.cache.sync import ITEM_FIELDS
+    assert "flag_status" in ITEM_FIELDS
+
+
+def test_row_from_message_keeps_open_and_complete_flags_only():
+    """MAPI PidTagFlagStatus: 2 = flagged (open), 1 = complete. Exchange
+    reports a CLEARED flag as 0 and a never-flagged one as absent — both mean
+    'not flagged' and are stored as NULL."""
+    from ewsmcp.cache.sync import row_from_message
+    for raw, stored in ((2, 2), (1, 1), (0, None), (None, None)):
+        item = _msg("M-F")
+        item.flag_status = raw
+        assert row_from_message(item, "F-IN", "Asia/Almaty")["flag_status"] == stored
+    plain = _msg("M-NOFLAG")  # meeting items carry no flag attribute at all
+    assert row_from_message(plain, "F-IN", "Asia/Almaty")["flag_status"] is None
+
+
+def test_flags_are_backfilled_once_for_rows_mirrored_before_flags_existed(db):
+    """Rows synced before flag_status was mirrored never get it from the delta
+    (nothing changed upstream). One pass fetches it for every live row, then
+    records that it ran so it never repeats."""
+    from conftest import make_row
+    account = _account()
+    engine, store = _engine(db, account)
+    store.upsert_messages([make_row(f"M-{i}", folder_id="F-IN") for i in range(3)])
+    flags = {"M-0": 2, "M-1": 1, "M-2": 0}
+    calls = []
+
+    def fetch(ids, only_fields=None, **kw):
+        ids = list(ids)
+        calls.append((len(ids), tuple(only_fields or ())))
+        return iter([SimpleNamespace(id=i, flag_status=flags[i]) for i, _ck in ids])
+
+    account.fetch = fetch
+    engine._backfill_flags(account)
+    with db.conn() as c:
+        got = {r["ews_id"]: r["flag_status"] for r in
+               c.execute("SELECT ews_id, flag_status FROM ews.messages").fetchall()}
+    assert got == {"M-0": 2, "M-1": 1, "M-2": None}
+    assert calls == [(3, ("flag_status",))]
+    engine._backfill_flags(account)  # recorded as done: no second pass
+    assert len(calls) == 1
