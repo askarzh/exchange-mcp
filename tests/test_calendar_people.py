@@ -281,10 +281,13 @@ def test_check_availability_end_to_end(tmp_path, db):
     assert per["b@corp.example"] == []
 
 
-def test_check_availability_hands_exchangelib_an_ews_timezone(tmp_path, db):
+def test_check_availability_asks_exchange_in_utc(tmp_path, db):
     """get_free_busy_info serialises the window's timezone through
-    tzinfo.ms_id, which only exchangelib's EWSTimeZone carries. A stdlib
-    ZoneInfo there made every live call fail (upstream PR #141)."""
+    tzinfo.ms_id, which only exchangelib's EWSTimeZone carries; a stdlib
+    ZoneInfo made every live call fail (upstream PR #141). And the zone must
+    be UTC: the server resolves a named zone with ITS OWN Windows definition,
+    and a stale one (Exchange still calls Central Asia Standard Time UTC+6,
+    while Almaty moved to UTC+5 in 2024) shifted every busy block an hour."""
     account = MagicMock()
     account.protocol.get_free_busy_info.return_value = iter(
         [SimpleNamespace(calendar_events=[])])
@@ -297,16 +300,17 @@ def test_check_availability_hands_exchangelib_an_ews_timezone(tmp_path, db):
     kwargs = account.protocol.get_free_busy_info.call_args.kwargs
     for bound in (kwargs["start"], kwargs["end"]):
         assert isinstance(bound.tzinfo, EWSTimeZone)
-        assert bound.tzinfo.ms_id  # what exchangelib actually reads
-    assert kwargs["start"] == _dt(9) and kwargs["end"] == _dt(11)
+        assert bound.tzinfo.ms_id == "UTC"  # what exchangelib actually reads
+    assert kwargs["start"] == _dt(9) and kwargs["end"] == _dt(11)  # same instants
 
 
-def test_check_availability_reads_naive_busy_blocks_in_ews_tz(tmp_path, db):
+def test_check_availability_reads_naive_busy_blocks_in_the_request_zone(tmp_path, db):
     """Free/busy CalendarEvents come back NAIVE, rendered in the request's
-    timezone. They must be read as EWS_TZ (not the host's UTC) and must not
-    crash the aware/naive comparison in slot finding (upstream PR #141)."""
+    timezone — UTC. 06:00-07:00 UTC is 09:00-10:00 in the server's EWS_TZ
+    (+03:00 here). Read as anything else, or left naive, they shift or crash
+    slot finding (upstream PR #141)."""
     busy_view = SimpleNamespace(calendar_events=[
-        SimpleNamespace(start=datetime(2026, 6, 15, 9), end=datetime(2026, 6, 15, 10),
+        SimpleNamespace(start=datetime(2026, 6, 15, 6), end=datetime(2026, 6, 15, 7),
                         busy_type="Busy"),
     ])
     account = MagicMock()
