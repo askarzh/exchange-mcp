@@ -46,6 +46,9 @@ def _row_body(ctx: Context, row: Any) -> str:
     return row["body_clean"] or ""
 
 
+_FLAG_NAMES = {2: "flagged", 1: "complete"}  # MAPI PidTagFlagStatus
+
+
 def _row_card(ctx: Context, row: Any) -> dict[str, Any]:
     """Mirror row → the same MsgCard shape the live path emits."""
     body = _row_body(ctx, row)
@@ -70,6 +73,8 @@ def _row_card(ctx: Context, row: Any) -> dict[str, Any]:
         card["importance"] = "high"
     if row["archive_state"] != "live":
         card["archive_state"] = row["archive_state"]
+    if row.get("flag_status") in _FLAG_NAMES:
+        card["flag"] = _FLAG_NAMES[row["flag_status"]]
     return card
 
 
@@ -299,6 +304,7 @@ async def search_messages(ctx: Context, *, folder: str | None,
                           until: str | None, is_unread: bool | None,
                           has_attachments: bool | None, offset: int,
                           limit: int, archived: str = "any",
+                          flag: str | None = None,
                           mode: str = "keyword",
                           include_calendar_items: bool = False
                           ) -> dict[str, Any] | None:
@@ -325,7 +331,7 @@ async def search_messages(ctx: Context, *, folder: str | None,
     until_ts = int(parse_when(until, "until", tz).timestamp()) if until else None
     filters: dict[str, Any] = dict(
         sender=sender, subject=subject, since_ts=since_ts, until_ts=until_ts,
-        is_unread=is_unread, has_attachments=has_attachments,
+        is_unread=is_unread, has_attachments=has_attachments, flag=flag,
         folder_ids=folder_ids, include_calendar_items=include_calendar_items,
     )
     meta: dict[str, Any] | None = None

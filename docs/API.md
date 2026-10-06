@@ -33,7 +33,7 @@ the registry is the single source of truth for what exists.
 | `add_attachment` | write | draft | Attach a file to a DRAFT. |
 | `delete_attachment` | write | draft | Remove one attachment from a DRAFT, by exact name or zero-based index as a string. |
 | `delete_draft` | write | draft | Move a draft to trash (recoverable). |
-| `update_messages` | write | draft | Bulk-update up to 50 messages: set_read and/or categories_add/categories_remove. |
+| `update_messages` | write | draft | Bulk-update up to 50 messages: set_read, categories_add/categories_remove and/or flag_complete. |
 | `move_messages` | write | draft | Move up to 50 messages to a folder (id, f:alias or path). |
 | `create_event` | write | draft | Create a calendar event. |
 | `update_event` | write | draft | Update event fields (subject/start/end/location/body). |
@@ -82,6 +82,7 @@ Search mail across the local mirror of the whole mailbox. `query` is full-text o
 | `until` | string | no | Window end: 'today', '+Nd', YYYY-MM-DD, or ISO datetime (server timezone). |
 | `is_unread` | boolean | no |  |
 | `has_attachments` | boolean | no |  |
+| `flag` | string | no | Outlook follow-up flag: 'flagged' = still open (what is left to follow up), 'complete' = marked done. Omit to ignore flags. (one of: `flagged`, `complete`) |
 | `offset` | integer | no | (default `0`) |
 | `limit` | integer | no | (default `20`) |
 | `archived` | string | no | any (default) searches live and archived mail; only restricts to archived; exclude to live. (one of: `any`, `only`, `exclude`; default `any`) |
@@ -294,7 +295,7 @@ Move a draft to trash (recoverable). Refuses items that are not in f:drafts.
 
 #### `update_messages` — write (min tier: draft)
 
-Bulk-update up to 50 messages: set_read and/or categories_add/categories_remove. Per-item failures are isolated and reported. There is no follow-up-flag support in this backend — use categories_add (e.g. ['Follow up']) as the visible marker.
+Bulk-update up to 50 messages: set_read, categories_add/categories_remove and/or flag_complete. Per-item failures are isolated and reported. flag_complete=true marks a follow-up flag complete; false reopens a completed one. Neither raises a flag on mail that has none — find flagged mail with search_messages(flag='flagged').
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -302,6 +303,7 @@ Bulk-update up to 50 messages: set_read and/or categories_add/categories_remove.
 | `set_read` | boolean | no |  |
 | `categories_add` | array | no |  |
 | `categories_remove` | array | no |  |
+| `flag_complete` | boolean | no |  |
 
 #### `move_messages` — write (min tier: draft)
 

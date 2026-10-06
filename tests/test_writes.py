@@ -250,6 +250,51 @@ def test_update_messages_isolates_per_item_failures(tmp_path, db):
     good2.save.assert_called_once_with(update_fields=["is_read"])
 
 
+def test_update_messages_marks_a_follow_up_flag_complete(tmp_path, db):
+    account = make_account()
+    ctx = make_ctx(tmp_path, db, account)
+    item = MagicMock()
+    item.flag_status = 2
+    account._by_id["RAW-1"] = item
+    res = call(ctx, "update_messages", {"ids": ["RAW-1"], "flag_complete": True})
+    assert res["ok"] is True and res["updated"] == 1
+    assert item.flag_status == 1
+    item.save.assert_called_once_with(update_fields=["flag_status"])
+
+
+def test_update_messages_reopens_a_completed_flag_and_leaves_unflagged_alone(tmp_path, db):
+    """flag_complete=false REOPENS a completed flag (1 -> 2, Outlook's 'unmark
+    complete'); it never raises a flag on mail that had none."""
+    account = make_account()
+    ctx = make_ctx(tmp_path, db, account)
+    done, unflagged = MagicMock(), MagicMock()
+    done.flag_status, unflagged.flag_status = 1, None
+    account._by_id.update({"RAW-1": done, "RAW-2": unflagged})
+    res = call(ctx, "update_messages",
+               {"ids": ["RAW-1", "RAW-2"], "flag_complete": False})
+    assert res["ok"] is True and res["updated"] == 2
+    assert done.flag_status == 2
+    done.save.assert_called_once_with(update_fields=["flag_status"])
+    assert unflagged.flag_status is None
+    unflagged.save.assert_not_called()
+
+
+def test_update_messages_writes_the_flag_through_to_the_mirror(tmp_path, db, store_with_message):
+    store, ews_id = store_with_message
+    account = make_account()
+    ctx = make_ctx(tmp_path, db, account)
+    ctx.cache = store
+    item = MagicMock()
+    item.flag_status = 2
+    account._by_id[ews_id] = item
+    res = call(ctx, "update_messages", {"ids": [ews_id], "flag_complete": True})
+    assert res["ok"] is True
+    with db.conn() as c:
+        row = c.execute("SELECT flag_status FROM ews.messages WHERE ews_id = %s",
+                        (ews_id,)).fetchone()
+    assert row["flag_status"] == 1
+
+
 def test_update_messages_rejects_set_flag(tmp_path, db):
     ctx = make_ctx(tmp_path, db, make_account())
     res = call(ctx, "update_messages", {"ids": ["RAW-1"], "set_flag": "flagged"})

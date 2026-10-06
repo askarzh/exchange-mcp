@@ -208,6 +208,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
                            subject: Optional[str] = None, since: Optional[str] = None,
                            until: Optional[str] = None, is_unread: Optional[bool] = None,
                            has_attachments: Optional[bool] = None,
+                           flag: Optional[str] = None,
                            offset: int = 0, limit: int = 20,
                            archived: str = "any",
                            mode: str = "keyword",
@@ -226,7 +227,7 @@ async def _search_messages(ctx: Context, query: Optional[str] = None,
         return await cache_reads.search_messages(
             ctx, folder=folder, query=query, sender=sender, subject=subject,
             since=since, until=until, is_unread=is_unread,
-            has_attachments=has_attachments, offset=offset, limit=limit,
+            has_attachments=has_attachments, flag=flag, offset=offset, limit=limit,
             archived=archived, mode=mode,
             include_calendar_items=include_calendar_items)
     except (psycopg.Error, RuntimeError) as exc:  # psycopg_pool.PoolClosed is RuntimeError
@@ -515,6 +516,12 @@ TOOLS: List[ToolSpec] = [
             },
             "is_unread": {"type": "boolean"},
             "has_attachments": {"type": "boolean"},
+            "flag": {
+                "type": "string", "enum": ["flagged", "complete"],
+                "description": "Outlook follow-up flag: 'flagged' = still open "
+                               "(what is left to follow up), 'complete' = marked "
+                               "done. Omit to ignore flags.",
+            },
             "offset": {"type": "integer", "minimum": 0, "default": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
             "archived": {

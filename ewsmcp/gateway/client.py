@@ -13,7 +13,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional
 
-from exchangelib import DELEGATE, Account, Configuration, Credentials, EWSTimeZone
+from exchangelib import DELEGATE, Account, Configuration, Credentials, EWSTimeZone, Message
+from exchangelib.extended_properties import ExtendedProperty
+from exchangelib.fields import InvalidField
 from exchangelib.protocol import (
     BaseProtocol,
     CachingProtocol,
@@ -31,6 +33,25 @@ from .wellknown import paginate as paginate
 
 logger = logging.getLogger(__name__)
 
+
+
+class FlagStatus(ExtendedProperty):
+    """Outlook's follow-up flag state, MAPI PidTagFlagStatus (0x1090).
+
+    exchangelib 5.0.3 has no first-class flag field; registered as an
+    extended property it reads, saves and filters like any other (verified
+    live). Values: 2 = flagged and still open, 1 = complete, 0 or absent =
+    not flagged. Registered here, in the daemon-only gateway, because the
+    read tools are loaded by the thin MCP, which must not import exchangelib.
+    """
+    property_tag = 0x1090
+    property_type = "Integer"
+
+
+try:
+    Message.get_field_by_fieldname("flag_status")
+except InvalidField:
+    Message.register("flag_status", FlagStatus)
 
 
 class EWSGateway:

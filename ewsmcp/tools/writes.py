@@ -464,22 +464,28 @@ async def _delete_draft(ctx: Context, *, draft_id: str) -> Dict[str, Any]:
 async def _update_messages(ctx: Context, *, ids: List[str],
                            set_read: Optional[bool] = None,
                            categories_add: Optional[List[str]] = None,
-                           categories_remove: Optional[List[str]] = None) -> Dict[str, Any]:
-    # NOTE: there is deliberately NO set_flag parameter — exchangelib 5.0.3
-    # exposes no first-class follow-up flag field, and pretending would be
-    # mock-drift bait. Categories are the visible marker (see description).
+                           categories_remove: Optional[List[str]] = None,
+                           flag_complete: Optional[bool] = None) -> Dict[str, Any]:
+    # Follow-up flags go through the gateway's registered `flag_status`
+    # extended property (PidTagFlagStatus). There is deliberately no way to
+    # RAISE a flag on unflagged mail: only complete one (2 -> 1) or reopen
+    # one (1 -> 2), the two transitions Outlook's own buttons make.
     _require_bulk(ids)
-    if set_read is None and not categories_add and not categories_remove:
-        raise ToolError("validation",
-                        "nothing to update: pass set_read and/or categories_add/_remove")
+    if (set_read is None and not categories_add and not categories_remove
+            and flag_complete is None):
+        raise ToolError(
+            "validation",
+            "nothing to update: pass set_read, categories_add/_remove and/or flag_complete")
     remove = set(categories_remove or [])
     ok_ids: List[str] = []
     final_cats: List[tuple] = []
+    final_flags: List[tuple] = []
 
     def work(account: Any) -> Dict[str, Any]:
         updated, failed = 0, []
         fetched = _fetch_many(account, ids,
-                              only=["id", "changekey", "is_read", "categories"])
+                              only=["id", "changekey", "is_read", "categories",
+                                    "flag_status"])
         for raw_id, item in zip(ids, fetched):
             try:  # per-item isolation: one failure never aborts the batch
                 if isinstance(item, Exception):
@@ -496,7 +502,18 @@ async def _update_messages(ctx: Context, *, ids: List[str],
                     item.categories = cats or None
                     changed.append("categories")
                     final_cats.append((raw_id, cats))
-                item.save(update_fields=changed)
+                if flag_complete is not None:
+                    current = getattr(item, "flag_status", None)
+                    target = 1 if flag_complete else 2
+                    # complete: open (2) or already-complete (1) -> 1;
+                    # reopen: only a completed flag (1) -> 2. Unflagged mail
+                    # is left alone either way.
+                    if current in (1, 2) and (flag_complete or current == 1):
+                        item.flag_status = target
+                        changed.append("flag_status")
+                        final_flags.append((raw_id, target))
+                if changed:
+                    item.save(update_fields=changed)
                 updated += 1
                 ok_ids.append(raw_id)
             except Exception as exc:
@@ -506,6 +523,8 @@ async def _update_messages(ctx: Context, *, ids: List[str],
     result = await ctx.gateway.call(work)
     if ok_ids and set_read is not None:
         _write_through(ctx, "set_read_flag", ok_ids, bool(set_read))
+    if final_flags:
+        _write_through(ctx, "set_flag_status", final_flags)
     for raw_id, cats in final_cats:
         _write_through(ctx, "apply_categories", raw_id, cats)
     return result
