@@ -22,6 +22,7 @@ from exchangelib.protocol import (
     FaultTolerance,
     NoVerifyHTTPAdapter,
 )
+from exchangelib.winzone import IANA_TO_MS_TIMEZONE_MAP, MS_TIMEZONE_TO_IANA_MAP
 
 from ..config import Settings
 from ..errors import ToolError
@@ -33,6 +34,24 @@ from .wellknown import paginate as paginate
 
 logger = logging.getLogger(__name__)
 
+
+
+# Kazakhstan moved to UTC+5 on 2024-03-01, and not every system has caught up.
+# exchangelib 5.0.3's CLDR table still maps Asia/Almaty (and Asia/Qostanay) to
+# "Central Asia Standard Time", which Windows and this Exchange define as
+# (UTC+06:00) Bishkek: right for Kyrgyzstan, an hour wrong for Kazakhstan.
+# Exchange's own zone for Kazakhstan is "Qyzylorda Standard Time", displayed
+# as "(UTC+05:00) Astana" (verified live 2026-10-11, and the label most of the
+# organisation's own events carry). Every timezone exchangelib names to
+# Exchange comes from these tables: create_event's StartTimeZone, and the
+# TimeZoneContext of every request. So correcting them here fixes all writes
+# at once. Instants were never wrong (they travel with an explicit offset);
+# the label was, which made Outlook show the event's own time an hour late
+# and risked a shift when the event was edited there. The reverse entry is
+# corrected too, so a Bishkek-labelled event reads back as Bishkek.
+for _iana in ("Asia/Almaty", "Asia/Qostanay"):
+    IANA_TO_MS_TIMEZONE_MAP[_iana] = ("Qyzylorda Standard Time", "KZ")
+MS_TIMEZONE_TO_IANA_MAP["Central Asia Standard Time"] = "Asia/Bishkek"
 
 
 class FlagStatus(ExtendedProperty):

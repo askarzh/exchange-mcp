@@ -74,3 +74,42 @@ def test_the_gateway_registers_the_follow_up_flag_property():
     field = Message.get_field_by_fieldname("flag_status")
     prop = field.value_cls
     assert prop.property_tag == 0x1090 and prop.property_type == "Integer"
+
+
+# -- Kazakhstan moved to UTC+5 on 2024-03-01. exchangelib 5.0.3's CLDR table
+# still maps Asia/Almaty to "Central Asia Standard Time", which Windows and
+# this Exchange define as (UTC+06:00) Bishkek — correct for Kyrgyzstan, wrong
+# for Almaty. Exchange's own zone for Kazakhstan is Qyzylorda Standard Time,
+# "(UTC+05:00) Astana". Verified live 2026-10-11: create_event stored the
+# right instant but labelled it Bishkek, so Outlook showed it at 11:00 in the
+# event's own zone and an edit there could move it an hour. --
+
+
+def test_almaty_is_labelled_with_exchanges_kazakhstan_zone():
+    from exchangelib import EWSTimeZone
+
+    import ewsmcp.gateway.client  # noqa: F401 - the correction is an import side effect
+    assert EWSTimeZone("Asia/Almaty").ms_id == "Qyzylorda Standard Time"
+    assert EWSTimeZone("Asia/Qostanay").ms_id == "Qyzylorda Standard Time"
+
+
+def test_bishkek_keeps_central_asia_and_reads_back_as_bishkek():
+    from exchangelib import EWSTimeZone
+
+    import ewsmcp.gateway.client  # noqa: F401
+    assert EWSTimeZone("Asia/Bishkek").ms_id == "Central Asia Standard Time"
+    assert EWSTimeZone.from_ms_id("Central Asia Standard Time").key == "Asia/Bishkek"
+
+
+def test_the_create_event_path_labels_almaty_times_correctly():
+    """create_event hands exchangelib a stdlib-ZoneInfo datetime (parse_when);
+    exchangelib converts it, and that conversion picks the label it sends."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from exchangelib import EWSDateTime
+
+    import ewsmcp.gateway.client  # noqa: F401
+    dt = EWSDateTime.from_datetime(datetime(2026, 10, 25, 10, tzinfo=ZoneInfo("Asia/Almaty")))
+    assert dt.tzinfo.ms_id == "Qyzylorda Standard Time"
+    assert dt.ewsformat() == "2026-10-25T10:00:00+05:00"  # the instant is unchanged
