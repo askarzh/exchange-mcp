@@ -152,7 +152,7 @@ Fetch one calendar event in full by id (a short alias like 'e3' from list_events
 
 #### `check_availability` — read (min tier: read)
 
-Check free/busy for one or more attendees and propose meeting slots. Each returned slot is a candidate start/end (30-minute grid) of duration_minutes where EVERY listed attendee is free; per_attendee shows the raw busy blocks behind the answer. With working_hours_only (default true) slots are confined to 09:00-17:00 in the server timezone. An empty slots list means no common free window exists in the range.
+Check free/busy for one or more attendees and propose meeting slots. Each returned slot is a candidate start/end (30-minute grid) of duration_minutes where EVERY listed attendee is free; per_attendee shows the raw busy blocks behind the answer. With working_hours_only (default true) slots are confined to 09:00-17:00 in the server timezone. Slots never start before the current time. An empty slots list means no common free window exists in the range.
 
 | parameter | type | required | description |
 |---|---|---|---|

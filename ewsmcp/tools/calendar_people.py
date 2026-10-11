@@ -20,7 +20,7 @@ exchangelib 5.0.3 shapes verified against the installed library:
 
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from itertools import islice
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,6 +38,11 @@ MAX_WINDOW_DAYS = 366  # reject absurd windows like '+9999d' before EWS does
 MAX_CONTACT_SCAN = 1000  # cap the personal-contacts substring scan
 _CONTACT_FIELDS = ("display_name", "email_addresses", "job_title",
                    "company_name", "phone_numbers")
+
+
+def _now() -> datetime:
+    """The clock, as a seam: tests pin it so slot synthesis is deterministic."""
+    return datetime.now(timezone.utc)
 
 
 def _window(start: str, end: str, tz: str) -> Tuple[datetime, datetime]:
@@ -245,15 +250,24 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
             hint="Check the addresses; external calendars may be hidden.",
         )
     hours = WORKING_HOURS if working_hours_only else None
-    raw = merge_busy_and_find_slots(busy_by_attendee, start_dt, end_dt,
+    # Never offer a slot that has already started: start='today' means
+    # midnight, which used to hand back the morning's passed slots. "Now" is
+    # taken in the window's own zone, because slot synthesis checks working
+    # hours on the wall clock.
+    slot_floor = max(start_dt, _now().astimezone(start_dt.tzinfo))
+    raw = merge_busy_and_find_slots(busy_by_attendee, slot_floor, end_dt,
                                     int(duration_minutes), hours)
     slots = [{"start": fmt_dt(s, tz), "end": fmt_dt(e, tz)} for s, e in raw]
     out: Dict[str, Any] = {"ok": True, "slots": slots, "per_attendee": per_attendee}
+    warnings: List[str] = []
+    if slot_floor >= end_dt:
+        warnings.append("the requested window is entirely in the past — no slots offered")
     if degraded:
-        out["warnings"] = [
+        warnings.append(
             f"free/busy unavailable for: {', '.join(degraded)} — slots "
-            "ignore their calendars"
-        ]
+            "ignore their calendars")
+    if warnings:
+        out["warnings"] = warnings
     return out
 
 
@@ -575,8 +589,9 @@ TOOLS: List[ToolSpec] = [
             "grid) of duration_minutes where EVERY listed attendee is free; "
             "per_attendee shows the raw busy blocks behind the answer. With "
             "working_hours_only (default true) slots are confined to "
-            "09:00-17:00 in the server timezone. An empty slots list means "
-            "no common free window exists in the range."
+            "09:00-17:00 in the server timezone. Slots never start before "
+            "the current time. An empty slots list means no common free "
+            "window exists in the range."
         ),
         side_effect_class="read",
         input_schema={

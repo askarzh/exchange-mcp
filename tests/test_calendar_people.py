@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
+import pytest
 from conftest import FakeGateway, make_context
 from exchangelib import EWSTimeZone
 
@@ -23,6 +24,14 @@ from ewsmcp.tools.calendar_people import merge_busy_and_find_slots
 
 TZ = ZoneInfo("Asia/Riyadh")
 SPEC = {s.name: s for s in calendar_people.TOOLS}
+
+
+@pytest.fixture(autouse=True)
+def _clock_before_the_test_windows(monkeypatch):
+    """The fixtures' windows are June 2026. Pin "now" before them, so slot
+    tests exercise slot synthesis and not whatever the wall clock says."""
+    monkeypatch.setattr(calendar_people, "_now",
+                        lambda: datetime(2026, 6, 1, 0, 0, tzinfo=TZ))
 
 
 def _ctx(tmp_path, db, account, **settings_overrides) -> Context:
@@ -507,3 +516,36 @@ def test_get_server_status_not_cold_gated_while_connecting(tmp_path, db):
     assert res["ok"] is True
     assert res["connection"]["state"] == "connecting"
     assert res["connection"]["attempts"] == 4
+
+
+def test_check_availability_never_offers_a_slot_that_has_already_started(tmp_path, db, monkeypatch):
+    """start='today' means midnight, so without a floor at "now" the morning's
+    already-passed slots came back as bookable."""
+    monkeypatch.setattr(calendar_people, "_now",
+                        lambda: datetime(2026, 6, 15, 10, 10, tzinfo=TZ))
+    account = MagicMock()
+    account.protocol.get_free_busy_info.return_value = iter(
+        [SimpleNamespace(calendar_events=[])])
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "check_availability", {
+        "attendees": ["a@corp.example"],
+        "start": "2026-06-15T09:00", "end": "2026-06-15T12:00",
+    })
+    assert res["ok"] is True
+    assert [s["start"] for s in res["slots"]] == [
+        "2026-06-15T10:30+03:00", "2026-06-15T11:00+03:00", "2026-06-15T11:30+03:00"]
+
+
+def test_check_availability_in_the_past_offers_nothing_and_says_why(tmp_path, db, monkeypatch):
+    monkeypatch.setattr(calendar_people, "_now",
+                        lambda: datetime(2026, 6, 20, 9, 0, tzinfo=TZ))
+    account = MagicMock()
+    account.protocol.get_free_busy_info.return_value = iter(
+        [SimpleNamespace(calendar_events=[])])
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "check_availability", {
+        "attendees": ["a@corp.example"],
+        "start": "2026-06-15T09:00", "end": "2026-06-15T12:00",
+    })
+    assert res["ok"] is True and res["slots"] == []
+    assert any("past" in w for w in res.get("warnings", []))
