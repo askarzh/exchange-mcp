@@ -24,6 +24,7 @@ import psycopg
 
 from .. import shared
 from ..archive import files
+from ..attachment_text import READ_BINARY_HINT, refuse_if_binary
 from ..dates import parse_when
 from ..dto import envelope
 from ..errors import ToolError
@@ -520,13 +521,13 @@ async def attachment_from_archive(ctx: Context, raw_id: str,
     if mode == "auto":
         chosen = "text" if texty else "info"
         if chosen == "info":
-            out["hint"] = ("Binary attachment — metadata only. Call again with "
-                           "mode='save' to write it to disk.")
+            out["hint"] = "Binary attachment — metadata only. " + READ_BINARY_HINT
     if chosen == "info":
         out["mode"] = "info"
         return out
     data = await asyncio.to_thread(path.read_bytes)
     if chosen == "text":
+        refuse_if_binary(name, att["content_type"], data, texty=texty)
         text = data.decode("utf-8", errors="replace")
         out["mode"] = "text"
         out["text"] = text[:20_000]

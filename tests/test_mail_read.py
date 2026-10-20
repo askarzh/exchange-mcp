@@ -372,3 +372,40 @@ def test_list_folders_depth_and_include_empty(tmp_path, db):
     ctx = _ctx(tmp_path, db, account)
     res = _run(ctx, "list_folders", depth=1, include_empty=False)
     assert [row["name"] for row in res["items"]] == ["Inbox"]
+
+
+def test_get_attachment_text_mode_refuses_a_binary_file_instead_of_dumping_it(tmp_path, db):
+    """mode='text' on a PDF used to return its raw bytes as `text` with
+    ok=true — thousands of tokens of %PDF/FlateDecode noise that looked like
+    a successful read."""
+    item = _msg("RAW-A=", attachments=[
+        _att("Талманова Нурия.pdf", b"%PDF-1.7\n\x00\xff stream FlateDecode", "application/pdf"),
+    ])
+    account = _account()
+    account.fetch = MagicMock(return_value=[item])
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "get_attachment", message_id="RAW-A=", mode="text")
+    assert res["ok"] is False
+    assert res["error"]["code"] == "validation"
+    assert "PDF" in res["error"]["message"] or "binary" in res["error"]["message"]
+    assert "save" in res["error"]["hint"] and "extract_content" in res["error"]["hint"]
+    assert "FlateDecode" not in str(res)
+
+
+def test_get_attachment_auto_hint_on_a_binary_names_the_way_to_read_it(tmp_path, db):
+    item = _msg("RAW-A=", attachments=[_att("cv.pdf", b"%PDF-1.7", "application/pdf")])
+    account = _account()
+    account.fetch = MagicMock(return_value=[item])
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "get_attachment", message_id="RAW-A=")
+    assert res["mode"] == "info" and "extract_content" in res["hint"]
+
+
+def test_get_attachment_text_mode_still_reads_text_without_a_text_content_type(tmp_path, db):
+    """Only binary is refused: XML sent as application/xml is still text."""
+    item = _msg("RAW-A=", attachments=[_att("invoice.xml", b"<inv>42</inv>", "application/xml")])
+    account = _account()
+    account.fetch = MagicMock(return_value=[item])
+    ctx = _ctx(tmp_path, db, account)
+    res = _run(ctx, "get_attachment", message_id="RAW-A=", mode="text")
+    assert res["ok"] is True and res["text"] == "<inv>42</inv>"

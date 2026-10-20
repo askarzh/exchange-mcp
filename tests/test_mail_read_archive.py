@@ -151,3 +151,15 @@ def test_semantic_mode_without_a_key_degrades_rather_than_failing(db, tmp_path):
     res = _run(ctx, "search_messages", query="budget", mode="semantic")
     assert res["ok"] is True and res["meta"]["degraded"] is True
     assert "GEMINI_API_KEY" in res["meta"]["reason"]
+
+
+def test_archived_binary_attachment_in_text_mode_is_refused_not_dumped(db, tmp_path):
+    ctx = _ctx(db, tmp_path)
+    sha, _p = files.store_blob(ctx.settings.data_dir, b"%PDF-1.7\n\x00\xff stream FlateDecode")
+    ctx.cache.replace_attachments("ARCH-1", [
+        {"name": "cv.pdf", "content_type": "application/pdf", "size": 30,
+         "sha256": sha, "is_inline": 0}])
+    res = _run(ctx, "get_attachment", message_id="ARCH-1", mode="text")
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert "extract_content" in res["error"]["hint"]
+    assert "FlateDecode" not in str(res)

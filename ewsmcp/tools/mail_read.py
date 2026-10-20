@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 
 from .. import shared
+from ..attachment_text import READ_BINARY_HINT, refuse_if_binary
 from ..dto import envelope, event_card, msg_card, msg_full
 from ..errors import ToolError
 from ..gateway.wellknown import WELL_KNOWN, paginate
@@ -329,8 +330,7 @@ async def _get_attachment(ctx: Context, message_id: str,
         if mode == "auto":
             chosen = "text" if _is_texty(name, content_type) else "info"
             if chosen == "info":
-                out["hint"] = ("Binary attachment — metadata only. Call again "
-                               "with mode='save' to write it to disk.")
+                out["hint"] = "Binary attachment — metadata only. " + READ_BINARY_HINT
         if chosen == "info":
             out["mode"] = "info"
             return out
@@ -343,6 +343,8 @@ async def _get_attachment(ctx: Context, message_id: str,
             )
         data = bytes(content)
         if chosen == "text":
+            refuse_if_binary(name, content_type, data,
+                             texty=_is_texty(name, content_type))
             text = data.decode("utf-8", errors="replace")
             out["mode"] = "text"
             out["text"] = text[:_TEXT_CAP]
@@ -616,7 +618,9 @@ TOOLS: List[ToolSpec] = [
             "the server data dir and return saved_path, plus shared_name when a "
             "shared space is configured (that copy is the one other services — "
             "file servers, model uploads — can read); 'auto' (default) → "
-            "text when text-like, otherwise info plus a hint. When the message "
+            "text when text-like, otherwise info plus a hint. 'text' on a binary "
+            "file (PDF, Office, image) is refused with how to read it: 'save', "
+            "then the Files MCP's extract_content. When the message "
             "has several attachments you MUST pick one via `attachment` (a "
             "name, or a zero-based index as a string). Attachments of "
             "archived mail are served from the server's blob store (stamped "
