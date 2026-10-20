@@ -405,3 +405,42 @@ def test_keyword_search_honours_include_calendar_items_locally(db):
     res = _run(ctx, "search_messages", query="budget", include_calendar_items=True)
     assert "Accepted: Budget review" in [i["subject"] for i in res["items"]]
     assert res["source"] == "cache" and daemon.calls == []
+
+
+def test_keyword_search_honours_flag_locally(db):
+    """`flag` was dropped by the MCP's own cache_reads call (as
+    include_calendar_items once was), so flag='complete' returned the whole
+    mailbox instead of the one finished follow-up."""
+    daemon = RecordingDaemon()
+    ctx = _mcp_ctx(db, daemon)
+    _seed(ctx)
+    ctx.cache.upsert_messages([
+        make_row("FLAG-OPEN", subject="Open follow-up", flag_status=2),
+        make_row("FLAG-DONE", subject="Done follow-up", flag_status=1),
+    ])
+
+    done = _run(ctx, "search_messages", flag="complete")
+    assert [i["subject"] for i in done["items"]] == ["Done follow-up"]
+    assert done["total_available"] == 1
+
+    open_ = _run(ctx, "search_messages", flag="flagged")
+    assert [i["subject"] for i in open_["items"]] == ["Open follow-up"]
+    assert open_["source"] == "cache" and daemon.calls == []
+
+
+def test_keyword_search_hands_every_schema_argument_to_the_mirror(db, monkeypatch):
+    """Guard for the whole class of bug above: every argument the tool schema
+    declares must reach cache_reads.search_messages (`from_` arrives folded
+    into `sender`; `mode` only picks the path)."""
+    from ewsmcp.mcp import local
+    from ewsmcp.tools import cache_reads
+    seen = {}
+
+    async def capture(ctx, **kw):
+        seen.update(kw)
+        return {"ok": True, "items": []}
+    monkeypatch.setattr(cache_reads, "search_messages", capture)
+    ctx = _mcp_ctx(db, RecordingDaemon())
+    props = ctx.registry["search_messages"].input_schema["properties"]
+    asyncio.run(local.search_messages(ctx, query="x"))
+    assert set(props) - {"from_", "mode"} <= set(seen)

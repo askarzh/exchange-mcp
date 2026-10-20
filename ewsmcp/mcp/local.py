@@ -137,6 +137,7 @@ async def search_messages(ctx: Context, **kw) -> dict[str, Any]:
             ctx, folder=kw.get("folder"), query=kw.get("query"), sender=sender,
             subject=kw.get("subject"), since=kw.get("since"), until=kw.get("until"),
             is_unread=kw.get("is_unread"), has_attachments=kw.get("has_attachments"),
+            flag=kw.get("flag"),
             offset=int(kw.get("offset", 0)), limit=int(kw.get("limit", 20)),
             archived=kw.get("archived", "any"),
             include_calendar_items=bool(kw.get("include_calendar_items", False)))
