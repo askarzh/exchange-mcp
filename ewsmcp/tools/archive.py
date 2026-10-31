@@ -39,6 +39,7 @@ _FS_UNSAFE_RE = re.compile(r'\s*[:/\\*?"<>|]+\s*')
 def _policy_dict(policy: ArchivePolicy) -> dict[str, Any]:
     return {"folders": list(policy.folders),
             "after_days": policy.after_days,
+            "capture_after_days": policy.capture_after_days,
             "grace_days": policy.grace_days,
             "exclude_categories": list(policy.exclude_categories),
             "max_delete_per_run": policy.max_delete_per_run,

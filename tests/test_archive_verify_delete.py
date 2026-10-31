@@ -292,7 +292,7 @@ def test_delete_skips_an_item_whose_changekey_moved_since_capture(captured):
     assert result["deleted"] == 1 and result["failed"] == 1
     assert items["V0"].deleted is False
     assert items["V1"].deleted is True
-    assert store.get_message("V0")["archive_state"] == "verified"
+    assert store.get_message("V0")["archive_state"] == "captured"
     assert store.get_message("V1")["archive_state"] == "deleted"
     assert len(result["reasons"]) == 1
     assert "V0" in result["reasons"][0] and "changed since capture" in result["reasons"][0]

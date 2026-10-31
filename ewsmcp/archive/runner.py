@@ -170,6 +170,10 @@ class ArchiveRunner:
                     out["deleted"] = res["deleted"]
                     out["failed"] += res["failed"]
                     out["blocked"] = res["blocked"]
+                    # Onto the run row, where archive_status shows it. A
+                    # refused delete leaves no other trace.
+                    out["stopped"] = (out["stopped"] or res["held"]
+                                      or res["warning"])
                     if not out["sample"]:
                         out["sample"] = res["sample"]
             except Exception as exc:  # noqa: BLE001 - a pass never takes ewsd down
@@ -283,6 +287,8 @@ class ArchiveRunner:
             # The policy ewsd actually runs. The MCP process has no ARCHIVE_*
             # environment of its own, so this is the only truthful source.
             "policy": self._policy_dict(),
+            "backup": ArchivePolicy.from_settings(self.settings).backup_state(
+                self.settings.data_dir),
             "semantic_enabled": bool(self.settings.semantic_enabled()),
             # Filled at the end of each cycle; empty before the first one.
             "boilerplate": dict(self._boilerplate_cache),
@@ -299,6 +305,7 @@ class ArchiveRunner:
     def _policy_dict(self) -> dict[str, Any]:
         p = ArchivePolicy.from_settings(self.settings)
         return {"folders": list(p.folders), "after_days": p.after_days,
+                "capture_after_days": p.capture_after_days,
                 "grace_days": p.grace_days,
                 "exclude_categories": list(p.exclude_categories),
                 "max_delete_per_run": p.max_delete_per_run,

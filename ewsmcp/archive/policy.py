@@ -8,6 +8,7 @@ apply one policy and half another.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import asdict, dataclass, replace
 from typing import Any
@@ -48,6 +49,10 @@ class ArchivePolicy:
     max_delete_per_run: int
     min_free_gb: float
     before_ts: int | None = None  # explicit cutoff from archive_run(before=…)
+    capture_after_days: int | None = None  # None: capture at after_days
+    backup_stamp: str = ""                 # empty: rail 4 is off
+    backup_max_age_hours: int = 48
+    backup_hold_max_days: int = 10
 
     @classmethod
     def from_settings(cls, settings: Any) -> "ArchivePolicy":
@@ -66,6 +71,10 @@ class ArchivePolicy:
             delete_enabled=bool(settings.archive_delete_enabled),
             max_delete_per_run=int(settings.archive_max_delete_per_run),
             min_free_gb=float(settings.archive_min_free_gb),
+            capture_after_days=settings.archive_capture_after_days,
+            backup_stamp=settings.archive_backup_stamp,
+            backup_max_age_hours=int(settings.archive_backup_max_age_hours),
+            backup_hold_max_days=int(settings.archive_backup_hold_max_days),
         )
 
     def with_overrides(self, *, before: str | None = None,
@@ -80,21 +89,49 @@ class ArchivePolicy:
 
     # ------------------------------------------------------------- cutoffs
 
-    def capture_cutoff_ts(self, now: float | None = None) -> int:
+    def _age_cutoff_ts(self, days: int, now: float | None) -> int:
         if self.before_ts is not None:
             return int(self.before_ts)
-        return int((now if now is not None else time.time())
-                   - self.after_days * DAY)
+        return int((now if now is not None else time.time()) - days * DAY)
+
+    def capture_cutoff_ts(self, now: float | None = None) -> int:
+        """Never later than after_days: mail that is not captured cannot be
+        deleted, and a mailbox with a quota fills up behind it."""
+        days = self.after_days if self.capture_after_days is None else (
+            min(max(0, int(self.capture_after_days)), self.after_days))
+        return self._age_cutoff_ts(days, now)
 
     def delete_cutoff_ts(self, now: float | None = None) -> int:
-        """Cutoff PLUS the grace period — rail 3, the date half."""
-        return self.capture_cutoff_ts(now) - self.grace_days * DAY
+        """after_days PLUS the grace period — rail 3, the date half. Measured
+        from after_days, not from the capture age: capturing mail early says
+        nothing about when it may leave the mailbox."""
+        return self._age_cutoff_ts(self.after_days, now) - self.grace_days * DAY
 
     def grace_instant_ts(self, now: float | None = None) -> int:
         """A row must have been verified at least grace_days ago — rail 3, the
         verification half. Freshly verified mail is never deleted, however old."""
         return int((now if now is not None else time.time())
                    - self.grace_days * DAY)
+
+    # -------------------------------------------------------------- backup
+
+    def backup_state(self, data_dir: str, now: float | None = None) -> dict[str, Any]:
+        """Rail 4. `state` is off, fresh, stale (holds deletion), expired (the
+        hold ran out: deletion resumes, loudly) or missing (holds for good)."""
+        if not self.backup_stamp:
+            return {"state": "off", "age_hours": None}
+        try:
+            stamped = os.stat(os.path.join(data_dir, self.backup_stamp)).st_mtime
+        except OSError:
+            return {"state": "missing", "age_hours": None}
+        age = ((now if now is not None else time.time()) - stamped) / 3600
+        if age <= self.backup_max_age_hours:
+            state = "fresh"
+        elif age <= self.backup_hold_max_days * 24:
+            state = "stale"
+        else:
+            state = "expired"
+        return {"state": state, "age_hours": round(age, 1)}
 
     # ------------------------------------------------------------- folders
 

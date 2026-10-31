@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     # --- Archive pipeline (daemon only) --------------------------------------
     archive_folders: str = "inbox,sent"        # well-known keys, never calendar/contacts/tasks
     archive_after_days: int = 180
+    # Copy mail this many days after it was sent, independently of when it may
+    # be deleted (0 = on arrival). Unset, capture follows archive_after_days.
+    archive_capture_after_days: int | None = None
     archive_exclude_categories: str = ""
     archive_grace_days: int = 7
     archive_delete_enabled: bool = False       # rail 1 of 3: deletion is OFF by default
@@ -104,6 +107,14 @@ class Settings(BaseSettings):
     archive_max_delete_per_run: int = 200
     archive_min_free_gb: float = 2.0
     archive_cycle_seconds: int = 300
+    # Rail 4: a file under data_dir the backup job touches after a good run.
+    # Empty turns the rail off. Older than max_age_hours holds deletion; past
+    # hold_max_days deletion resumes with a warning, because a mailbox with a
+    # quota stops working if nothing ever leaves it. A MISSING file is never
+    # released: it may mean the archive volume itself is gone.
+    archive_backup_stamp: str = ""
+    archive_backup_max_age_hours: int = 48
+    archive_backup_hold_max_days: int = 10
 
     # --- Phase 3: boilerplate detectors (daemon only) ------------------------
     embed_boilerplate_threshold: float = 0.80

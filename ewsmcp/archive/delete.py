@@ -7,9 +7,16 @@ is issued:
 1. `ARCHIVE_DELETE_ENABLED` is true (checked here; the `full`-tier + confirm
    gate for the tool path is the caller's job).
 2. The row is `verified`.
-3. The row is older than the delete cutoff (capture cutoff + grace) AND was
+3. The row is older than the delete cutoff (after_days + grace) AND was
    verified at least a grace period ago — `CacheStore.deletable_rows` is the
    only query that selects candidates, so both halves of rail 3 live there.
+
+A fourth rail sits above those: when `ARCHIVE_BACKUP_STAMP` is set, a stale
+backup holds the whole pass, because the archive may be the only copy once
+this runs. A stale marker holds for `ARCHIVE_BACKUP_HOLD_MAX_DAYS` and then
+gives way with a warning, since a mailbox with a quota stops working if
+nothing leaves it. A missing marker never gives way: it may mean the volume
+holding the archive is gone.
 
 On top of that, two LAST-MILE checks are re-done immediately before a batch
 is deleted, because at least ARCHIVE_GRACE_DAYS pass between verification and
@@ -28,8 +35,11 @@ deletion and neither disk nor mailbox stands still in the meantime:
 - **The changekey re-fetched from Exchange** must still match
   `captured_changekey` (the snapshot taken at capture/verify time). A
   mismatch — or either side missing — means the item changed after it was
-  verified and is skipped, never deleted; it is counted in `failed` and gets a
-  line in `reasons`, not silently dropped.
+  verified and is skipped, never deleted; it is counted in `failed`, gets a
+  line in `reasons`, and is demoted to `captured`. The verifier then resets it
+  and the capturer takes the current version. Without that it would fail every
+  run for ever, holding its place at the head of the oldest-first queue, and
+  reading a message is enough to move a changekey.
 
 Deletes go to Exchange in batches of `BATCH_SIZE`. `mark_deleted` plus one
 destructive-class audit record per successfully deleted item are written
@@ -85,6 +95,7 @@ from .policy import ArchivePolicy
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 25
+STALE_REASON = "changekey changed since capture"
 
 
 class Deleter:
@@ -102,12 +113,28 @@ class Deleter:
             "eligible": 0, "deleted": 0, "failed": 0, "remaining": 0,
             "unmarked": 0, "deleted_unrecorded": [], "reasons": [],
             "blocked": None, "error": None, "sample": [],
+            "requeued": 0, "held": None, "warning": None,
         }
         if not self.policy.delete_enabled:
             result["blocked"] = (
                 "ARCHIVE_DELETE_ENABLED=false — nothing is deleted from Exchange. "
                 "Flip it deliberately once you trust the archive.")
             return result
+        backup = await asyncio.to_thread(self.policy.backup_state,
+                                         self.settings.data_dir)
+        if backup["state"] in ("stale", "missing"):
+            age = backup["age_hours"]
+            result["held"] = result["blocked"] = (
+                "backup marker missing" if age is None
+                else f"last good backup is {age:.0f}h old"
+            ) + " — nothing is deleted from Exchange until a backup succeeds"
+            logger.error("archive delete held: %s", result["held"])
+            return result
+        if backup["state"] == "expired":
+            result["warning"] = (
+                f"last good backup is {backup['age_hours']:.0f}h old and the hold "
+                "has run out: deleting so the mailbox does not fill")
+            logger.error("archive delete: %s", result["warning"])
         rows = await asyncio.to_thread(
             self.store.deletable_rows,
             before_ts=self.policy.delete_cutoff_ts(),
@@ -171,6 +198,9 @@ class Deleter:
             skip_pairs = list(unusable.items()) + list(reasons.items())
             if skip_pairs:
                 await asyncio.to_thread(self._persist_skips, skip_pairs, run_id)
+            stale = [i for i, r in reasons.items() if r.startswith(STALE_REASON)]
+            if stale:
+                result["requeued"] += await asyncio.to_thread(self._requeue, stale)
             if not deleted:
                 continue
             # Counted as `deleted` the moment Exchange's item.delete() has
@@ -239,6 +269,11 @@ class Deleter:
                 tool="archive_delete_skipped", side_effect_class="destructive",
                 outcome="skipped", latency_ms=0, transport="archive",
                 detail={"ews_id": ews_id, "reason": reason, "run_id": run_id})
+
+    # Runs on a worker thread (asyncio.to_thread). The verifier takes it from
+    # here: its own changekey check resets the row for a fresh capture.
+    def _requeue(self, ids: list[str]) -> int:
+        return sum(self.store.demote_to_captured(i) for i in ids)
 
     # Runs on a worker thread (asyncio.to_thread): file hashing and the
     # per-row attachment lookups are both blocking.
@@ -315,7 +350,7 @@ class Deleter:
                 captured_ck = by_id[raw_id].get("captured_changekey")
                 if not captured_ck or not live_ck or live_ck != captured_ck:
                     raise _StaleChangekey(
-                        f"changekey changed since capture (captured={captured_ck!r}, "
+                        f"{STALE_REASON} (captured={captured_ck!r}, "
                         f"live={live_ck!r})")
                 item.delete()  # exchangelib 5.0.3: Item.delete() IS HardDelete
                 done.append(raw_id)

@@ -6,7 +6,19 @@ this file starts from the point this repository was extracted.
 
 ## [Unreleased]
 
+### Added
+- `ARCHIVE_CAPTURE_AFTER_DAYS` separates capture from deletion, so mail can be
+  copied on arrival while it stays in Exchange until `ARCHIVE_AFTER_DAYS`.
+  Unset, capture follows `ARCHIVE_AFTER_DAYS` as before.
+- A backup rail on deletion. With `ARCHIVE_BACKUP_STAMP` set, a marker older
+  than `ARCHIVE_BACKUP_MAX_AGE_HOURS` holds deletion, for at most
+  `ARCHIVE_BACKUP_HOLD_MAX_DAYS`; then it resumes with a warning, because a
+  mailbox with a quota stops working if nothing leaves it. A missing marker
+  never gives way. `archive_status` reports the state.
+
 ### Fixed
+- Mail that changed after verification is recaptured instead of failing
+  deletion every run for ever at the head of the oldest-first queue.
 - The Mindet bridge serves mail the archive has deleted from Exchange. It hid
   every row with `deleted_at`, but that column means the archive kept the mail,
   so a backfill could never reach anything past the archive's cutoff. `sweep`,

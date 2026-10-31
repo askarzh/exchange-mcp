@@ -204,6 +204,10 @@ Postgres and calls `ewsd`). Both need `DATABASE_URL`. See
 | `EMBED_DIMS` | `768` | Fixed by migration 003's `vector(768)` column; any other value fails to boot |
 | `ARCHIVE_FOLDERS` | `inbox,sent` | Well-known folder keys the archive pipeline captures; never calendar/contacts/tasks. Fail-closed: set to empty and the pipeline captures NOTHING, not every folder |
 | `ARCHIVE_AFTER_DAYS` | `180` | Age cutoff (days) before a message becomes eligible for archival |
+| `ARCHIVE_CAPTURE_AFTER_DAYS` | — | Copy mail this many days after it was sent (`0` = on arrival). Unset, capture follows `ARCHIVE_AFTER_DAYS`. Never later than `ARCHIVE_AFTER_DAYS`. |
+| `ARCHIVE_BACKUP_STAMP` | — | File under `DATA_DIR` the backup job touches after a good run. Set, a stale backup holds deletion; a missing file holds it for good. |
+| `ARCHIVE_BACKUP_MAX_AGE_HOURS` | `48` | Marker age that holds deletion |
+| `ARCHIVE_BACKUP_HOLD_MAX_DAYS` | `10` | Marker age at which deletion resumes with a warning, so a mailbox with a quota cannot fill |
 | `ARCHIVE_EXCLUDE_CATEGORIES` | — | Comma-separated categories excluded from archival |
 | `ARCHIVE_GRACE_DAYS` | `7` | Extra days past the cutoff a `verified` row must age before it is eligible for deletion; floored at 1 |
 | `ARCHIVE_DELETE_ENABLED` | `false` | **The rollout switch.** Capture, verify and embed run regardless; this is rail 1 of 3 for the Exchange delete itself — OFF by default, deletion also needs tier `full` (plus a confirm token) and the per-run cap. `SEND_ENABLED` does NOT gate deletion: it is the send kill-switch only |
