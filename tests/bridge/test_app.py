@@ -70,12 +70,11 @@ def test_a_terminal_page_echoes_even_when_the_head_has_moved_past_it(db):
     terminal page's `after` always equals `head(c)` — a mutant that always
     returns `head(c)` instead of echoing `after` would still pass. Force
     `after != head(c)` on a genuinely terminal page: seed two messages, sweep
-    (so both get a seq and `head(c)` sits on the second), then soft-delete the
-    second. A page asked from a cursor at the first message's seq now sees no
-    live rows past it — terminal — while `head(c)` still reports the deleted
-    message's seq. Only echoing `after` gets this right; jumping to
-    `head(c)` would silently skip nothing (there is nothing left to skip),
-    but it would still be answering the wrong rule."""
+    (so both get a seq and `head(c)` sits on the second), then ask from the
+    first message's seq with an `until` before either arrived. That page is
+    terminal — nothing past the cursor qualifies — while `head(c)` still sits
+    on the second message. Only echoing `after` gets this right; jumping to
+    `head(c)` would carry the consumer past a message it never saw."""
     with db.conn() as conn:
         _msg(conn, "m1")
         _msg(conn, "m2")
@@ -83,11 +82,10 @@ def test_a_terminal_page_echoes_even_when_the_head_has_moved_past_it(db):
         m1_seq = conn.execute(
             "SELECT seq FROM ews.bridge_arrival WHERE ews_id = 'm1'").fetchone()["seq"]
         head_seq = bridge_app.arrival.head(conn)
-        conn.execute("UPDATE ews.messages SET deleted_at = now() WHERE ews_id = 'm2'")
     assert m1_seq != head_seq
     c = _client(db)
     cursor = f"v1:{_gen(db)}:{m1_seq}"
-    r = c.get("/bridge/v1/messages", params={"since": cursor},
+    r = c.get("/bridge/v1/messages", params={"since": cursor, "until": "2000-01-01T00:00:00+00:00"},
               headers={"Authorization": "Bearer t"}).json()
     assert r["messages"] == []
     assert r["next"] == cursor
@@ -476,3 +474,63 @@ def test_an_unhandled_fault_is_logged_and_answered_generically(caplog):
     assert "secret@host" not in r.text
     assert any("unhandled error serving /bridge/v1/health" in rec.getMessage()
                for rec in caplog.records)
+
+
+def _archive(conn, ews_id):
+    """What the archive's delete worker leaves behind: gone from Exchange, kept
+    here. `mark_deleted` is the only path to this state besides a server delete
+    of mail already captured, and both mean the archive holds the mail."""
+    conn.execute("UPDATE ews.messages SET archive_state = 'deleted', deleted_at = now()"
+                 " WHERE ews_id = %s", (ews_id,))
+
+
+AUTH = {"Authorization": "Bearer t"}
+
+
+def test_mail_archived_after_it_entered_the_ledger_is_still_served(db):
+    """Removing mail from Exchange does not remove it from this store, and the
+    store is what the bridge reports. Hiding it made history older than the
+    archive's cutoff unreachable to any backfill."""
+    with db.conn() as conn:
+        _msg(conn, "kept")
+        _msg(conn, "archived")
+        bridge_app.arrival.sweep(conn)
+        _archive(conn, "archived")
+    r = _client(db).get("/bridge/v1/messages", headers=AUTH).json()
+    assert {m["native_id"] for m in r["messages"]} == {"kept", "archived"}
+
+
+def test_mail_archived_before_any_sweep_saw_it_still_enters_the_stream(db):
+    """The older half of the history: rows deleted from Exchange before the
+    ledger reached them hold no sequence. Serving rows with a sequence is not
+    enough; the sweep has to give them one."""
+    with db.conn() as conn:
+        _msg(conn, "archived-early")
+        _archive(conn, "archived-early")
+    r = _client(db).get("/bridge/v1/messages", headers=AUTH).json()
+    assert [m["native_id"] for m in r["messages"]] == ["archived-early"]
+
+
+def test_a_conversation_held_only_in_the_archive_is_in_the_catalog(db):
+    """A consumer skips a message whose chat `chats` did not name and moves its
+    cursor past it, so serving archived mail without naming its conversation
+    would lose it just as quietly."""
+    with db.conn() as conn:
+        _msg(conn, "only-archived")
+        _archive(conn, "only-archived")
+    c = _client(db)
+    messages = c.get("/bridge/v1/messages", headers=AUTH).json()["messages"]
+    chats = c.get("/bridge/v1/chats", headers=AUTH).json()["chats"]
+    assert {m["chat"] for m in messages} <= {x["native_id"] for x in chats}
+    assert "conv-only-archived" in {x["native_id"] for x in chats}
+
+
+def test_mail_really_removed_from_the_store_is_not_served(db):
+    """Live mail deleted in Exchange is dropped from the store outright. The
+    bridge may only serve what the store still holds."""
+    with db.conn() as conn:
+        _msg(conn, "gone")
+        bridge_app.arrival.sweep(conn)
+        conn.execute("DELETE FROM ews.messages WHERE ews_id = 'gone'")
+    r = _client(db).get("/bridge/v1/messages", headers=AUTH).json()
+    assert r["messages"] == []

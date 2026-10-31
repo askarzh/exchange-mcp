@@ -61,8 +61,10 @@ def sweep(conn) -> int:
         "        now(), now(), coalesce(m.conversation_id, m.ews_id)"
         "   FROM ews.messages m"
         "   LEFT JOIN ews.bridge_arrival a ON a.ews_id = m.ews_id"
-        "  WHERE m.deleted_at IS NULL"
-        "    AND (a.ews_id IS NULL OR a.changekey IS DISTINCT FROM m.changekey)"
+        # No `deleted_at` test: that column means the mail left Exchange and the
+        # archive kept it, never that it left this store (see `page`). Mail
+        # archived before a sweep reached it has to get its sequence here.
+        "  WHERE a.ews_id IS NULL OR a.changekey IS DISTINCT FROM m.changekey"
         # Oldest first, so a batch of newly-discovered mail enters the ledger
         # in send order and `until` stays a prefix of the sequence stream. Note
         # that nextval is evaluated wherever the planner puts it, so this is a
@@ -110,7 +112,11 @@ def page(conn, *, after_seq: int | None, until: dt.datetime | None,
            " coalesce(a.chat_id, m.conversation_id, m.ews_id) AS chat_id"
            " FROM ews.bridge_arrival a"
            " JOIN ews.messages m ON m.ews_id = a.ews_id"
-           " WHERE m.deleted_at IS NULL")
+           # Archived mail is served. `deleted_at` is set only on rows the
+           # archive holds (live mail deleted in Exchange is dropped from the
+           # table), so filtering on it hid everything past the archive's
+           # cutoff from a backfill, and the history with it.
+           " WHERE true")
     args: list = []
     if after_seq is not None:
         sql += " AND a.seq > %s"

@@ -232,7 +232,9 @@ def build_app(pool, *, token: str, owner_email: str = "") -> Starlette:
                 " m.subject, m.sender_email, m.to_json"
                 " FROM ews.messages m"
                 " LEFT JOIN ews.bridge_arrival a ON a.ews_id = m.ews_id"
-                " WHERE m.deleted_at IS NULL"
+                # Archived rows included: `messages` serves them, and a message
+                # whose chat is not named here is skipped for good.
+                #
                 # Most recent first, so the first row met for a conversation
                 # carries its newest subject and the conversations come back
                 # in recency order. ews_id DESC breaks a same-second tie

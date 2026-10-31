@@ -4,6 +4,17 @@ Earlier history (the 4.0–4.5 lines) lives in the upstream
 [`azizmazrou/ews-mcp`](https://github.com/azizmazrou/ews-mcp) changelog;
 this file starts from the point this repository was extracted.
 
+## [Unreleased]
+
+### Fixed
+- The Mindet bridge serves mail the archive has deleted from Exchange. It hid
+  every row with `deleted_at`, but that column means the archive kept the mail,
+  so a backfill could never reach anything past the archive's cutoff. `sweep`,
+  the message feed and `chats` all change together: rows archived before a sweep
+  saw them now get a sequence, and a message whose chat `chats` omits would be
+  skipped. A consumer's first poll after this sees the newly sequenced rows; one
+  bounded by a window ignores them by send date.
+
 ## [5.2.0a2] - 2026-09-08 (pre-release)
 
 ### Fixed
