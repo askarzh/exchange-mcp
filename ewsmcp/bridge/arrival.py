@@ -14,7 +14,7 @@ import datetime as dt
 # ever reads them, and every one of them is mail plumbing that the contract
 # deliberately does not speak.
 _COLS = ("m.ews_id, m.sender_name, m.sender_email, m.to_json, m.subject,"
-         " m.date_ts, m.body_clean")
+         " m.date_ts, m.body_clean, m.item_class")
 
 # Any 64-bit constant unique to this lane; see sweep().
 _SWEEP_LOCK_KEY = 0x6577735F73776570        # "ews_swep"

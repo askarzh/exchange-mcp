@@ -178,3 +178,60 @@ def test_is_owner_set_when_sender_key_matches_owner_key():
     # Message with no owner_key provided (not the owner's mailbox).
     m = mapping.message(_row(sender_email="owner@example.test"), owner_key=None)
     assert m["author"]["is_owner"] is False
+
+
+# ------------------------------------------------------- meetings are not mail
+#
+# The owner's calendar is in his mailbox: Exchange delivers an invitation, each
+# reply and every cancellation as items whose class says what they are. The
+# bridge handed them over as ordinary mail, so a consumer could not tell a
+# meeting from a message, when it starts, or whether it was called off — and an
+# invitation's body is usually empty, so what survived was nothing at all.
+
+
+def test_an_invitation_says_it_is_a_meeting_and_keeps_its_subject():
+    m = mapping.message(_row(item_class="IPM.Schedule.Meeting.Request",
+                             subject="Quarterly review", body_clean=""))
+    assert m["meta"]["meeting"] == {"kind": "invitation"}
+    assert m["text"] == "Quarterly review"
+    assert m["kind"] == "mail"
+
+
+def test_an_invitation_with_a_body_keeps_both():
+    m = mapping.message(_row(item_class="IPM.Schedule.Meeting.Request",
+                             subject="Quarterly review", body_clean="agenda inside"))
+    assert m["text"] == "Quarterly review\n\nagenda inside"
+
+
+@pytest.mark.parametrize(
+    ("item_class", "meeting"),
+    [
+        ("IPM.Schedule.Meeting.Request", {"kind": "invitation"}),
+        ("IPM.Schedule.Meeting.Resp.Pos", {"kind": "reply", "response": "accepted"}),
+        ("IPM.Schedule.Meeting.Resp.Neg", {"kind": "reply", "response": "declined"}),
+        ("IPM.Schedule.Meeting.Resp.Tent", {"kind": "reply", "response": "tentative"}),
+        ("IPM.Schedule.Meeting.Canceled", {"kind": "cancellation"}),
+        ("IPM.Schedule.Meeting.Notification.Forward", {"kind": "forwarded"}),
+    ],
+)
+def test_every_meeting_class_is_named_in_plain_words(item_class, meeting):
+    assert mapping.message(_row(item_class=item_class))["meta"]["meeting"] == meeting
+
+
+def test_ordinary_mail_carries_no_meeting_marker():
+    assert "meeting" not in mapping.message(_row())["meta"]
+    assert mapping.message(_row(item_class=None))["meta"] == {}
+
+
+def test_a_meeting_class_this_bridge_does_not_know_is_still_a_meeting():
+    """Exchange has more schedule classes than these; an unknown one must not
+    read as ordinary mail, because that is how a cancellation goes unnoticed."""
+    m = mapping.message(_row(item_class="IPM.Schedule.Meeting.Something.New"))
+    assert m["meta"]["meeting"] == {"kind": "other", "class": "IPM.Schedule.Meeting.Something.New"}
+
+
+def test_a_meeting_subject_is_not_repeated_when_the_body_already_starts_with_it():
+    m = mapping.message(_row(item_class="IPM.Schedule.Meeting.Canceled",
+                             subject="Quarterly review",
+                             body_clean="Quarterly review has been cancelled"))
+    assert m["text"] == "Quarterly review has been cancelled"
