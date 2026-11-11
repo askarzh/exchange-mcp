@@ -854,3 +854,185 @@ def test_attachment_tools_return_aliases_not_raw_ids(tmp_path, db):
         assert res["ok"] is True
         assert res["draft_id"] == alias
         assert "RAW" not in res["draft_id"]
+
+
+# --- add_attachment from the shared space (/shared) -------------------------
+# M365 download_file, Files MCP, Telegram and WhatsApp all drop files into the
+# shared space; add_attachment only read DATA_DIR, so none of them could be
+# attached to a draft (2026-11-11, d40).
+
+
+def _shared_ctx(tmp_path, db, account):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    return make_ctx(tmp_path, db, account, shared_dir=str(shared)), shared
+
+
+def test_add_attachment_reads_a_file_from_the_shared_space(tmp_path, db):
+    account = make_account()
+    ctx, shared = _shared_ctx(tmp_path, db, account)
+    draft, alias = _draft_with_attachments(account, ctx)
+    (shared / "схема3_клиентские_отношения.png").write_bytes(b"\x89PNG scheme")
+
+    res = call(ctx, "add_attachment", {"draft_id": alias,
+                                       "path": str(shared / "схема3_клиентские_отношения.png")})
+    assert res["ok"] is True and res["name"] == "схема3_клиентские_отношения.png"
+    assert draft.attach.call_args[0][0].content == b"\x89PNG scheme"
+
+
+def test_add_attachment_takes_a_bare_shared_name(tmp_path, db):
+    """The shared_name other tools return, without the /shared prefix."""
+    account = make_account()
+    ctx, shared = _shared_ctx(tmp_path, db, account)
+    draft, alias = _draft_with_attachments(account, ctx)
+    (shared / "plan.pdf").write_bytes(b"%PDF plan")
+    res = call(ctx, "add_attachment", {"draft_id": alias, "path": "plan.pdf"})
+    assert res["ok"] is True and draft.attach.call_args[0][0].content == b"%PDF plan"
+
+
+@pytest.mark.parametrize("rel", [".links/token.json", "sub/.hidden.pdf", "../secret.txt"])
+def test_add_attachment_refuses_hidden_and_escaping_shared_paths(tmp_path, db, rel):
+    """/shared/.links holds the Files MCP's capability tokens: attaching one to a
+    mail would hand out a working download link. Hidden components and
+    traversal stay refused."""
+    account = make_account()
+    ctx, shared = _shared_ctx(tmp_path, db, account)
+    _draft, alias = _draft_with_attachments(account, ctx)
+    (shared / ".links").mkdir()
+    (shared / ".links" / "token.json").write_text("{}")
+    (shared / "sub").mkdir()
+    (shared / "sub" / ".hidden.pdf").write_bytes(b"x")
+    (tmp_path / "secret.txt").write_bytes(b"nope")
+    res = call(ctx, "add_attachment", {"draft_id": alias, "path": str(shared / rel)})
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+
+
+def test_add_attachment_refuses_a_shared_symlink_pointing_outside(tmp_path, db):
+    account = make_account()
+    ctx, shared = _shared_ctx(tmp_path, db, account)
+    _draft, alias = _draft_with_attachments(account, ctx)
+    (tmp_path / "secret.txt").write_bytes(b"nope")
+    (shared / "innocent.txt").symlink_to(tmp_path / "secret.txt")
+    res = call(ctx, "add_attachment", {"draft_id": alias, "path": str(shared / "innocent.txt")})
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+
+
+def test_without_a_shared_space_only_data_dir_is_readable(tmp_path, db):
+    account = make_account()
+    ctx = make_ctx(tmp_path, db, account)          # shared_dir unset
+    _draft, alias = _draft_with_attachments(account, ctx)
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "shared" / "plan.pdf").write_bytes(b"x")
+    res = call(ctx, "add_attachment",
+               {"draft_id": alias, "path": str(tmp_path / "shared" / "plan.pdf")})
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+
+
+# --- reply / forward to mail that exists only in the archive ------------------
+# create_reply/create_forward are Exchange operations on the ORIGINAL item; once
+# the archiver deleted it from Exchange (archive_state='deleted') they fail with
+# ErrorItemNotFound and a "re-run search_messages" hint that loops forever
+# (2026-11-11, m1343). The draft is built from the archived .eml instead.
+
+from conftest import make_row  # noqa: E402
+
+from ewsmcp.archive import files as archive_files  # noqa: E402
+
+ARCHIVED_EML = (
+    b"From: Lawyer <lawyer@bank.example>\r\n"
+    b"To: Askar <askar@hub.example>\r\n"
+    b"Cc: Team <team@hub.example>, Other <other@bank.example>\r\n"
+    b"Subject: =?utf-8?b?0KHQvtCz0LvQsNGB0L7QstCw0L3QvdCw0Y8g0YDQtdC00LDQutGG0LjRjw==?=\r\n"
+    b"Date: Tue, 10 Nov 2026 10:00:00 +0500\r\n"
+    b"Message-ID: <orig-123@bank.example>\r\n"
+    b"References: <earlier-1@bank.example>\r\n"
+    b"MIME-Version: 1.0\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+    b"Clause 7 agreed as discussed.\r\n"
+)
+
+
+class FakeArchivedDraft(FakeDraftMessage):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.attached = []
+
+    def attach(self, att):
+        self.attached.append(att)
+
+
+def _archived_ctx(tmp_path, db, monkeypatch, *, state="deleted", with_mime=True):
+    account = make_account()
+    account.primary_smtp_address = "askar@hub.example"
+    ctx = make_context(db, gateway=FakeGateway(account), cache=True,
+                       audit_dir=str(tmp_path / "audit"))
+    ctx.cache.upsert_messages([make_row("ARCH-1", subject="Согласованная редакция")])
+    if with_mime:
+        sha, path = archive_files.store_mime(ctx.settings.data_dir, ARCHIVED_EML)
+        ctx.cache.mark_captured("ARCH-1", mime_sha256=sha, mime_path=str(path))
+        if state in ("verified", "deleted"):
+            ctx.cache.mark_verified("ARCH-1")
+        if state == "deleted":
+            ctx.cache.mark_deleted(["ARCH-1"])
+    monkeypatch.setattr(writes, "Message", FakeArchivedDraft)
+    return ctx, account, ctx.aliaser.alias_for("ARCH-1", "m")
+
+
+def test_forward_of_archived_mail_attaches_the_original_eml(tmp_path, db, monkeypatch):
+    ctx, account, alias = _archived_ctx(tmp_path, db, monkeypatch)
+    res = call(ctx, "create_draft", {"mode": "forward", "reply_to": alias,
+                                     "to": ["colleague@hub.example"], "body": "FYI"})
+    assert res["ok"] is True, res
+    msg = FakeArchivedDraft.last
+    assert msg.kwargs["folder"] is account.drafts
+    assert msg.kwargs["to_recipients"] == ["colleague@hub.example"]
+    assert msg.kwargs["subject"] == "Fwd: Согласованная редакция"
+    body = str(msg.kwargs["body"])
+    assert "FYI" in body and "Clause 7 agreed" in body and "lawyer@bank.example" in body
+    [att] = msg.attached
+    assert att.content == ARCHIVED_EML and att.name.endswith(".eml")
+    assert msg.save_calls == [{}]
+    assert res["source"] == "archive"
+
+
+def test_reply_all_to_archived_mail_addresses_from_its_headers(tmp_path, db, monkeypatch):
+    ctx, _account, alias = _archived_ctx(tmp_path, db, monkeypatch)
+    res = call(ctx, "create_draft", {"mode": "reply_all", "reply_to": alias, "body": "Agreed"})
+    assert res["ok"] is True, res
+    msg = FakeArchivedDraft.last
+    assert msg.kwargs["to_recipients"] == ["lawyer@bank.example"]
+    assert sorted(msg.kwargs["cc_recipients"]) == ["other@bank.example", "team@hub.example"]
+    assert msg.kwargs["subject"] == "Re: Согласованная редакция"
+    assert msg.kwargs["in_reply_to"] == "<orig-123@bank.example>"
+    assert msg.kwargs["references"] == "<earlier-1@bank.example> <orig-123@bank.example>"
+    assert "Clause 7 agreed" in str(msg.kwargs["body"]) and msg.attached == []
+
+
+def test_reply_to_archived_mail_goes_to_the_sender_only(tmp_path, db, monkeypatch):
+    ctx, _account, alias = _archived_ctx(tmp_path, db, monkeypatch)
+    res = call(ctx, "create_draft", {"mode": "reply", "reply_to": alias, "body": "Thanks"})
+    assert res["ok"] is True, res
+    msg = FakeArchivedDraft.last
+    assert msg.kwargs["to_recipients"] == ["lawyer@bank.example"]
+    assert not msg.kwargs.get("cc_recipients")
+
+
+def test_archived_mail_without_its_eml_says_archived_only(tmp_path, db, monkeypatch):
+    ctx, _account, alias = _archived_ctx(tmp_path, db, monkeypatch)
+    row = ctx.cache.get_message("ARCH-1")
+    Path(row["mime_path"]).unlink()
+    res = call(ctx, "create_draft", {"mode": "forward", "reply_to": alias,
+                                     "to": ["x@hub.example"], "body": "x"})
+    assert res["ok"] is False and res["error"]["code"] == "archived_only"
+    assert "search_messages" not in (res["error"].get("hint") or "")
+
+
+def test_captured_mail_still_in_exchange_uses_the_exchange_reply(tmp_path, db, monkeypatch):
+    ctx, account, alias = _archived_ctx(tmp_path, db, monkeypatch, state="captured")
+    original = MagicMock(subject="Budget")
+    reply_item = MagicMock(to_recipients=None, cc_recipients=None)
+    reply_item.save.return_value = SimpleNamespace(id="RAW-R", changekey="CK")
+    original.create_reply.return_value = reply_item
+    account._by_id["ARCH-1"] = original
+    res = call(ctx, "create_draft", {"mode": "reply", "reply_to": alias, "body": "x"})
+    assert res["ok"] is True and original.create_reply.called

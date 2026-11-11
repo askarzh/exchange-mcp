@@ -11,6 +11,7 @@ HTTP_BY_CODE = {
     "recipient_blocked": 403,
     "confirm_invalid": 409,
     "not_found": 404,
+    "archived_only": 409,
     "throttled": 429,
     "rate_capped": 429,
     "upstream_unavailable": 503,

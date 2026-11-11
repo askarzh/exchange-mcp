@@ -30,6 +30,7 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
   flag field; pretending would be mock-drift bait (categories instead).
 """
 
+import asyncio
 import base64 as _b64
 import html as _html
 import logging
@@ -50,7 +51,7 @@ from exchangelib.items import (
 from .. import uploads
 from ..dates import parse_when
 from ..errors import ToolError
-from . import write_specs
+from . import archived_drafts, write_specs
 from .base import Context, ToolSpec
 from .write_specs import DRAFT_MODES as _DRAFT_MODES
 from .write_specs import MAX_BULK_IDS
@@ -255,6 +256,45 @@ async def _create_upload_link(ctx: Context, *, name: str,
 # produces, making save→attach a zero-token hand-off.
 MAX_INLINE_ATTACHMENT_BYTES = 5 * 1024 * 1024
 
+# Characters no filesystem accepts in a name (same rule as get_raw_message).
+_FS_UNSAFE_RE = _re.compile(r'\s*[:/\\*?"<>|]+\s*')
+
+
+def _readable_attachment_path(ctx: Context, path: str) -> Path:
+    """Resolve `path` to a file add_attachment may read, or raise validation.
+
+    Containment: the server must not become a file-exfiltration primitive (an
+    attached file can be mailed anywhere). Readable are DATA_DIR and the
+    shared space — where M365, the Files MCP, Telegram and WhatsApp put files,
+    and where get_attachment(mode='save') publishes — and nothing else.
+    Symlinks are resolved before the check. In the shared space no hidden
+    component is readable: /shared/.links holds the Files MCP's capability
+    tokens, and attaching one would hand out a working download link. A bare
+    relative name is a shared-space name (what other tools return as
+    shared_name)."""
+    roots = [Path(ctx.settings.data_dir).resolve()]
+    shared = (getattr(ctx.settings, "shared_dir", "") or "").strip()
+    shared_root = Path(shared).resolve() if shared else None
+    if shared_root is not None:
+        roots.append(shared_root)
+    raw = Path(path)
+    if not raw.is_absolute() and shared_root is not None:
+        raw = shared_root / raw
+    target = raw.resolve()
+    root = next((r for r in roots if target == r or r in target.parents), None)
+    where = "DATA_DIR" + (" or the shared space" if shared_root is not None else "")
+    if root is None:
+        raise ToolError("validation",
+                        f"path must be inside {where} ({', '.join(map(str, roots))}).",
+                        hint="Save or download the file there first (get_attachment"
+                             "(mode='save'), M365 download_file, Files MCP upload).")
+    if root == shared_root and any(part.startswith(".")
+                                   for part in target.relative_to(root).parts):
+        raise ToolError("validation", "Hidden files in the shared space cannot be attached.")
+    if not target.is_file():
+        raise ToolError("validation", f"No such file: {target}")
+    return target
+
 
 def _attachment_bytes(ctx: Context, path: Optional[str],
                       content_base64: Optional[str],
@@ -263,18 +303,10 @@ def _attachment_bytes(ctx: Context, path: Optional[str],
     if bool(path) == bool(content_base64):
         raise ToolError("validation",
                         "Provide exactly one of path or content_base64.",
-                        hint="path must live under DATA_DIR; content_base64 also needs name.")
+                        hint="path is a file under DATA_DIR or the shared space; "
+                             "content_base64 also needs name.")
     if path:
-        # Containment: the server must not be turned into a file-exfiltration
-        # primitive by a crafted path. Only DATA_DIR is readable here.
-        root = Path(ctx.settings.data_dir).resolve()
-        target = Path(path).resolve()
-        if root not in target.parents and target != root:
-            raise ToolError("validation",
-                            f"path must be inside DATA_DIR ({root}).",
-                            hint="Use get_attachment(mode='save') to place a file there first.")
-        if not target.is_file():
-            raise ToolError("validation", f"No such file: {target}")
+        target = _readable_attachment_path(ctx, path)
         data = target.read_bytes()
         return (name or target.name), data
     if not name:
@@ -342,6 +374,81 @@ async def _delete_attachment(ctx: Context, *, draft_id: str,
 # --- WRITE class (reversible; tier ≥ draft) ----------------------------------
 
 
+async def _archived_original(ctx: Context, mode: str,
+                             reply_to: Optional[str]) -> Optional[tuple]:
+    """(row, eml bytes) when `reply_to` is mail the archiver deleted from
+    Exchange, so a reply/forward must be built from the archive; None when
+    Exchange still holds it (live, captured, verified) or there is no cache."""
+    if mode == "new" or not reply_to or getattr(ctx, "cache", None) is None:
+        return None
+    row = await asyncio.to_thread(ctx.cache.get_message, reply_to)
+    if row is None or row["archive_state"] != "deleted":
+        return None
+    path = Path(row["mime_path"]) if row.get("mime_path") else None
+    if path is None or not path.is_file():
+        raise ToolError(
+            "archived_only",
+            "This message is no longer in Exchange and its archived copy (.eml) "
+            "is missing, so it cannot be replied to or forwarded.",
+            hint="Write a new message (mode='new') and quote what is needed; "
+                 "get_message still reads the archived text.")
+    return row, await asyncio.to_thread(path.read_bytes)
+
+
+async def _create_draft_from_archive(ctx: Context, archived: tuple, *, mode: str,
+                                     body: str, body_format: str,
+                                     to: Optional[List[str]], cc: Optional[List[str]],
+                                     bcc: Optional[List[str]], subject: Optional[str],
+                                     importance: Optional[str]) -> Dict[str, Any]:
+    _row, eml = archived
+    orig = archived_drafts.parse_eml(eml)
+    quoted = (archived_drafts.forward_text(orig) if mode == "forward"
+              else archived_drafts.reply_text(orig))
+    if body_format == "html":
+        full = f"{body}<br><br><pre>{_html.escape(quoted)}</pre>"
+    else:
+        full = f"{body}\n\n{quoted}"
+    final_subject = subject or _prefixed("Fwd: " if mode == "forward" else "Re: ",
+                                         orig["subject"])
+
+    def work(account: Any) -> Any:
+        self_addr = getattr(account, "primary_smtp_address", "") or ""
+        to_list, cc_list = archived_drafts.recipients(mode, orig, self_addr, to, cc)
+        if not to_list:
+            raise ToolError("validation", "The archived message has no sender to reply to.",
+                            hint="Pass `to` explicitly.")
+        kwargs: Dict[str, Any] = dict(
+            account=account, folder=account.drafts, subject=final_subject,
+            body=_wrap_html(full, body_format), to_recipients=to_list,
+            cc_recipients=cc_list or None, bcc_recipients=list(bcc) if bcc else None)
+        if mode != "forward" and orig["message_id"]:
+            kwargs["in_reply_to"] = orig["message_id"]
+            kwargs["references"] = " ".join(
+                x for x in (orig["references"], orig["message_id"]) if x)
+        msg = Message(**kwargs)
+        if importance == "high":
+            msg.importance = "High"
+        if mode == "forward":
+            name = (_FS_UNSAFE_RE.sub(" - ", orig["subject"] or "message").strip(" -.")
+                    or "message")[:60] + ".eml"
+            msg.attach(FileAttachment(name=name, content=eml, content_type="message/rfc822"))
+        msg.save()  # SAVE_ONLY into Drafts — nothing leaves the mailbox
+        return msg.id, getattr(msg, "changekey", None), to_list, cc_list
+
+    raw_id, changekey, prev_to, prev_cc = await ctx.gateway.call(work)
+    alias = ctx.aliaser.alias_for(str(raw_id), "d", changekey=changekey)
+    return {
+        "ok": True,
+        "draft_id": alias,
+        "folder": "f:drafts",
+        "source": "archive",
+        "preview": _draft_preview(prev_to, prev_cc, final_subject, body, body_format),
+        "note": ("built from the archived copy (the original is no longer in "
+                 "Exchange)" + ("; original attached as .eml" if mode == "forward" else "")
+                 + " — saved as draft, NOT sent"),
+    }
+
+
 async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                         reply_to: Optional[str] = None,
                         to: Optional[List[str]] = None,
@@ -361,6 +468,11 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
     if body_format not in ("text", "html"):
         raise ToolError("validation", "body_format must be 'text' or 'html'")
     html_body = _wrap_html(body, body_format)
+    archived = await _archived_original(ctx, mode, reply_to)
+    if archived is not None:
+        return await _create_draft_from_archive(
+            ctx, archived, mode=mode, body=body, body_format=body_format, to=to,
+            cc=cc, bcc=bcc, subject=subject, importance=importance)
 
     def work(account: Any) -> Any:
         if mode == "new":

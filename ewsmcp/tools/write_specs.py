@@ -111,11 +111,13 @@ SPECS: List[ToolSpec] = [
     ToolSpec(
         name="add_attachment",
         description=(
-            "Attach a file to a DRAFT. Exactly one source: `path` (a file inside "
-            "DATA_DIR — pair with get_attachment(mode='save') to forward an "
-            "attachment between messages at zero token cost), or `content_base64` "
-            "+ `name` for small inline content. Paths outside DATA_DIR are "
-            "refused. The draft is still not sent — use send_draft."
+            "Attach a file to a DRAFT. Exactly one source: `path`, or "
+            "`content_base64` + `name` for small inline content. `path` is a file "
+            "in the shared space — `/shared/<name>` or just the shared_name that "
+            "M365 download_file, the Files MCP, Telegram, WhatsApp or "
+            "get_attachment(mode='save') return — or under DATA_DIR. Any other "
+            "path, and hidden files, are refused. The draft is still not sent — "
+            "use send_draft."
         ),
         side_effect_class="write",
         input_schema=_obj({
