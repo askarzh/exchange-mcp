@@ -1036,3 +1036,20 @@ def test_captured_mail_still_in_exchange_uses_the_exchange_reply(tmp_path, db, m
     account._by_id["ARCH-1"] = original
     res = call(ctx, "create_draft", {"mode": "reply", "reply_to": alias, "body": "x"})
     assert res["ok"] is True and original.create_reply.called
+
+
+def test_archived_subject_folding_does_not_double_the_re_prefix(tmp_path, db, monkeypatch):
+    """A folded Subject header ('Subject:\\r\\n\\tRE: FW: …') kept its tab, so
+    'RE:' was not seen and the draft became 'Re: \\tRE: FW: …' (m1343)."""
+    global ARCHIVED_EML
+    saved = ARCHIVED_EML
+    ARCHIVED_EML = saved.replace(
+        b"Subject: =?utf-8?b?0KHQvtCz0LvQsNGB0L7QstCw0L3QvdCw0Y8g0YDQtdC00LDQutGG0LjRjw==?=\r\n",
+        b"Subject:\r\n\tRE: FW: Draft contract\r\n")
+    try:
+        ctx, _account, alias = _archived_ctx(tmp_path, db, monkeypatch)
+        res = call(ctx, "create_draft", {"mode": "reply_all", "reply_to": alias, "body": "x"})
+    finally:
+        ARCHIVED_EML = saved
+    assert res["ok"] is True
+    assert FakeArchivedDraft.last.kwargs["subject"] == "RE: FW: Draft contract"

@@ -49,7 +49,8 @@ def parse_eml(raw: bytes) -> Dict[str, Any]:
         text = (text[:QUOTE_CAP].rstrip()
                 + "\n[… shortened; the full message is attached or archived]")
     return {
-        "subject": str(msg.get("Subject") or ""),
+        # Folded headers keep their CRLF+tab; collapse so "RE:" is seen.
+        "subject": " ".join(str(msg.get("Subject") or "").split()),
         "from": str(msg.get("From") or ""),
         "date": str(msg.get("Date") or ""),
         "to_header": str(msg.get("To") or ""),
